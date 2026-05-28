@@ -143,6 +143,28 @@ pub struct ShipmentOptions {
     pub auto_confirm_ledgers: u32,
 }
 
+/// Contract-level statistics for analytics and monitoring.
+#[contracttype]
+#[derive(Clone)]
+pub struct ContractStats {
+    /// Total number of shipments created.
+    pub total_shipments: u64,
+    /// Total USDC volume locked across all shipments.
+    pub total_volume: i128,
+    /// Total number of disputes raised.
+    pub total_disputes: u64,
+    /// Total number of shipments completed.
+    pub completed_shipments: u64,
+}
+
+/// Active dispute entry: (shipment_id, milestone_index).
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct DisputeEntry {
+    pub shipment_id: String,
+    pub milestone_index: u32,
+}
+
 // ============================================================
 // STORAGE KEYS
 // ============================================================
@@ -165,6 +187,12 @@ pub enum DataKey {
     Paused,
     /// Pending arbiter rotation proposal: (new_arbiter, buyer_agreed, supplier_agreed).
     ArbiterRotation(String),
+    /// Total escrowed value for a given token across all active shipments.
+    TotalEscrowed(Address),
+    /// Active disputes: Vec<(shipment_id, milestone_index)>.
+    ActiveDisputes,
+    /// Contract-level statistics.
+    ContractStats,
 }
 
 // ============================================================
@@ -211,6 +239,20 @@ impl ChainSettleContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         // Initialise paused to false.
         env.storage().instance().set(&DataKey::Paused, &false);
+        // Initialize contract stats.
+        env.storage().instance().set(
+            &DataKey::ContractStats,
+            &ContractStats {
+                total_shipments: 0,
+                total_volume: 0,
+                total_disputes: 0,
+                completed_shipments: 0,
+            },
+        );
+        // Initialize active disputes list.
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveDisputes, &Vec::<DisputeEntry>::new(&env));
     }
 
     // ----------------------------------------------------------
@@ -420,7 +462,7 @@ impl ChainSettleContract {
             supplier,
             logistics,
             arbiter,
-            token,
+            token: token.clone(),
             total_amount,
             released_amount: 0,
             milestones: clean_milestones,
@@ -446,6 +488,43 @@ impl ChainSettleContract {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Shipment(shipment_id.clone()), 100_000, 6_300_000);
+
+        // Add to AllShipments list for pagination.
+        let mut all_shipments: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllShipments)
+            .unwrap_or_else(|| Vec::new(&env));
+        all_shipments.push_back(shipment_id.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::AllShipments, &all_shipments);
+
+        // Update total escrowed value for this token.
+        let current_escrowed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalEscrowed(token.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::TotalEscrowed(token.clone()),
+            &(current_escrowed + total_amount),
+        );
+
+        // Update contract stats.
+        let mut stats: ContractStats = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractStats)
+            .unwrap_or(ContractStats {
+                total_shipments: 0,
+                total_volume: 0,
+                total_disputes: 0,
+                completed_shipments: 0,
+            });
+        stats.total_shipments += 1;
+        stats.total_volume += total_amount;
+        env.storage().instance().set(&DataKey::ContractStats, &stats);
 
         env.events().publish(
             (Symbol::new(&env, "shipment_created"), shipment_id.clone()),
@@ -660,7 +739,31 @@ impl ChainSettleContract {
 
             if Self::all_milestones_done(&shipment) {
                 shipment.status = ShipmentStatus::Completed;
+                // Update completed shipments stat.
+                let mut stats: ContractStats = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::ContractStats)
+                    .unwrap_or(ContractStats {
+                        total_shipments: 0,
+                        total_volume: 0,
+                        total_disputes: 0,
+                        completed_shipments: 0,
+                    });
+                stats.completed_shipments += 1;
+                env.storage().instance().set(&DataKey::ContractStats, &stats);
             }
+
+            // Decrement total escrowed value.
+            let current_escrowed: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::TotalEscrowed(shipment.token.clone()))
+                .unwrap_or(0);
+            env.storage().persistent().set(
+                &DataKey::TotalEscrowed(shipment.token.clone()),
+                &(current_escrowed - payment).max(0),
+            );
 
             env.storage()
                 .persistent()
@@ -715,7 +818,31 @@ impl ChainSettleContract {
 
         if Self::all_milestones_done(&shipment) {
             shipment.status = ShipmentStatus::Completed;
+            // Update completed shipments stat.
+            let mut stats: ContractStats = env
+                .storage()
+                .instance()
+                .get(&DataKey::ContractStats)
+                .unwrap_or(ContractStats {
+                    total_shipments: 0,
+                    total_volume: 0,
+                    total_disputes: 0,
+                    completed_shipments: 0,
+                });
+            stats.completed_shipments += 1;
+            env.storage().instance().set(&DataKey::ContractStats, &stats);
         }
+
+        // Decrement total escrowed value.
+        let current_escrowed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalEscrowed(shipment.token.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::TotalEscrowed(shipment.token.clone()),
+            &(current_escrowed - payment).max(0),
+        );
 
         env.storage()
             .persistent()
@@ -783,6 +910,17 @@ impl ChainSettleContract {
                 &net_payment,
             );
 
+            // Decrement total escrowed value.
+            let current_escrowed: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::TotalEscrowed(shipment.token.clone()))
+                .unwrap_or(0);
+            env.storage().persistent().set(
+                &DataKey::TotalEscrowed(shipment.token.clone()),
+                &(current_escrowed - payment).max(0),
+            );
+
             env.events().publish(
                 (Symbol::new(&env, "milestone_confirmed"), shipment_id.clone()),
                 (idx, payment, fee_amount),
@@ -791,6 +929,19 @@ impl ChainSettleContract {
 
         if Self::all_milestones_done(&shipment) {
             shipment.status = ShipmentStatus::Completed;
+            // Update completed shipments stat.
+            let mut stats: ContractStats = env
+                .storage()
+                .instance()
+                .get(&DataKey::ContractStats)
+                .unwrap_or(ContractStats {
+                    total_shipments: 0,
+                    total_volume: 0,
+                    total_disputes: 0,
+                    completed_shipments: 0,
+                });
+            stats.completed_shipments += 1;
+            env.storage().instance().set(&DataKey::ContractStats, &stats);
         }
 
         env.storage()
@@ -855,6 +1006,34 @@ impl ChainSettleContract {
             .persistent()
             .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
 
+        // Add to active disputes list.
+        let mut disputes: Vec<DisputeEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveDisputes)
+            .unwrap_or_else(|| Vec::new(&env));
+        disputes.push_back(DisputeEntry {
+            shipment_id: shipment_id.clone(),
+            milestone_index,
+        });
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveDisputes, &disputes);
+
+        // Increment total disputes stat.
+        let mut stats: ContractStats = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractStats)
+            .unwrap_or(ContractStats {
+                total_shipments: 0,
+                total_volume: 0,
+                total_disputes: 0,
+                completed_shipments: 0,
+            });
+        stats.total_disputes += 1;
+        env.storage().instance().set(&DataKey::ContractStats, &stats);
+
         env.events().publish(
             (Symbol::new(&env, "dispute_raised"), shipment_id.clone()),
             milestone_index,
@@ -914,11 +1093,41 @@ impl ChainSettleContract {
 
         if Self::all_milestones_done(&shipment) {
             shipment.status = ShipmentStatus::Completed;
+            // Update completed shipments stat.
+            let mut stats: ContractStats = env
+                .storage()
+                .instance()
+                .get(&DataKey::ContractStats)
+                .unwrap_or(ContractStats {
+                    total_shipments: 0,
+                    total_volume: 0,
+                    total_disputes: 0,
+                    completed_shipments: 0,
+                });
+            stats.completed_shipments += 1;
+            env.storage().instance().set(&DataKey::ContractStats, &stats);
         }
 
         env.storage()
             .persistent()
             .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        // Remove from active disputes list.
+        let disputes: Vec<DisputeEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveDisputes)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_disputes: Vec<DisputeEntry> = Vec::new(&env);
+        for i in 0..disputes.len() {
+            let d = disputes.get(i).unwrap();
+            if !(d.shipment_id == shipment_id && d.milestone_index == milestone_index) {
+                new_disputes.push_back(d);
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveDisputes, &new_disputes);
 
         env.events().publish(
             (Symbol::new(&env, "dispute_resolved"), shipment_id.clone()),
@@ -961,6 +1170,34 @@ impl ChainSettleContract {
         env.storage()
             .persistent()
             .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        // Decrement total escrowed value.
+        let current_escrowed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalEscrowed(shipment.token.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::TotalEscrowed(shipment.token.clone()),
+            &(current_escrowed - refund).max(0),
+        );
+
+        // Remove any disputes for this shipment.
+        let disputes: Vec<DisputeEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveDisputes)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_disputes: Vec<DisputeEntry> = Vec::new(&env);
+        for i in 0..disputes.len() {
+            let d = disputes.get(i).unwrap();
+            if d.shipment_id != shipment_id {
+                new_disputes.push_back(d);
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveDisputes, &new_disputes);
 
         env.events().publish(
             (Symbol::new(&env, "shipment_cancelled"), shipment_id.clone()),
@@ -1040,6 +1277,34 @@ impl ChainSettleContract {
         env.storage()
             .persistent()
             .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        // Decrement total escrowed value.
+        let current_escrowed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalEscrowed(shipment.token.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::TotalEscrowed(shipment.token.clone()),
+            &(current_escrowed - remaining).max(0),
+        );
+
+        // Remove any disputes for this shipment.
+        let disputes: Vec<DisputeEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveDisputes)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_disputes: Vec<DisputeEntry> = Vec::new(&env);
+        for i in 0..disputes.len() {
+            let d = disputes.get(i).unwrap();
+            if d.shipment_id != shipment_id {
+                new_disputes.push_back(d);
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveDisputes, &new_disputes);
 
         env.events().publish(
             (Symbol::new(&env, "supplier_cancellation"), shipment_id.clone()),
@@ -1407,7 +1672,31 @@ impl ChainSettleContract {
 
         if Self::all_milestones_done(&shipment) {
             shipment.status = ShipmentStatus::Completed;
+            // Update completed shipments stat.
+            let mut stats: ContractStats = env
+                .storage()
+                .instance()
+                .get(&DataKey::ContractStats)
+                .unwrap_or(ContractStats {
+                    total_shipments: 0,
+                    total_volume: 0,
+                    total_disputes: 0,
+                    completed_shipments: 0,
+                });
+            stats.completed_shipments += 1;
+            env.storage().instance().set(&DataKey::ContractStats, &stats);
         }
+
+        // Decrement total escrowed value.
+        let current_escrowed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalEscrowed(shipment.token.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::TotalEscrowed(shipment.token.clone()),
+            &(current_escrowed - payment).max(0),
+        );
 
         env.storage()
             .persistent()
@@ -1449,6 +1738,63 @@ impl ChainSettleContract {
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
+    pub fn get_total_escrowed_value(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TotalEscrowed(token))
+            .unwrap_or(0)
+    }
+
+    pub fn get_active_disputes(env: Env) -> Vec<DisputeEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ActiveDisputes)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    pub fn get_contract_stats(env: Env) -> ContractStats {
+        env.storage()
+            .instance()
+            .get(&DataKey::ContractStats)
+            .unwrap_or(ContractStats {
+                total_shipments: 0,
+                total_volume: 0,
+                total_disputes: 0,
+                completed_shipments: 0,
+            })
+    }
+
+    pub fn list_shipments(env: Env, cursor: Option<u32>, limit: u32) -> (Vec<String>, Option<u32>) {
+        let all_shipments: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllShipments)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let clamped_limit = if limit > 50 { 50 } else { limit };
+        let start_idx = cursor.unwrap_or(0);
+        let total_len = all_shipments.len() as u32;
+
+        if start_idx >= total_len {
+            return (Vec::new(&env), None);
+        }
+
+        let mut result: Vec<String> = Vec::new(&env);
+        let mut idx = start_idx;
+        while idx < total_len && (result.len() as u32) < clamped_limit {
+            result.push_back(all_shipments.get(idx).unwrap());
+            idx += 1;
+        }
+
+        let next_cursor = if idx < total_len {
+            Some(idx)
+        } else {
+            None
+        };
+
+        (result, next_cursor)
     }
 
     // ----------------------------------------------------------
