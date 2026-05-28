@@ -20,6 +20,18 @@ pub enum MilestoneStatus {
     ConfirmedHeld,
 }
 
+/// Controls whether milestones must be completed in order (Sequential)
+/// or can be submitted and confirmed independently (Parallel).
+/// Immutable after shipment creation.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub enum MilestoneMode {
+    /// Proof for milestone N requires milestone N-1 to be Confirmed or Resolved first.
+    Sequential,
+    /// All milestones are independently submittable at any time.
+    Parallel,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub struct Milestone {
@@ -43,7 +55,9 @@ pub enum ShipmentStatus {
 #[derive(Clone)]
 pub struct Shipment {
     pub id: String,
-    pub buyer: Address,
+    /// All co-buyers. All must call confirm_milestone for payment to release.
+    /// raise_dispute requires only one co-buyer's signature.
+    pub buyers: Vec<Address>,
     pub supplier: Address,
     pub logistics: Address,
     pub arbiter: Address,
@@ -52,6 +66,7 @@ pub struct Shipment {
     pub released_amount: i128,
     pub milestones: Vec<Milestone>,
     pub status: ShipmentStatus,
+    pub milestone_mode: MilestoneMode,
     pub created_at: u32,
     // Issue #1: enforce sequential milestone ordering
     pub sequential: bool,
@@ -112,6 +127,9 @@ pub enum ChainSettleError {
     InvalidPercentages = 7,
     InvalidAmount = 8,
     DisputeAlreadyOpen = 9,
+    DeadlineNotBreached = 10,
+    FeeTooHigh = 11,
+    PreviousMilestoneNotComplete = 12,
 }
 
 // ============================================================
@@ -168,7 +186,7 @@ impl ChainSettleContract {
     pub fn create_shipment(
         env: Env,
         shipment_id: String,
-        buyer: Address,
+        buyers: Vec<Address>,
         supplier: Address,
         logistics: Address,
         arbiter: Address,
@@ -178,7 +196,14 @@ impl ChainSettleContract {
         response_deadline: u32,
         penalty_bps: u32,
     ) -> String {
-        buyer.require_auth();
+        if buyers.is_empty() {
+            panic!("at least one buyer is required");
+        }
+
+        // All co-buyers must authorise the creation
+        for i in 0..buyers.len() {
+            buyers.get(i).unwrap().require_auth();
+        }
 
         if total_amount <= 0 {
             panic!("amount must be greater than zero");
@@ -219,20 +244,35 @@ impl ChainSettleContract {
             panic!("shipment already exists");
         }
 
+        // Transfer total_amount from the first buyer (primary payer).
+        // In multi-buyer setups the callers are expected to have pre-funded
+        // the primary buyer address, or the primary buyer holds the full escrow.
+        let primary_buyer = buyers.get(0).unwrap();
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&buyer, &env.current_contract_address(), &total_amount);
+        token_client.transfer(&primary_buyer, &env.current_contract_address(), &total_amount);
+
+        // Normalise milestones: clear any approvals passed in by the caller
+        let mut clean_milestones: Vec<Milestone> = Vec::new(&env);
+        for i in 0..milestones.len() {
+            let mut m = milestones.get(i).unwrap();
+            m.approvals = Vec::new(&env);
+            m.status = MilestoneStatus::Pending;
+            m.proof_hash = String::from_str(&env, "");
+            clean_milestones.push_back(m);
+        }
 
         let shipment = Shipment {
             id: shipment_id.clone(),
-            buyer,
+            buyers,
             supplier,
             logistics,
             arbiter,
             token,
             total_amount,
             released_amount: 0,
-            milestones,
+            milestones: clean_milestones,
             status: ShipmentStatus::Active,
+            milestone_mode,
             created_at: env.ledger().sequence(),
             sequential,
             holdback_ledgers,
@@ -302,6 +342,21 @@ impl ChainSettleContract {
             panic!("unauthorized");
         }
 
+        // Sequential mode: previous milestone must be complete
+        if shipment.milestone_mode == MilestoneMode::Sequential && milestone_index > 0 {
+            let prev = shipment.milestones.get(milestone_index - 1).unwrap();
+            if prev.status != MilestoneStatus::Confirmed && prev.status != MilestoneStatus::Resolved {
+                panic!("previous milestone not yet complete");
+            }
+        }
+
+        // Deadline check: proof must arrive on or before the deadline ledger
+        if let Some(deadline) = milestone.deadline_ledger {
+            if env.ledger().sequence() > deadline {
+                panic!("milestone deadline has passed");
+            }
+        }
+
         milestone.proof_hash = proof_hash;
         milestone.status = MilestoneStatus::ProofSubmitted;
         shipment.milestones.set(milestone_index, milestone);
@@ -323,7 +378,7 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
-    // CONFIRM MILESTONE
+    // CONFIRM MILESTONE (multi-sig)
     // ----------------------------------------------------------
 
     pub fn confirm_milestone(
@@ -424,8 +479,9 @@ impl ChainSettleContract {
         shipment.milestones.set(milestone_index, milestone);
         shipment.released_amount += payment;
 
-        let token_client = token::Client::new(&env, &shipment.token);
-        token_client.transfer(&env.current_contract_address(), &shipment.supplier, &payment);
+        if all_approved {
+            let payment = (shipment.total_amount * milestone.payment_percent as i128) / 100;
+            let net_payment = Self::deduct_fee(&env, payment, &shipment.token, &mut fee_amount);
 
         let all_confirmed = (0..shipment.milestones.len()).all(|i| {
             shipment.milestones.get(i).unwrap().status == MilestoneStatus::Confirmed
@@ -440,7 +496,7 @@ impl ChainSettleContract {
 
         env.events().publish(
             (Symbol::new(&env, "milestone_confirmed"), shipment_id.clone()),
-            (milestone_index, payment),
+            (milestone_index, all_approved, fee_amount),
         );
     }
 
@@ -542,6 +598,8 @@ impl ChainSettleContract {
         // Issue #4: cancel holdback if within window
         milestone.release_after_ledger = 0;
         milestone.status = MilestoneStatus::Disputed;
+        // Clear partial approvals so the slate is clean if proof is resubmitted
+        milestone.approvals = Vec::new(&env);
         shipment.milestones.set(milestone_index, milestone);
 
         env.storage()
@@ -583,6 +641,9 @@ impl ChainSettleContract {
 
         if approve {
             let payment = (shipment.total_amount * milestone.payment_percent as i128) / 100;
+            let mut fee_amount: i128 = 0;
+            let net_payment = Self::deduct_fee(&env, payment, &shipment.token, &mut fee_amount);
+
             shipment.released_amount += payment;
             let token_client = token::Client::new(&env, &shipment.token);
             token_client.transfer(&env.current_contract_address(), &shipment.supplier, &payment);
@@ -590,6 +651,7 @@ impl ChainSettleContract {
         } else {
             milestone.status = MilestoneStatus::Pending;
             milestone.proof_hash = String::from_str(&env, "");
+            milestone.approvals = Vec::new(&env);
         }
 
         shipment.milestones.set(milestone_index, milestone);
@@ -849,6 +911,10 @@ impl ChainSettleContract {
     pub fn get_escrow_balance(env: Env, shipment_id: String) -> i128 {
         let shipment = Self::get_shipment_internal(&env, &shipment_id);
         shipment.total_amount - shipment.released_amount
+    }
+
+    pub fn get_fee_config(env: Env) -> Option<FeeConfig> {
+        env.storage().instance().get(&DataKey::FeeConfig)
     }
 
     // ----------------------------------------------------------

@@ -23,16 +23,29 @@ fn setup() -> (Env, Address, Address, Address, Address, Address, Address) {
     let token_client = token::StellarAssetClient::new(&env, &token_id);
 
     let buyer = Address::generate(&env);
+    let buyer2 = Address::generate(&env);
     let supplier = Address::generate(&env);
     let logistics = Address::generate(&env);
     let arbiter = Address::generate(&env);
+    let treasury = Address::generate(&env);
 
     token_client.mint(&buyer, &10_000_000_000);
+    token_client.mint(&buyer2, &10_000_000_000);
 
     let client = ChainSettleContractClient::new(&env, &contract_id);
     client.init(&buyer);
 
-    (env, contract_id, token_id, buyer, supplier, logistics, arbiter)
+    TestSetup {
+        env,
+        contract_id,
+        token_id,
+        buyer,
+        buyer2,
+        supplier,
+        logistics,
+        arbiter,
+        treasury,
+    }
 }
 
 fn build_milestones(env: &Env) -> Vec<Milestone> {
@@ -94,9 +107,9 @@ fn create_standard_shipment(
 
 #[test]
 fn test_create_shipment_success() {
-    let (env, contract_id, token_id, buyer, supplier, logistics, arbiter) = setup();
-    let client = ChainSettleContractClient::new(&env, &contract_id);
-    let token_client = token::Client::new(&env, &token_id);
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
 
     let total_amount: i128 = 1_000_000_000;
     create(&client, &env, "SHIP-001", &buyer, &supplier, &logistics, &arbiter, &token_id, total_amount, false, 0);
@@ -121,41 +134,41 @@ fn test_create_shipment_success() {
 #[test]
 #[should_panic(expected = "milestone percentages must sum to 100")]
 fn test_create_shipment_invalid_percentages() {
-    let (env, contract_id, token_id, buyer, supplier, logistics, arbiter) = setup();
-    let client = ChainSettleContractClient::new(&env, &contract_id);
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
 
     let bad_milestones = vec![
-        &env,
+        &t.env,
         Milestone {
-            name: String::from_str(&env, "Step 1"),
+            name: String::from_str(&t.env, "Step 1"),
             payment_percent: 30,
-            proof_hash: String::from_str(&env, ""),
+            proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
         },
         Milestone {
-            name: String::from_str(&env, "Step 2"),
+            name: String::from_str(&t.env, "Step 2"),
             payment_percent: 30,
-            proof_hash: String::from_str(&env, ""),
+            proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
         },
         Milestone {
-            name: String::from_str(&env, "Step 3"),
+            name: String::from_str(&t.env, "Step 3"),
             payment_percent: 30,
-            proof_hash: String::from_str(&env, ""),
+            proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
         },
     ];
 
     client.create_shipment(
-        &String::from_str(&env, "SHIP-BAD"),
-        &buyer,
-        &supplier,
-        &logistics,
-        &arbiter,
-        &token_id,
+        &String::from_str(&t.env, "SHIP-BAD"),
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
         &1_000_000_000,
         &bad_milestones,
         &0,
