@@ -908,7 +908,15 @@ impl ChainSettleContract {
 
         env.events().publish(
             (Symbol::new(&env, "shipment_created"), shipment_id.clone()),
-            shipment_id.clone(),
+            (
+                shipment.buyers.get(0).unwrap(),
+                shipment.supplier.clone(),
+                shipment.logistics.clone(),
+                shipment.arbiter.clone(),
+                shipment.token.clone(),
+                shipment.total_amount,
+                env.ledger().sequence(),
+            ),
         );
 
         shipment_id
@@ -1156,7 +1164,7 @@ impl ChainSettleContract {
 
             env.events().publish(
                 (Symbol::new(&env, "milestone_confirmed"), shipment_id.clone()),
-                (milestone_index, payment, fee_amount, penalty_deducted),
+                (milestone_index, payment, fee_amount, penalty_deducted, shipment.supplier.clone(), env.ledger().sequence()),
             );
         }
     }
@@ -1317,7 +1325,7 @@ impl ChainSettleContract {
 
             env.events().publish(
                 (Symbol::new(&env, "milestone_confirmed"), shipment_id.clone()),
-                (idx, payment, fee_amount),
+                (idx, payment, fee_amount, shipment.supplier.clone(), env.ledger().sequence()),
             );
         }
 
@@ -1650,7 +1658,7 @@ impl ChainSettleContract {
 
         env.events().publish(
             (Symbol::new(&env, "shipment_cancelled"), shipment_id.clone()),
-            refund,
+            (refund, buyer.clone(), env.ledger().sequence()),
         );
     }
 

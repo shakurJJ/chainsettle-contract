@@ -1,0 +1,19 @@
+[default]
+# Run all workspace members.
+workspace = true
+
+# Output formats.
+out = ["Xml", "Html"]
+
+# Exclusions: skip generated boilerplate and test helpers themselves.
+exclude-files = [
+  "*/test.rs",
+  "*/tests/*",
+  "*/build.rs",
+]
+
+# Ignore lines that only contain closing braces, macros, or derive attrs.
+ignore-panics = true
+
+# Minimum line coverage required (informational; gate enforced in CI).
+# The coverage.yml workflow enforces 80% and fails the PR check on breach.

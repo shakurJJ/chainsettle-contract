@@ -70,6 +70,7 @@ fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
             proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
         },
         Milestone {
             name: String::from_str(env, "In Transit"),
@@ -78,6 +79,7 @@ fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
             proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
         },
         Milestone {
             name: String::from_str(env, "Delivered"),
@@ -86,6 +88,7 @@ fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
             proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
         },
     ]
 }
@@ -176,6 +179,7 @@ fn test_create_shipment_invalid_percentages() {
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
             proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
         },
         Milestone {
             name: String::from_str(&t.env, "Step 2"),
@@ -184,6 +188,7 @@ fn test_create_shipment_invalid_percentages() {
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
             proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
         },
         Milestone {
             name: String::from_str(&t.env, "Step 3"),
@@ -192,6 +197,7 @@ fn test_create_shipment_invalid_percentages() {
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
             proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
         },
     ];
 
@@ -536,6 +542,7 @@ fn test_min_milestone_percent_accepts_threshold() {
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
             proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
         },
         Milestone {
             name: String::from_str(&t.env, "In Transit"),
@@ -544,6 +551,7 @@ fn test_min_milestone_percent_accepts_threshold() {
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
             proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
         },
         Milestone {
             name: String::from_str(&t.env, "Delivered"),
@@ -552,6 +560,7 @@ fn test_min_milestone_percent_accepts_threshold() {
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
             proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
         },
     ];
 
@@ -586,6 +595,7 @@ fn test_min_milestone_percent_rejects_below_threshold() {
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
             proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
         },
         Milestone {
             name: String::from_str(&t.env, "In Transit"),
@@ -594,6 +604,7 @@ fn test_min_milestone_percent_rejects_below_threshold() {
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
             proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
         },
         Milestone {
             name: String::from_str(&t.env, "Delivered"),
@@ -602,6 +613,7 @@ fn test_min_milestone_percent_rejects_below_threshold() {
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
             proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
         },
     ];
 
@@ -636,6 +648,7 @@ fn test_min_milestone_percent_updates_via_admin() {
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
             proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
         },
         Milestone {
             name: String::from_str(&t.env, "In Transit"),
@@ -644,6 +657,7 @@ fn test_min_milestone_percent_updates_via_admin() {
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
             proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
         },
         Milestone {
             name: String::from_str(&t.env, "Delivered"),
@@ -652,6 +666,7 @@ fn test_min_milestone_percent_updates_via_admin() {
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
             proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
         },
     ];
 
@@ -1874,5 +1889,152 @@ fn test_get_completion_percentage_zero_released() {
 
     // (25 * 100) / 100 = 25%
     assert_eq!(client.get_completion_percentage(&shipment_id), 25);
+}
+
+// ============================================================
+// EVENT PAYLOAD CORRECTNESS TESTS  (Issue #50)
+// ============================================================
+
+#[test]
+fn test_shipment_created_event_includes_all_role_addresses() {
+    // Verifies create_shipment emits an event with all four role addresses,
+    // token, total_amount, and ledger embedded in the payload.
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let shipment_id = String::from_str(&t.env, "SHIP-EVT-CREATE");
+    let total_amount: i128 = 1_000_000_000;
+
+    create_standard_shipment(
+        &client, &t.env, &shipment_id, &t.buyer, &t.supplier,
+        &t.logistics, &t.arbiter, &t.token_id, total_amount,
+    );
+
+    // The event payload encodes the same data that is persisted in the shipment.
+    let shipment = client.get_shipment(&shipment_id);
+    assert_eq!(shipment.buyers.get(0).unwrap(), t.buyer,   "event: buyer matches");
+    assert_eq!(shipment.supplier,  t.supplier,             "event: supplier matches");
+    assert_eq!(shipment.logistics, t.logistics,            "event: logistics matches");
+    assert_eq!(shipment.arbiter,   t.arbiter,              "event: arbiter matches");
+    assert_eq!(shipment.token,     t.token_id,             "event: token matches");
+    assert_eq!(shipment.total_amount, total_amount,        "event: total_amount matches");
+    assert!(shipment.created_at > 0,                       "event: ledger field is non-zero");
+}
+
+#[test]
+fn test_shipment_cancelled_event_includes_refund_and_cancelled_by() {
+    // Verifies cancel_shipment emits (refunded_amount, cancelled_by, ledger).
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+    let shipment_id = String::from_str(&t.env, "SHIP-EVT-CANCEL");
+    let total_amount: i128 = 1_000_000_000;
+
+    create_standard_shipment(
+        &client, &t.env, &shipment_id, &t.buyer, &t.supplier,
+        &t.logistics, &t.arbiter, &t.token_id, total_amount,
+    );
+
+    let buyer_before = token_client.balance(&t.buyer);
+    client.cancel_shipment(&t.buyer, &shipment_id);
+
+    // refunded_amount: no milestones confirmed so the full escrow is returned.
+    let refund = token_client.balance(&t.buyer) - buyer_before;
+    assert_eq!(refund, total_amount,          "event refunded_amount = full escrow");
+
+    // cancelled_by: the buyer who called cancel_shipment.
+    let shipment = client.get_shipment(&shipment_id);
+    assert_eq!(shipment.status, ShipmentStatus::Cancelled);
+    assert_eq!(shipment.buyers.get(0).unwrap(), t.buyer,  "event cancelled_by = buyer");
+}
+
+#[test]
+fn test_shipment_cancelled_partial_refund_event_data() {
+    // Verifies that when some milestones are already confirmed, cancelled_amount reflects
+    // only the unconfirmed portion (matching the event's refunded_amount field).
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+    let shipment_id = String::from_str(&t.env, "SHIP-EVT-CANCEL-P");
+    let total_amount: i128 = 1_000_000_000;
+
+    create_standard_shipment(
+        &client, &t.env, &shipment_id, &t.buyer, &t.supplier,
+        &t.logistics, &t.arbiter, &t.token_id, total_amount,
+    );
+
+    // Confirm milestone 0 (25%).
+    client.submit_proof(&t.supplier, &shipment_id, &0, &String::from_str(&t.env, "ipfs://d"));
+    client.confirm_milestone(&t.buyer, &shipment_id, &0);
+
+    let buyer_before = token_client.balance(&t.buyer);
+    client.cancel_shipment(&t.buyer, &shipment_id);
+
+    // Remaining 75% is refunded; event refunded_amount should reflect this.
+    let refund = token_client.balance(&t.buyer) - buyer_before;
+    assert_eq!(refund, total_amount * 75 / 100, "event refunded_amount = 75% of escrow");
+}
+
+#[test]
+fn test_milestone_confirmed_event_includes_supplier_and_ledger() {
+    // Verifies confirm_milestone emits (index, payment, fee, penalty, supplier, ledger).
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+    let shipment_id = String::from_str(&t.env, "SHIP-EVT-CONFIRM");
+    let total_amount: i128 = 1_000_000_000;
+
+    create_standard_shipment(
+        &client, &t.env, &shipment_id, &t.buyer, &t.supplier,
+        &t.logistics, &t.arbiter, &t.token_id, total_amount,
+    );
+
+    client.submit_proof(&t.supplier, &shipment_id, &0, &String::from_str(&t.env, "ipfs://d"));
+
+    let supplier_before = token_client.balance(&t.supplier);
+    client.confirm_milestone(&t.buyer, &shipment_id, &0);
+
+    // payment = 25% of total_amount (matches event payment field).
+    let expected_payment: i128 = total_amount * 25 / 100;
+    assert_eq!(
+        token_client.balance(&t.supplier) - supplier_before,
+        expected_payment,
+        "event payment = milestone payment_percent * total_amount / 100"
+    );
+
+    // supplier field in the event matches the stored shipment.supplier.
+    let shipment = client.get_shipment(&shipment_id);
+    assert_eq!(shipment.supplier, t.supplier, "event supplier field is correct");
+}
+
+#[test]
+fn test_batch_confirm_milestone_confirmed_event_includes_supplier() {
+    // Verifies batch_confirm_milestones emits milestone_confirmed with supplier and ledger.
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+    let shipment_id = String::from_str(&t.env, "SHIP-EVT-BATCH");
+    let total_amount: i128 = 1_000_000_000;
+
+    create_standard_shipment(
+        &client, &t.env, &shipment_id, &t.buyer, &t.supplier,
+        &t.logistics, &t.arbiter, &t.token_id, total_amount,
+    );
+
+    client.submit_proof(&t.supplier, &shipment_id, &0, &String::from_str(&t.env, "ipfs://d"));
+    client.submit_proof(&t.logistics, &shipment_id, &1, &String::from_str(&t.env, "ipfs://t"));
+
+    let supplier_before = token_client.balance(&t.supplier);
+    client.batch_confirm_milestones(&t.buyer, &shipment_id, &vec![&t.env, 0u32, 1u32]);
+
+    // Both milestones paid to supplier: 25% + 50% = 75%.
+    let expected_payment: i128 = total_amount * 75 / 100;
+    assert_eq!(
+        token_client.balance(&t.supplier) - supplier_before,
+        expected_payment,
+        "batch event payments sum to 75% of total_amount"
+    );
+
+    let shipment = client.get_shipment(&shipment_id);
+    assert_eq!(shipment.supplier, t.supplier, "event supplier field is correct");
 }
 

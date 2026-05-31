@@ -1,5 +1,7 @@
 # ChainSettle — Contract Repo
 
+[![codecov](https://codecov.io/gh/shakurJJ/chainsettle-contract/branch/main/graph/badge.svg)](https://codecov.io/gh/shakurJJ/chainsettle-contract)
+
 > **Milestone-based supply chain escrow on Stellar Soroban**
 
 ChainSettle is a Soroban smart contract that locks buyer payment in escrow and automatically releases funds to the supplier as each delivery milestone is confirmed on-chain. No middlemen, no delayed wire transfers, no trust required.
