@@ -43,6 +43,8 @@ pub struct Milestone {
     pub release_after_ledger: u32,
     /// Ledger at which proof was submitted; used for auto-confirmation timeout.
     pub proof_submitted_ledger: Option<u32>,
+    /// Ledger at which dispute was opened; used for escalation threshold check.
+    pub dispute_opened_ledger: Option<u32>,
 }
 
 #[contracttype]
@@ -178,6 +180,23 @@ pub struct DisputeEntry {
     pub milestone_index: u32,
 }
 
+/// Multi-admin configuration for M-of-N approvals.
+#[contracttype]
+#[derive(Clone)]
+pub struct MultiAdminConfig {
+    pub admins: Vec<Address>,
+    pub threshold: u32,
+}
+
+/// Pending admin action proposal.
+#[contracttype]
+#[derive(Clone)]
+pub struct AdminAction {
+    pub action_id: String,
+    pub operation: Symbol,
+    pub params: String,
+}
+
 // ============================================================
 // STORAGE KEYS
 // ============================================================
@@ -212,6 +231,24 @@ pub enum DataKey {
     ContractStats,
     /// Per-status index: Vec<String> of shipment IDs with the given status.
     ShipmentsByStatus(ShipmentStatus),
+    /// Escalation threshold in ledgers (dispute escalation feature).
+    EscalationThreshold,
+    /// Maximum shipment value cap in i128 (0 = no cap).
+    MaxShipmentValue,
+    /// Circuit breaker outflow limit in i128.
+    CircuitBreakerLimit,
+    /// Circuit breaker window in ledgers.
+    CircuitBreakerWindow,
+    /// Circuit breaker window start ledger.
+    CircuitBreakerWindowStart,
+    /// Circuit breaker window outflow amount.
+    CircuitBreakerWindowOutflow,
+    /// Multi-admin approvals: Vec of (action_id, num_approvals).
+    PendingActions(String),
+    /// Multi-admin configuration.
+    MultiAdminConfig,
+    /// Multi-admin approvals tracking: Vec<Address> who approved an action.
+    AdminApprovals(String),
 }
 
 // ============================================================
@@ -237,6 +274,7 @@ pub enum ChainSettleError {
     ContractPaused = 13,
     DisputeCooldownActive = 14,
     TransferDisallowed = 15,
+    CircuitBreakerTripped = 16,
 }
 
 // ============================================================
@@ -272,6 +310,15 @@ impl ChainSettleContract {
         env.storage()
             .persistent()
             .set(&DataKey::ActiveDisputes, &Vec::<DisputeEntry>::new(&env));
+        // Initialize escalation threshold (0 = disabled).
+        env.storage().instance().set(&DataKey::EscalationThreshold, &0u32);
+        // Initialize max shipment value (0 = no cap).
+        env.storage().instance().set(&DataKey::MaxShipmentValue, &0i128);
+        // Initialize circuit breaker.
+        env.storage().instance().set(&DataKey::CircuitBreakerLimit, &0i128);
+        env.storage().instance().set(&DataKey::CircuitBreakerWindow, &0u32);
+        env.storage().instance().set(&DataKey::CircuitBreakerWindowStart, &0u32);
+        env.storage().instance().set(&DataKey::CircuitBreakerWindowOutflow, &0i128);
     }
 
     // ----------------------------------------------------------
@@ -325,6 +372,152 @@ impl ChainSettleContract {
             (Symbol::new(&env, "contract_unpaused"),),
             env.ledger().sequence(),
         );
+    }
+
+    // ----------------------------------------------------------
+    // ADMIN: ESCALATION THRESHOLD
+    // ----------------------------------------------------------
+
+    pub fn set_escalation_threshold(env: Env, admin: Address, threshold_ledgers: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage().instance().set(&DataKey::EscalationThreshold, &threshold_ledgers);
+        env.events().publish(
+            (Symbol::new(&env, "escalation_threshold_set"),),
+            threshold_ledgers,
+        );
+    }
+
+    pub fn get_escalation_threshold(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::EscalationThreshold).unwrap_or(0)
+    }
+
+    // ----------------------------------------------------------
+    // ADMIN: MAX SHIPMENT VALUE
+    // ----------------------------------------------------------
+
+    pub fn set_max_shipment_value(env: Env, admin: Address, max_value: i128) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage().instance().set(&DataKey::MaxShipmentValue, &max_value);
+        env.events().publish(
+            (Symbol::new(&env, "max_shipment_value_set"),),
+            max_value,
+        );
+    }
+
+    pub fn get_max_shipment_value(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::MaxShipmentValue).unwrap_or(0)
+    }
+
+    // ----------------------------------------------------------
+    // ADMIN: CIRCUIT BREAKER
+    // ----------------------------------------------------------
+
+    pub fn set_circuit_breaker(env: Env, admin: Address, limit: i128, window_ledgers: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage().instance().set(&DataKey::CircuitBreakerLimit, &limit);
+        env.storage().instance().set(&DataKey::CircuitBreakerWindow, &window_ledgers);
+        env.storage().instance().set(&DataKey::CircuitBreakerWindowStart, &env.ledger().sequence());
+        env.storage().instance().set(&DataKey::CircuitBreakerWindowOutflow, &0i128);
+        env.events().publish(
+            (Symbol::new(&env, "circuit_breaker_set"),),
+            (limit, window_ledgers),
+        );
+    }
+
+    // ----------------------------------------------------------
+    // MULTI-ADMIN GOVERNANCE
+    // ----------------------------------------------------------
+
+    pub fn initialize_multisig_admin(env: Env, admin: Address, admins: Vec<Address>, threshold: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        if admins.len() < 1 || threshold < 1 || threshold > admins.len() as u32 {
+            panic!("invalid multi-sig parameters");
+        }
+        let config = MultiAdminConfig { admins, threshold };
+        env.storage().instance().set(&DataKey::MultiAdminConfig, &config);
+        env.events().publish(
+            (Symbol::new(&env, "multisig_admin_initialized"),),
+            threshold,
+        );
+    }
+
+    pub fn propose_admin_action(
+        env: Env,
+        admin: Address,
+        action_id: String,
+        operation: Symbol,
+        params: String,
+    ) {
+        admin.require_auth();
+        let config: MultiAdminConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiAdminConfig)
+            .unwrap_or_else(|| panic!("multisig admin not configured"));
+
+        let mut is_admin = false;
+        for i in 0..config.admins.len() {
+            if config.admins.get(i).unwrap() == admin {
+                is_admin = true;
+                break;
+            }
+        }
+        if !is_admin {
+            panic!("unauthorized");
+        }
+
+        let mut approvals: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AdminApprovals(action_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Check if this admin already approved
+        let mut already_approved = false;
+        for i in 0..approvals.len() {
+            if approvals.get(i).unwrap() == admin {
+                already_approved = true;
+                break;
+            }
+        }
+        if already_approved {
+            panic!("already approved by this admin");
+        }
+
+        approvals.push_back(admin.clone());
+        env.storage().persistent().set(&DataKey::AdminApprovals(action_id.clone()), &approvals);
+
+        env.events().publish(
+            (Symbol::new(&env, "admin_action_proposed"), action_id.clone()),
+            approvals.len() as u32,
+        );
+
+        // Check if threshold reached
+        if approvals.len() as u32 >= config.threshold {
+            // Execute action
+            Self::execute_admin_action(&env, &action_id, operation, params);
+            env.storage().persistent().remove(&DataKey::AdminApprovals(action_id.clone()));
+        }
+    }
+
+    pub fn get_pending_admin_actions(env: Env, action_id: String) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AdminApprovals(action_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    fn execute_admin_action(env: &Env, action_id: &String, operation: Symbol, params: String) {
+        env.events().publish(
+            (Symbol::new(env, "admin_action_executed"), action_id.clone()),
+            operation,
+        );
+        // Note: Actual action execution depends on the operation type
+        // Implementations for specific operations (pause, upgrade, etc.) would go here
     }
 
     // ----------------------------------------------------------
@@ -425,6 +618,12 @@ impl ChainSettleContract {
             panic!("amount must be greater than zero");
         }
 
+        // Check max shipment value cap.
+        let max_value: i128 = env.storage().instance().get(&DataKey::MaxShipmentValue).unwrap_or(0);
+        if max_value > 0 && total_amount > max_value {
+            panic!("total amount exceeds maximum shipment value");
+        }
+
         // Enforce token whitelist when non-empty.
         let allowed: Vec<Address> = env
             .storage()
@@ -473,6 +672,7 @@ impl ChainSettleContract {
             m.proof_hash = String::from_str(&env, "");
             m.release_after_ledger = 0;
             m.proof_submitted_ledger = None;
+            m.dispute_opened_ledger = None;
             clean_milestones.push_back(m);
         }
 
@@ -781,6 +981,9 @@ impl ChainSettleContract {
             let mut fee_amount: i128 = 0;
             let net_payment = Self::deduct_fee(&env, payment, &shipment.token, &mut fee_amount);
 
+            // Check circuit breaker before transferring payment
+            Self::check_circuit_breaker(&env, payment);
+
             milestone.status = MilestoneStatus::Confirmed;
             shipment.milestones.set(milestone_index, milestone);
             shipment.released_amount += payment;
@@ -870,6 +1073,9 @@ impl ChainSettleContract {
         let payment = (shipment.total_amount * milestone.payment_percent as i128) / 100;
         let mut fee_amount: i128 = 0;
         let net_payment = Self::deduct_fee(&env, payment, &shipment.token, &mut fee_amount);
+
+        // Check circuit breaker before transferring payment
+        Self::check_circuit_breaker(&env, payment);
 
         milestone.status = MilestoneStatus::Confirmed;
         milestone.release_after_ledger = 0;
@@ -970,6 +1176,10 @@ impl ChainSettleContract {
             let payment = (shipment.total_amount * milestone.payment_percent as i128) / 100;
             let mut fee_amount: i128 = 0;
             let net_payment = Self::deduct_fee(&env, payment, &shipment.token, &mut fee_amount);
+            
+            // Check circuit breaker before transferring payment
+            Self::check_circuit_breaker(&env, payment);
+            
             shipment.released_amount += payment;
 
             let token_client = token::Client::new(&env, &shipment.token);
@@ -1071,6 +1281,7 @@ impl ChainSettleContract {
         // Cancel any holdback window.
         milestone.release_after_ledger = 0;
         milestone.status = MilestoneStatus::Disputed;
+        milestone.dispute_opened_ledger = Some(env.ledger().sequence());
         shipment.milestones.set(milestone_index, milestone);
 
         env.storage()
@@ -1144,6 +1355,9 @@ impl ChainSettleContract {
             let mut fee_amount: i128 = 0;
             let net_payment = Self::deduct_fee(&env, payment, &shipment.token, &mut fee_amount);
 
+            // Check circuit breaker before transferring payment
+            Self::check_circuit_breaker(&env, payment);
+
             shipment.released_amount += payment;
             let token_client = token::Client::new(&env, &shipment.token);
             token_client.transfer(
@@ -1206,6 +1420,40 @@ impl ChainSettleContract {
             (Symbol::new(&env, "dispute_resolved"), shipment_id.clone()),
             (milestone_index, approve),
         );
+    }
+
+    // ----------------------------------------------------------
+    // CHECK ESCALATION
+    // ----------------------------------------------------------
+
+    /// Check if a dispute has exceeded the escalation threshold without arbiter action.
+    /// Emits DisputeEscalated event if threshold exceeded.
+    pub fn check_escalation(env: Env, shipment_id: String, milestone_index: u32) {
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        let threshold: u32 = env.storage().instance().get(&DataKey::EscalationThreshold).unwrap_or(0);
+
+        if threshold == 0 {
+            return; // Escalation not enabled
+        }
+
+        if milestone_index as usize >= shipment.milestones.len() as usize {
+            panic!("invalid milestone index");
+        }
+
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        if milestone.status != MilestoneStatus::Disputed {
+            return; // Not disputed
+        }
+
+        if let Some(opened_ledger) = milestone.dispute_opened_ledger {
+            let current_ledger = env.ledger().sequence();
+            if current_ledger >= opened_ledger + threshold {
+                env.events().publish(
+                    (Symbol::new(&env, "dispute_escalated"), shipment_id.clone()),
+                    (milestone_index, opened_ledger, current_ledger),
+                );
+            }
+        }
     }
 
     // ----------------------------------------------------------
@@ -1727,6 +1975,9 @@ impl ChainSettleContract {
         let mut fee_amount: i128 = 0;
         let net_payment = Self::deduct_fee(&env, payment, &shipment.token, &mut fee_amount);
 
+        // Check circuit breaker before transferring payment
+        Self::check_circuit_breaker(&env, payment);
+
         milestone.status = MilestoneStatus::Confirmed;
         milestone.proof_submitted_ledger = None;
         shipment.milestones.set(milestone_index, milestone);
@@ -1951,6 +2202,34 @@ impl ChainSettleContract {
                 panic!("transfer disallowed: open dispute must be resolved first");
             }
         }
+    }
+
+    fn check_circuit_breaker(env: &Env, payment: i128) {
+        let limit: i128 = env.storage().instance().get(&DataKey::CircuitBreakerLimit).unwrap_or(0);
+        if limit == 0 {
+            return; // Circuit breaker disabled
+        }
+
+        let window: u32 = env.storage().instance().get(&DataKey::CircuitBreakerWindow).unwrap_or(0);
+        let window_start: u32 = env.storage().instance().get(&DataKey::CircuitBreakerWindowStart).unwrap_or(0);
+        let mut window_outflow: i128 = env.storage().instance().get(&DataKey::CircuitBreakerWindowOutflow).unwrap_or(0);
+
+        let current_ledger = env.ledger().sequence();
+
+        // Reset window if expired
+        if current_ledger >= window_start + window {
+            window_outflow = 0;
+            env.storage().instance().set(&DataKey::CircuitBreakerWindowStart, &current_ledger);
+        }
+
+        // Check if this payment would exceed limit
+        if window_outflow + payment > limit {
+            panic!("circuit breaker triggered: outflow limit exceeded");
+        }
+
+        // Update window outflow
+        window_outflow += payment;
+        env.storage().instance().set(&DataKey::CircuitBreakerWindowOutflow, &window_outflow);
     }
 
     fn get_shipment_internal(env: &Env, shipment_id: &String) -> Shipment {
