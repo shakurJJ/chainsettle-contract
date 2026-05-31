@@ -1,0 +1,26 @@
+[advisories]
+# Fail on any vulnerability that has not been explicitly ignored below.
+vulnerability = "deny"
+unmaintained = "warn"
+yanked = "deny"
+notice = "warn"
+# Add exemptions here with a reason, e.g.:
+# ignore = [{ id = "RUSTSEC-2023-XXXX", reason = "not reachable in our usage" }]
+ignore = []
+
+[licenses]
+# Only MIT and Apache-2.0 are permitted.
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception"]
+deny = []
+unlicensed = "deny"
+copyleft = "deny"
+
+[bans]
+# Deny duplicate versions of the same crate.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

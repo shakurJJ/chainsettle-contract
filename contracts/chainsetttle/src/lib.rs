@@ -2303,6 +2303,42 @@ impl ChainSettleContract {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Returns the total number of shipments associated with `address` as buyer or supplier.
+    /// Shipments where the address holds both roles are counted once.
+    pub fn get_shipment_count(env: Env, address: Address) -> u32 {
+        let buyer_ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BuyerShipments(address.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let supplier_ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SupplierShipments(address.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Start with all buyer shipments, then add supplier shipments not already present.
+        let mut seen: Vec<String> = Vec::new(&env);
+        for i in 0..buyer_ids.len() {
+            seen.push_back(buyer_ids.get(i).unwrap());
+        }
+        for i in 0..supplier_ids.len() {
+            let id = supplier_ids.get(i).unwrap();
+            let mut already = false;
+            for j in 0..seen.len() {
+                if seen.get(j).unwrap() == id {
+                    already = true;
+                    break;
+                }
+            }
+            if !already {
+                seen.push_back(id);
+            }
+        }
+        seen.len() as u32
+    }
+
     // ----------------------------------------------------------
     // INTERNAL HELPERS
     // ----------------------------------------------------------

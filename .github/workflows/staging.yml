@@ -1,0 +1,60 @@
+name: Staging Deploy & Smoke Test
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+jobs:
+  deploy-staging:
+    name: Deploy to Staging Testnet
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + wasm target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Install Stellar CLI
+        run: cargo install --locked stellar-cli --features opt
+
+      - name: Build optimized WASM
+        run: |
+          cargo build --release --target wasm32v1-none
+          stellar contract optimize \
+            --wasm target/wasm32v1-none/release/chainsetttle.wasm
+
+      - name: Deploy to staging contract
+        id: deploy
+        env:
+          STAGING_SECRET: ${{ secrets.STAGING_ACCOUNT_SECRET }}
+        run: |
+          echo "$STAGING_SECRET" | stellar keys add staging-key --secret-key
+          stellar contract deploy \
+            --wasm target/wasm32v1-none/release/chainsetttle.optimized.wasm \
+            --source staging-key \
+            --network testnet \
+            --contract-id ${{ secrets.STAGING_CONTRACT_ID }}
+
+      - name: Run smoke tests
+        id: smoke
+        env:
+          STAGING_CONTRACT_ID: ${{ secrets.STAGING_CONTRACT_ID }}
+          BUYER_SECRET: ${{ secrets.STAGING_BUYER_SECRET }}
+          SUPPLIER_ADDRESS: ${{ secrets.STAGING_SUPPLIER_ADDRESS }}
+          LOGISTICS_ADDRESS: ${{ secrets.STAGING_LOGISTICS_ADDRESS }}
+          ARBITER_ADDRESS: ${{ secrets.STAGING_ARBITER_ADDRESS }}
+          USDC_SAC: ${{ secrets.STAGING_USDC_SAC }}
+        run: bash scripts/smoke_test.sh
+
+      - name: Notify Discord on failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          curl -s -X POST "$DISCORD_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\":\"🚨 **ChainSettle staging smoke test FAILED** on commit \`${{ github.sha }}\` — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}>\"}"
