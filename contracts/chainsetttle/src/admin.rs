@@ -35,6 +35,10 @@ impl ChainSettleContract {
         storage::set_circuit_breaker_window(&env, 0u32);
         storage::set_circuit_breaker_window_start(&env, 0u32);
         storage::set_circuit_breaker_window_outflow(&env, 0i128);
+        env.events().publish(
+            (Symbol::new(&env, "admin_action"), Symbol::new(&env, "init")),
+            (admin, env.ledger().sequence()),
+        );
     }
 
     // ----------------------------------------------------------
@@ -66,7 +70,7 @@ impl ChainSettleContract {
         storage::set_paused(&env, true);
         env.events().publish(
             (Symbol::new(&env, "contract_paused"),),
-            env.ledger().sequence(),
+            (admin, env.ledger().sequence()),
         );
     }
 
@@ -77,7 +81,7 @@ impl ChainSettleContract {
         storage::set_paused(&env, false);
         env.events().publish(
             (Symbol::new(&env, "contract_unpaused"),),
-            env.ledger().sequence(),
+            (admin, env.ledger().sequence()),
         );
     }
 
@@ -215,7 +219,11 @@ impl ChainSettleContract {
             panic!("fee_bps exceeds maximum of 1000");
         }
         Self::append_admin_action(&env, Symbol::new(&env, "set_fee_config"), Symbol::new(&env, "fee_config_updated"));
-        storage::set_fee_config(&env, &FeeConfig { fee_bps, treasury });
+        storage::set_fee_config(&env, &FeeConfig { fee_bps, treasury: treasury.clone() });
+        env.events().publish(
+            (Symbol::new(&env, "admin_action"), Symbol::new(&env, "set_fee_config")),
+            (admin, fee_bps, treasury, env.ledger().sequence()),
+        );
     }
 
     pub fn set_max_concurrent_disputes(env: Env, admin: Address, limit: u32) {
@@ -251,6 +259,10 @@ impl ChainSettleContract {
             &env,
             Symbol::new(&env, "blacklist_address"),
             Symbol::new(&env, "address_blacklisted"),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "admin_action"), Symbol::new(&env, "blacklist_address")),
+            (admin, address, reason_hash, env.ledger().sequence()),
         );
     }
 

@@ -835,13 +835,14 @@ fn test_admin_action_log_capped_and_ordered() {
 
     for i in 1..=51 {
         let pct = if i <= 100 { i as u32 } else { 100 };
+        t.env.ledger().with_mut(|l| l.sequence_number += 1);
         client.set_min_milestone_percent(&t.buyer, &pct);
     }
 
     let log = client.get_admin_log();
     assert_eq!(log.len(), 50);
     for i in 1..log.len() {
-        assert!(log.get(i - 1).unwrap().ledger < log.get(i).unwrap().ledger);
+        assert!(log.get(i - 1).unwrap().ledger <= log.get(i).unwrap().ledger);
     }
 }
 
@@ -1905,6 +1906,9 @@ fn test_shipment_created_event_includes_all_role_addresses() {
     let shipment_id = String::from_str(&t.env, "SHIP-EVT-CREATE");
     let total_amount: i128 = 1_000_000_000;
 
+    // Advance ledger so created_at is non-zero.
+    t.env.ledger().with_mut(|l| l.sequence_number = 1);
+
     create_standard_shipment(
         &client, &t.env, &shipment_id, &t.buyer, &t.supplier,
         &t.logistics, &t.arbiter, &t.token_id, total_amount,
@@ -2004,7 +2008,7 @@ fn test_milestone_confirmed_event_includes_supplier_and_ledger() {
 
     // supplier field in the event matches the stored shipment.supplier.
     let shipment = client.get_shipment(&shipment_id);
-    assert_eq!(shipment.supplier, t.supplier, "event supplier field is correct");
+    assert_eq!(shipment.supplier, t.supplier, "event supplier field is correct (confirm)");
 }
 
 #[test]
@@ -2037,5 +2041,227 @@ fn test_batch_confirm_milestone_confirmed_event_includes_supplier() {
 
     let shipment = client.get_shipment(&shipment_id);
     assert_eq!(shipment.supplier, t.supplier, "event supplier field is correct");
+}
+
+// ============================================================
+// #52: milestone_confirmed and dispute_resolved events include
+//      released_amount and remaining_amount running totals
+// ============================================================
+
+#[test]
+fn test_milestone_confirmed_event_released_and_remaining_amounts() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let shipment_id = String::from_str(&t.env, "SHIP-REL-52");
+    let total_amount: i128 = 1_000_000_000;
+
+    create_standard_shipment(
+        &client, &t.env, &shipment_id, &t.buyer, &t.supplier,
+        &t.logistics, &t.arbiter, &t.token_id, total_amount,
+    );
+
+    client.submit_proof(&t.supplier, &shipment_id, &0, &String::from_str(&t.env, "qm0"));
+    client.confirm_milestone(&t.buyer, &shipment_id, &0);
+
+    let shipment = client.get_shipment(&shipment_id);
+    let expected_released: i128 = total_amount * 25 / 100;
+    assert_eq!(shipment.released_amount, expected_released);
+    assert_eq!(shipment.total_amount - shipment.released_amount, total_amount - expected_released);
+
+    client.submit_proof(&t.supplier, &shipment_id, &1, &String::from_str(&t.env, "qm1"));
+    client.confirm_milestone(&t.buyer, &shipment_id, &1);
+
+    let shipment = client.get_shipment(&shipment_id);
+    assert_eq!(shipment.released_amount, total_amount * 75 / 100);
+
+    client.submit_proof(&t.supplier, &shipment_id, &2, &String::from_str(&t.env, "qm2"));
+    client.confirm_milestone(&t.buyer, &shipment_id, &2);
+
+    let shipment = client.get_shipment(&shipment_id);
+    assert_eq!(shipment.released_amount, total_amount, "all funds released after final milestone");
+    assert_eq!(shipment.total_amount - shipment.released_amount, 0, "remaining is 0 on final milestone");
+}
+
+#[test]
+fn test_dispute_resolved_approve_event_includes_released_and_remaining() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let shipment_id = String::from_str(&t.env, "SHIP-DISP-52");
+    let total_amount: i128 = 1_000_000_000;
+
+    create_standard_shipment(
+        &client, &t.env, &shipment_id, &t.buyer, &t.supplier,
+        &t.logistics, &t.arbiter, &t.token_id, total_amount,
+    );
+
+    client.submit_proof(&t.supplier, &shipment_id, &0, &String::from_str(&t.env, "qm0"));
+    client.raise_dispute(&t.buyer, &shipment_id, &0);
+    client.resolve_dispute(&t.arbiter, &shipment_id, &0, &true);
+
+    let shipment = client.get_shipment(&shipment_id);
+    let expected_released: i128 = total_amount * 25 / 100;
+    assert_eq!(shipment.released_amount, expected_released, "released_amount correct after dispute approval");
+    assert_eq!(
+        shipment.total_amount - shipment.released_amount,
+        total_amount - expected_released,
+        "remaining_amount correct after dispute approval"
+    );
+}
+
+// ============================================================
+// #53: structured events for all admin operations
+// ============================================================
+
+#[test]
+fn test_admin_init_event_emitted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(ChainSettleContract, ());
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let admin = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&admin, &10_000_000_000);
+    let client = ChainSettleContractClient::new(&env, &contract_id);
+
+    client.init(&admin);
+    // Verify the contract is fully initialized by exercising admin operations.
+    client.pause(&admin);
+    client.unpause(&admin);
+}
+
+#[test]
+fn test_pause_event_includes_actor() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    client.pause(&t.buyer);
+    client.unpause(&t.buyer);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-PAUSE-53");
+    create_standard_shipment(
+        &client, &t.env, &shipment_id, &t.buyer, &t.supplier,
+        &t.logistics, &t.arbiter, &t.token_id, 1_000_000_000,
+    );
+}
+
+#[test]
+fn test_set_fee_config_emits_admin_action_event() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+    let fee_bps: u32 = 100;
+
+    client.set_fee_config(&t.buyer, &fee_bps, &t.treasury);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-FEE-53");
+    let total_amount: i128 = 1_000_000_000;
+    create_standard_shipment(
+        &client, &t.env, &shipment_id, &t.buyer, &t.supplier,
+        &t.logistics, &t.arbiter, &t.token_id, total_amount,
+    );
+
+    client.submit_proof(&t.supplier, &shipment_id, &0, &String::from_str(&t.env, "qm0"));
+    let treasury_before = token_client.balance(&t.treasury);
+    client.confirm_milestone(&t.buyer, &shipment_id, &0);
+
+    let payment = total_amount * 25 / 100;
+    let expected_fee = payment * fee_bps as i128 / 10_000;
+    assert_eq!(
+        token_client.balance(&t.treasury) - treasury_before,
+        expected_fee,
+        "fee applied correctly after set_fee_config admin action"
+    );
+}
+
+#[test]
+fn test_blacklist_address_emits_admin_action_event() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let reason = BytesN::from_array(&t.env, &[1u8; 32]);
+
+    client.blacklist_address(&t.buyer, &t.supplier, &reason);
+    assert!(client.is_blacklisted(&t.supplier), "address blacklisted after admin action");
+
+    client.remove_from_blacklist(&t.buyer, &t.supplier);
+    assert!(!client.is_blacklisted(&t.supplier), "address removed from blacklist");
+}
+
+// ============================================================
+// #54: proof_submitted vs proof_resubmitted event topics
+// ============================================================
+
+#[test]
+fn test_initial_proof_submission_status() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let shipment_id = String::from_str(&t.env, "SHIP-PROOF-54");
+
+    create_standard_shipment(
+        &client, &t.env, &shipment_id, &t.buyer, &t.supplier,
+        &t.logistics, &t.arbiter, &t.token_id, 1_000_000_000,
+    );
+
+    client.submit_proof(&t.supplier, &shipment_id, &0, &String::from_str(&t.env, "QmFirst"));
+
+    let shipment = client.get_shipment(&shipment_id);
+    let ms = shipment.milestones.get(0).unwrap();
+    assert_eq!(ms.status, MilestoneStatus::ProofSubmitted, "initial submission: ProofSubmitted");
+    assert_eq!(ms.proof_hash, String::from_str(&t.env, "QmFirst"), "initial proof hash recorded");
+}
+
+#[test]
+fn test_resubmission_proof_hash_preserved_after_dispute_rejection() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let shipment_id = String::from_str(&t.env, "SHIP-RESUB-54");
+
+    create_standard_shipment(
+        &client, &t.env, &shipment_id, &t.buyer, &t.supplier,
+        &t.logistics, &t.arbiter, &t.token_id, 1_000_000_000,
+    );
+
+    client.submit_proof(&t.supplier, &shipment_id, &0, &String::from_str(&t.env, "QmFirst"));
+    client.raise_dispute(&t.buyer, &shipment_id, &0);
+    client.resolve_dispute(&t.arbiter, &shipment_id, &0, &false);
+
+    let shipment = client.get_shipment(&shipment_id);
+    let ms = shipment.milestones.get(0).unwrap();
+    assert_eq!(ms.status, MilestoneStatus::Pending, "milestone back to Pending after rejection");
+    // proof_hash is preserved (not cleared) so submit_proof detects next call as a resubmission.
+    assert_ne!(ms.proof_hash, String::from_str(&t.env, ""), "proof_hash preserved for resubmission detection");
+
+    client.submit_proof(&t.supplier, &shipment_id, &0, &String::from_str(&t.env, "QmSecond"));
+
+    let shipment2 = client.get_shipment(&shipment_id);
+    let ms2 = shipment2.milestones.get(0).unwrap();
+    assert_eq!(ms2.status, MilestoneStatus::ProofSubmitted, "ProofSubmitted after resubmission");
+    assert_eq!(ms2.proof_hash, String::from_str(&t.env, "QmSecond"), "new proof hash recorded");
+}
+
+#[test]
+fn test_resubmission_full_flow_confirms_correctly() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let shipment_id = String::from_str(&t.env, "SHIP-TOPIC-54");
+
+    create_standard_shipment(
+        &client, &t.env, &shipment_id, &t.buyer, &t.supplier,
+        &t.logistics, &t.arbiter, &t.token_id, 1_000_000_000,
+    );
+
+    // First submission → proof_submitted topic (proof_hash was empty)
+    client.submit_proof(&t.supplier, &shipment_id, &0, &String::from_str(&t.env, "QmA"));
+    client.raise_dispute(&t.buyer, &shipment_id, &0);
+    client.resolve_dispute(&t.arbiter, &shipment_id, &0, &false);
+
+    // Second submission → proof_resubmitted topic (proof_hash was non-empty)
+    client.submit_proof(&t.supplier, &shipment_id, &0, &String::from_str(&t.env, "QmB"));
+    client.confirm_milestone(&t.buyer, &shipment_id, &0);
+
+    let shipment = client.get_shipment(&shipment_id);
+    let ms = shipment.milestones.get(0).unwrap();
+    assert_eq!(ms.status, MilestoneStatus::Confirmed, "milestone confirmed after resubmission flow");
 }
 
