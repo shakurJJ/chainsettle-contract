@@ -178,6 +178,14 @@ pub struct ContractStats {
     pub completed_shipments: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ReputationScore {
+    pub completed: u32,
+    pub disputed: u32,
+    pub cancelled: u32,
+}
+
 /// Active dispute entry: (shipment_id, milestone_index).
 #[contracttype]
 #[derive(Clone, PartialEq, Debug)]
@@ -214,6 +222,8 @@ pub enum DataKey {
     AllShipments,
     /// Supplier-to-shipments index: Vec<shipment_id> for a given supplier.
     SupplierShipments(Address),
+    /// Supplier reputation score.
+    SupplierRep(Address),
     /// Buyer-to-shipments index: Vec<shipment_id> for a given buyer.
     BuyerShipments(Address),
     Admin,
@@ -480,6 +490,13 @@ impl ChainSettleContract {
             .instance()
             .get(&DataKey::MaxShipmentValue)
             .unwrap_or(0)
+    }
+
+    pub fn get_reputation(env: Env, supplier: Address) -> ReputationScore {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SupplierRep(supplier.clone()))
+            .unwrap_or_default()
     }
 
     // ----------------------------------------------------------
@@ -1275,6 +1292,7 @@ impl ChainSettleContract {
                 env.storage()
                     .instance()
                     .set(&DataKey::ContractStats, &stats);
+                Self::increment_reputation_internal(&env, &shipment.supplier, 1, 0, 0);
                 // Move from Active to Completed status index.
                 Self::move_shipment_status_index(
                     &env,
@@ -1379,6 +1397,7 @@ impl ChainSettleContract {
             env.storage()
                 .instance()
                 .set(&DataKey::ContractStats, &stats);
+            Self::increment_reputation_internal(&env, &shipment.supplier, 1, 0, 0);
             // Move from Active to Completed status index.
             Self::move_shipment_status_index(
                 &env,
@@ -1518,6 +1537,7 @@ impl ChainSettleContract {
             env.storage()
                 .instance()
                 .set(&DataKey::ContractStats, &stats);
+            Self::increment_reputation_internal(&env, &shipment.supplier, 1, 0, 0);
             // Move from Active to Completed status index.
             Self::move_shipment_status_index(
                 &env,
@@ -1593,6 +1613,8 @@ impl ChainSettleContract {
         env.storage()
             .persistent()
             .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        Self::increment_reputation_internal(&env, &shipment.supplier, 0, 1, 0);
 
         // Add to active disputes list.
         let mut disputes: Vec<DisputeEntry> = env
@@ -1720,6 +1742,7 @@ impl ChainSettleContract {
             env.storage()
                 .instance()
                 .set(&DataKey::ContractStats, &stats);
+            Self::increment_reputation_internal(&env, &shipment.supplier, 1, 0, 0);
             // Move from Active to Completed status index.
             Self::move_shipment_status_index(
                 &env,
@@ -1828,6 +1851,8 @@ impl ChainSettleContract {
         }
 
         shipment.status = ShipmentStatus::Cancelled;
+
+        Self::increment_reputation_internal(&env, &shipment.supplier, 0, 0, 1);
 
         // Move from Active to Cancelled status index.
         Self::move_shipment_status_index(
@@ -1946,6 +1971,8 @@ impl ChainSettleContract {
         }
 
         shipment.status = ShipmentStatus::Cancelled;
+
+        Self::increment_reputation_internal(&env, &shipment.supplier, 0, 0, 1);
 
         // Move from Active to Cancelled status index.
         Self::move_shipment_status_index(
@@ -2790,6 +2817,35 @@ impl ChainSettleContract {
         env.storage()
             .instance()
             .set(&DataKey::CircuitBreakerWindowOutflow, &window_outflow);
+    }
+
+    fn get_reputation_internal(env: &Env, supplier: &Address) -> ReputationScore {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SupplierRep(supplier.clone()))
+            .unwrap_or_default()
+    }
+
+    fn set_reputation_internal(env: &Env, supplier: &Address, score: &ReputationScore) {
+        let key = DataKey::SupplierRep(supplier.clone());
+        env.storage().persistent().set(&key, score);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 6_300_000);
+    }
+
+    fn increment_reputation_internal(
+        env: &Env,
+        supplier: &Address,
+        completed_delta: u32,
+        disputed_delta: u32,
+        cancelled_delta: u32,
+    ) {
+        let mut score = Self::get_reputation_internal(env, supplier);
+        score.completed = score.completed.saturating_add(completed_delta);
+        score.disputed = score.disputed.saturating_add(disputed_delta);
+        score.cancelled = score.cancelled.saturating_add(cancelled_delta);
+        Self::set_reputation_internal(env, supplier, &score);
     }
 
     fn get_shipment_internal(env: &Env, shipment_id: &String) -> Shipment {
