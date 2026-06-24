@@ -3559,6 +3559,442 @@ fn test_concurrent_shipments_no_storage_clobbering() {
 }
 
 // ============================================================
+// SUPPLIER ADVANCE PAYMENT TESTS
+// ============================================================
+
+#[test]
+fn test_advance_approved_deducted_on_confirm() {
+    // Verify: Supplier requests advance → buyer approves → advance transferred
+    // → on confirm, advance deducted from milestone payment.
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-ADV-DEDUCT");
+    let total_amount: i128 = 1_000_000_000;
+
+    create_standard_shipment(
+        &client,
+        &t.env,
+        &shipment_id,
+        &t.buyer,
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        total_amount,
+    );
+
+    // Milestone 0 is 25%. Advance 30% of that = 7.5% of total = 75_000_000.
+    let milestone_payment = total_amount * 25 / 100; // 250_000_000
+    let advance_percent: u32 = 30;
+    let expected_advance = milestone_payment * advance_percent as i128 / 100; // 75_000_000
+
+    let supplier_before = token_client.balance(&t.supplier);
+
+    // Supplier requests advance.
+    client.request_advance(&t.supplier, &shipment_id, &0, &advance_percent);
+
+    // Buyer approves advance.
+    client.approve_advance(&t.buyer, &shipment_id, &0);
+
+    // Advance should be transferred immediately.
+    assert_eq!(
+        token_client.balance(&t.supplier),
+        supplier_before + expected_advance,
+        "advance transferred on approval"
+    );
+
+    // Escrow balance should reflect the advance.
+    assert_eq!(
+        client.get_escrow_balance(&shipment_id),
+        total_amount - expected_advance,
+        "escrow reduced by advance"
+    );
+
+    // Submit proof and confirm milestone.
+    client.submit_proof(
+        &t.supplier,
+        &shipment_id,
+        &0,
+        &String::from_str(&t.env, "ipfs://d"),
+    );
+    client.confirm_milestone(&t.buyer, &shipment_id, &0);
+
+    // On confirm, supplier should receive milestone_payment - advance.
+    assert_eq!(
+        token_client.balance(&t.supplier),
+        supplier_before + milestone_payment, // advance + remaining = full payment
+        "supplier received full milestone payment over two transfers"
+    );
+
+    // Shipment should show correct released amount.
+    let shipment = client.get_shipment(&shipment_id);
+    assert_eq!(shipment.released_amount, milestone_payment);
+    assert_eq!(shipment.total_advanced_amount, 0, "advance consumed");
+
+    // Escrow balance should now reflect the milestone payment.
+    assert_eq!(
+        client.get_escrow_balance(&shipment_id),
+        total_amount - milestone_payment,
+    );
+}
+
+#[test]
+fn test_advance_exceeding_cap_rejected() {
+    // Verify: advance_percent > max_advance_percent is rejected.
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-ADV-CAP");
+    let total_amount: i128 = 1_000_000_000;
+
+    create_standard_shipment(
+        &client,
+        &t.env,
+        &shipment_id,
+        &t.buyer,
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        total_amount,
+    );
+
+    // Default max is 30%. Try 31%.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.request_advance(&t.supplier, &shipment_id, &0, &31);
+    }));
+    assert!(result.is_err(), "advance > 30% should be rejected");
+}
+
+#[test]
+fn test_advance_exceeding_custom_cap_rejected() {
+    // Verify: admin can change max advance percent; new cap enforced.
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    // Admin sets max to 10%.
+    client.set_max_advance_percent(&t.buyer, &10);
+    assert_eq!(client.get_max_advance_percent(), 10);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-ADV-CUSTOM");
+    let total_amount: i128 = 1_000_000_000;
+
+    create_standard_shipment(
+        &client,
+        &t.env,
+        &shipment_id,
+        &t.buyer,
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        total_amount,
+    );
+
+    // 10% should work.
+    client.request_advance(&t.supplier, &shipment_id, &0, &10);
+
+    // 11% should be rejected.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.request_advance(&t.supplier, &shipment_id, &1, &11);
+    }));
+    assert!(result.is_err(), "advance > 10% should be rejected after update");
+}
+
+#[test]
+fn test_unapproved_advance_no_funds_moved() {
+    // Verify: requesting advance does NOT transfer funds until approved.
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-ADV-NOOP");
+    let total_amount: i128 = 1_000_000_000;
+
+    create_standard_shipment(
+        &client,
+        &t.env,
+        &shipment_id,
+        &t.buyer,
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        total_amount,
+    );
+
+    let supplier_before = token_client.balance(&t.supplier);
+
+    // Supplier requests advance — no funds should move.
+    client.request_advance(&t.supplier, &shipment_id, &0, &20);
+
+    assert_eq!(
+        token_client.balance(&t.supplier),
+        supplier_before,
+        "no funds transferred on request alone"
+    );
+
+    // Escrow balance unchanged.
+    assert_eq!(client.get_escrow_balance(&shipment_id), total_amount);
+}
+
+#[test]
+fn test_advance_only_supplier_can_request() {
+    // Verify: only the shipment's supplier can request an advance.
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-ADV-AUTH");
+    let total_amount: i128 = 1_000_000_000;
+
+    create_standard_shipment(
+        &client,
+        &t.env,
+        &shipment_id,
+        &t.buyer,
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        total_amount,
+    );
+
+    // Logistics is not the supplier — should be rejected.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.request_advance(&t.logistics, &shipment_id, &0, &20);
+    }));
+    assert!(result.is_err(), "non-supplier should be rejected");
+}
+
+#[test]
+fn test_advance_only_buyer_can_approve() {
+    // Verify: only a buyer can approve an advance.
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-ADV-APPROVE-AUTH");
+    let total_amount: i128 = 1_000_000_000;
+
+    create_standard_shipment(
+        &client,
+        &t.env,
+        &shipment_id,
+        &t.buyer,
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        total_amount,
+    );
+
+    client.request_advance(&t.supplier, &shipment_id, &0, &20);
+
+    // Supplier tries to approve their own advance — should be rejected.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.approve_advance(&t.supplier, &shipment_id, &0);
+    }));
+    assert!(result.is_err(), "non-buyer should not approve advance");
+}
+
+#[test]
+fn test_advance_multi_milestone_deductions() {
+    // Verify: advances on multiple milestones are deducted independently.
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-ADV-MULTI");
+    let total_amount: i128 = 1_000_000_000;
+
+    create_standard_shipment(
+        &client,
+        &t.env,
+        &shipment_id,
+        &t.buyer,
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        total_amount,
+    );
+
+    // Milestones: 25%, 50%, 25%
+    // Advance 20% on milestone 0 (25% of total = 250M → advance = 50M)
+    // Advance 10% on milestone 1 (50% of total = 500M → advance = 50M)
+    let m0_payment = total_amount * 25 / 100;
+    let m1_payment = total_amount * 50 / 100;
+    let _m2_payment = total_amount - m0_payment - m1_payment;
+
+    let advance0 = m0_payment * 20 / 100;
+    let advance1 = m1_payment * 10 / 100;
+
+    let supplier_before = token_client.balance(&t.supplier);
+
+    // Request and approve advance for milestone 0.
+    client.request_advance(&t.supplier, &shipment_id, &0, &20);
+    client.approve_advance(&t.buyer, &shipment_id, &0);
+    assert_eq!(
+        token_client.balance(&t.supplier),
+        supplier_before + advance0,
+    );
+
+    // Request and approve advance for milestone 1.
+    client.request_advance(&t.supplier, &shipment_id, &1, &10);
+    client.approve_advance(&t.buyer, &shipment_id, &1);
+    assert_eq!(
+        token_client.balance(&t.supplier),
+        supplier_before + advance0 + advance1,
+    );
+
+    // Confirm milestone 0.
+    client.submit_proof(
+        &t.supplier,
+        &shipment_id,
+        &0,
+        &String::from_str(&t.env, "ipfs://m0"),
+    );
+    client.confirm_milestone(&t.buyer, &shipment_id, &0);
+
+    // Supplier gets m0_payment - advance0 extra.
+    assert_eq!(
+        token_client.balance(&t.supplier),
+        supplier_before + advance0 + advance1 + (m0_payment - advance0),
+    );
+
+    // Confirm milestone 1.
+    client.submit_proof(
+        &t.logistics,
+        &shipment_id,
+        &1,
+        &String::from_str(&t.env, "ipfs://m1"),
+    );
+    client.confirm_milestone(&t.buyer, &shipment_id, &1);
+
+    assert_eq!(
+        token_client.balance(&t.supplier),
+        supplier_before + advance0 + advance1 + (m0_payment - advance0) + (m1_payment - advance1),
+    );
+
+    // Confirm milestone 2 (no advance).
+    client.submit_proof(
+        &t.supplier,
+        &shipment_id,
+        &2,
+        &String::from_str(&t.env, "ipfs://m2"),
+    );
+    client.confirm_milestone(&t.buyer, &shipment_id, &2);
+
+    // Total should be full amount.
+    assert_eq!(
+        token_client.balance(&t.supplier),
+        supplier_before + total_amount,
+    );
+
+    let shipment = client.get_shipment(&shipment_id);
+    assert_eq!(shipment.status, ShipmentStatus::Completed);
+    assert_eq!(shipment.released_amount, total_amount);
+    assert_eq!(shipment.total_advanced_amount, 0, "all advances consumed");
+    assert_eq!(client.get_escrow_balance(&shipment_id), 0);
+}
+
+#[test]
+fn test_advance_rejected_for_wrong_milestone_status() {
+    // Verify: advance can only be requested on a Pending milestone.
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-ADV-STATUS");
+    let total_amount: i128 = 1_000_000_000;
+
+    create_standard_shipment(
+        &client,
+        &t.env,
+        &shipment_id,
+        &t.buyer,
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        total_amount,
+    );
+
+    // Submit proof for milestone 0.
+    client.submit_proof(
+        &t.supplier,
+        &shipment_id,
+        &0,
+        &String::from_str(&t.env, "ipfs://d"),
+    );
+
+    // Advance on non-Pending milestone should be rejected.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.request_advance(&t.supplier, &shipment_id, &0, &10);
+    }));
+    assert!(result.is_err(), "advance on non-pending milestone should be rejected");
+}
+
+#[test]
+fn test_advance_double_approval_rejected() {
+    // Verify: approving an already-approved advance is rejected.
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-ADV-DBL");
+    let total_amount: i128 = 1_000_000_000;
+
+    create_standard_shipment(
+        &client,
+        &t.env,
+        &shipment_id,
+        &t.buyer,
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        total_amount,
+    );
+
+    client.request_advance(&t.supplier, &shipment_id, &0, &20);
+    client.approve_advance(&t.buyer, &shipment_id, &0);
+
+    // Second approval should be rejected.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.approve_advance(&t.buyer, &shipment_id, &0);
+    }));
+    assert!(result.is_err(), "double approval should be rejected");
+}
+
+#[test]
+fn test_advance_no_request_no_approval() {
+    // Verify: approving without a prior request is rejected.
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-ADV-NOREQ");
+    let total_amount: i128 = 1_000_000_000;
+
+    create_standard_shipment(
+        &client,
+        &t.env,
+        &shipment_id,
+        &t.buyer,
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        total_amount,
+    );
+
+    // Approve without prior request.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.approve_advance(&t.buyer, &shipment_id, &0);
+    }));
+    assert!(result.is_err(), "approval without request should be rejected");
+}
+
+// ============================================================
 // TTL EXPIRY SIMULATION TESTS (Issue #58)
 // ============================================================
 
