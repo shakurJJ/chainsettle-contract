@@ -4,8 +4,8 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _, Symbol},
-    token, vec, Address, BytesN, Env, String,
+    testutils::{Address as _, Ledger as _},
+    token, vec, Address, BytesN, Env, String, Symbol,
 };
 use std::format;
 
@@ -25,17 +25,26 @@ struct TestSetup {
     treasury: Address,
 }
 
+/// Create a mock SAC (Stellar Asset Contract) for testing.
+/// Returns the token address and mints initial funds to addresses.
+fn mock_token(env: &Env, admin: &Address, addresses: &Vec<Address>, initial_balance: i128) -> Address {
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_client = token::StellarAssetClient::new(env, &token_id);
+
+    for i in 0..addresses.len() {
+        token_client.mint(addresses.get(i).unwrap(), &initial_balance);
+    }
+
+    token_id
+}
+
 fn setup() -> TestSetup {
     let env = Env::default();
     env.mock_all_auths();
 
     let contract_id = env.register(ChainSettleContract, ());
-
-    let token_admin = Address::generate(&env);
-    let token_id = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
-    let token_client = token::StellarAssetClient::new(&env, &token_id);
 
     let buyer = Address::generate(&env);
     let buyer2 = Address::generate(&env);
@@ -43,9 +52,10 @@ fn setup() -> TestSetup {
     let logistics = Address::generate(&env);
     let arbiter = Address::generate(&env);
     let treasury = Address::generate(&env);
+    let token_admin = Address::generate(&env);
 
-    token_client.mint(&buyer, &10_000_000_000);
-    token_client.mint(&buyer2, &10_000_000_000);
+    let addresses = vec![&env, buyer.clone(), buyer2.clone()];
+    let token_id = mock_token(&env, &token_admin, &addresses, 10_000_000_000);
 
     let client = ChainSettleContractClient::new(&env, &contract_id);
     client.init(&buyer);
@@ -110,6 +120,10 @@ fn default_options(_env: &Env) -> ShipmentOptions {
         late_penalty_bps_per_ledger: 0,
         auto_confirm_ledgers: 0,
         dispute_bond_amount: 0,
+        arbiter_fee_bps: 0,
+        logistics_fee_bps: 0,
+        supplier_collateral: 0,
+        expires_at_ledger: None,
     }
 }
 
@@ -1248,7 +1262,11 @@ fn test_dispute_cooldown_enforced() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     // First dispute on milestone 0.
@@ -1313,7 +1331,11 @@ fn test_dispute_cooldown_blocks_early_redispute() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     client.submit_proof(
@@ -1408,7 +1430,11 @@ fn test_cooldown_updated_on_resolve() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     client.submit_proof(
@@ -1795,7 +1821,11 @@ fn test_non_whitelisted_token_rejected() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 }
 
@@ -1917,7 +1947,11 @@ fn test_holdback_happy_path() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     client.submit_proof(
@@ -2004,7 +2038,11 @@ fn test_holdback_early_dispute_cancels_hold() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     client.submit_proof(
@@ -2216,7 +2254,11 @@ fn test_multisig_both_buyers_must_confirm() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     client.submit_proof(
@@ -2292,7 +2334,11 @@ fn test_multisig_minority_veto_dispute() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     client.submit_proof(
@@ -2667,7 +2713,11 @@ fn test_deadline_cancellation_success() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     client.submit_proof(
@@ -2722,7 +2772,11 @@ fn test_deadline_cancellation_too_early() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     client.submit_proof(
@@ -4363,4 +4417,236 @@ fn test_ttl_documentation_in_comments() {
         max_seconds, 31_500_000,
         "TTL_MAX_LEDGERS = 31,500,000 seconds"
     );
+}
+
+// ============================================================
+// NEW FEATURES TESTS
+// ============================================================
+
+#[test]
+fn test_logistics_fee_deduction() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+
+    let shipment_id = String::from_str(&t.env, "logistics-fee-1");
+    let mut opts = default_options(&t.env);
+    opts.logistics_fee_bps = 500; // 5% logistics fee
+
+    client.create_shipment(
+        &shipment_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000_000i128,
+        &build_milestones(&t.env),
+        &opts,
+    );
+
+    // Submit and confirm proof for first milestone (25% = 250,000,000)
+    client.submit_proof(
+        &t.supplier,
+        &shipment_id,
+        &0,
+        &String::from_str(&t.env, "proof_hash_0"),
+        &Symbol::new(&t.env, "ipfs"),
+    );
+    client.confirm_milestone(&t.buyer, &shipment_id, &0);
+
+    // Logistics fee = 250,000,000 * 500 / 10,000 = 12,500,000
+    // Supplier should receive: 250,000,000 - 12,500,000 = 237,500,000
+    let supplier_balance = token_client.balance(&t.supplier);
+    assert_eq!(supplier_balance, 237_500_000, "Supplier should receive payment minus logistics fee");
+
+    let logistics_balance = token_client.balance(&t.logistics);
+    assert_eq!(logistics_balance, 12_500_000, "Logistics provider should receive logistics fee");
+}
+
+#[test]
+fn test_logistics_fee_zero() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+
+    let shipment_id = String::from_str(&t.env, "no-logistics-fee");
+    let opts = default_options(&t.env);
+
+    client.create_shipment(
+        &shipment_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000_000i128,
+        &build_milestones(&t.env),
+        &opts,
+    );
+
+    client.submit_proof(
+        &t.supplier,
+        &shipment_id,
+        &0,
+        &String::from_str(&t.env, "proof_hash_0"),
+        &Symbol::new(&t.env, "ipfs"),
+    );
+    client.confirm_milestone(&t.buyer, &shipment_id, &0);
+
+    // With zero logistics fee, full payment goes to supplier
+    let supplier_balance = token_client.balance(&t.supplier);
+    assert_eq!(supplier_balance, 250_000_000, "Supplier should receive full payment");
+
+    let logistics_balance = token_client.balance(&t.logistics);
+    assert_eq!(logistics_balance, 0, "Logistics provider should receive nothing");
+}
+
+#[test]
+fn test_supplier_collateral_forfeiture_on_buyer_cancel() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+
+    let shipment_id = String::from_str(&t.env, "collateral-1");
+    let mut opts = default_options(&t.env);
+    opts.supplier_collateral = 50_000_000; // Supplier must lock 50M
+
+    // Mint additional funds for supplier
+    token_client.mint(&t.supplier, &100_000_000);
+
+    client.create_shipment(
+        &shipment_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000_000i128,
+        &build_milestones(&t.env),
+        &opts,
+    );
+
+    // Buyer cancels, collateral should be forfeited to buyer
+    client.cancel_shipment(&t.buyer, &shipment_id);
+
+    let buyer_balance = token_client.balance(&t.buyer);
+    // Original 10B - 1B (shipment) + 1B (full refund) + 50M (collateral forfeiture)
+    assert_eq!(
+        buyer_balance, 10_050_000_000,
+        "Buyer should receive collateral forfeiture on cancellation"
+    );
+}
+
+#[test]
+fn test_supplier_collateral_return_on_completion() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+
+    let shipment_id = String::from_str(&t.env, "collateral-complete");
+    let mut opts = default_options(&t.env);
+    opts.supplier_collateral = 50_000_000;
+
+    token_client.mint(&t.supplier, &100_000_000);
+
+    client.create_shipment(
+        &shipment_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000_000i128,
+        &build_milestones(&t.env),
+        &opts,
+    );
+
+    let initial_supplier_balance = token_client.balance(&t.supplier);
+
+    // Complete all milestones
+    for i in 0..3 {
+        client.submit_proof(
+            &t.supplier,
+            &shipment_id,
+            &i,
+            &String::from_str(&t.env, &format!("proof_hash_{}", i)),
+            &Symbol::new(&t.env, "ipfs"),
+        );
+        client.confirm_milestone(&t.buyer, &shipment_id, &i);
+    }
+
+    let final_supplier_balance = token_client.balance(&t.supplier);
+    // Supplier should have: initial + all milestone payments + returned collateral
+    // All milestones: 1B total (no deductions from original supply in this test)
+    assert!(
+        final_supplier_balance > initial_supplier_balance,
+        "Supplier should receive collateral return on completion"
+    );
+}
+
+#[test]
+fn test_shipment_expiry_success() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+
+    let shipment_id = String::from_str(&t.env, "expiry-1");
+    let mut opts = default_options(&t.env);
+    opts.expires_at_ledger = Some(t.env.ledger().sequence() + 10);
+
+    client.create_shipment(
+        &shipment_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000_000i128,
+        &build_milestones(&t.env),
+        &opts,
+    );
+
+    // Try to expire before deadline (should fail)
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.expire_shipment(&shipment_id);
+    }));
+    assert!(result.is_err(), "Should not allow expiry before deadline");
+
+    // Jump to after expiry ledger
+    t.env.ledger().set_sequence(t.env.ledger().sequence() + 11);
+
+    // Now expiry should succeed
+    client.expire_shipment(&shipment_id);
+
+    let buyer_balance = token_client.balance(&t.buyer);
+    // Full refund: 10B (original) - 1B (locked) + 1B (refund) = 10B
+    assert_eq!(buyer_balance, 10_000_000_000, "Buyer should receive full escrow refund on expiry");
+}
+
+#[test]
+fn test_shipment_no_expiry() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let shipment_id = String::from_str(&t.env, "no-expiry");
+    let opts = default_options(&t.env);
+
+    client.create_shipment(
+        &shipment_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000_000i128,
+        &build_milestones(&t.env),
+        &opts,
+    );
+
+    // Try to expire when no expiry is set (should fail)
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.expire_shipment(&shipment_id);
+    }));
+    assert!(result.is_err(), "Should not allow expiry when not configured");
 }

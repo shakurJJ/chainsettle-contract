@@ -313,6 +313,10 @@ mod contract_prop_tests {
                 late_penalty_bps_per_ledger: 0,
                 auto_confirm_ledgers: 0,
                 dispute_bond_amount: 0,
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
             },
         );
     }
