@@ -3745,6 +3745,7 @@ mod benchmarks;
 pub mod constants;
 mod property_tests;
 mod test;
+mod test_oracle;
 mod test_upgrade;
 mod test_concurrent_disputes;
 mod test_boundaries;
