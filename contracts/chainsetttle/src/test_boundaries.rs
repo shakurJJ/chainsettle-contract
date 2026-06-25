@@ -21,8 +21,8 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _, Symbol},
-    token, vec, Address, Env, String,
+    testutils::{Address as _, Ledger as _},
+    token, vec, Address, Env, String, Symbol,
 };
 
 // ---- shared env setup -------------------------------------------------------

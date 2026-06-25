@@ -4,8 +4,8 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _, Symbol},
-    token, vec, Address, BytesN, Env, String,
+    testutils::{Address as _, Ledger as _},
+    token, vec, Address, BytesN, Env, String, Symbol,
 };
 use std::format;
 
@@ -25,17 +25,26 @@ struct TestSetup {
     treasury: Address,
 }
 
+/// Create a mock SAC (Stellar Asset Contract) for testing.
+/// Returns the token address and mints initial funds to addresses.
+fn mock_token(env: &Env, admin: &Address, addresses: &Vec<Address>, initial_balance: i128) -> Address {
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_client = token::StellarAssetClient::new(env, &token_id);
+
+    for i in 0..addresses.len() {
+        token_client.mint(addresses.get(i).unwrap(), &initial_balance);
+    }
+
+    token_id
+}
+
 fn setup() -> TestSetup {
     let env = Env::default();
     env.mock_all_auths();
 
     let contract_id = env.register(ChainSettleContract, ());
-
-    let token_admin = Address::generate(&env);
-    let token_id = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
-    let token_client = token::StellarAssetClient::new(&env, &token_id);
 
     let buyer = Address::generate(&env);
     let buyer2 = Address::generate(&env);
@@ -43,9 +52,10 @@ fn setup() -> TestSetup {
     let logistics = Address::generate(&env);
     let arbiter = Address::generate(&env);
     let treasury = Address::generate(&env);
+    let token_admin = Address::generate(&env);
 
-    token_client.mint(&buyer, &10_000_000_000);
-    token_client.mint(&buyer2, &10_000_000_000);
+    let addresses = vec![&env, buyer.clone(), buyer2.clone()];
+    let token_id = mock_token(&env, &token_admin, &addresses, 10_000_000_000);
 
     let client = ChainSettleContractClient::new(&env, &contract_id);
     client.init(&buyer);
@@ -110,6 +120,10 @@ fn default_options(_env: &Env) -> ShipmentOptions {
         late_penalty_bps_per_ledger: 0,
         auto_confirm_ledgers: 0,
         dispute_bond_amount: 0,
+        arbiter_fee_bps: 0,
+        logistics_fee_bps: 0,
+        supplier_collateral: 0,
+        expires_at_ledger: None,
     }
 }
 
@@ -1248,7 +1262,11 @@ fn test_dispute_cooldown_enforced() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     // First dispute on milestone 0.
@@ -1313,7 +1331,11 @@ fn test_dispute_cooldown_blocks_early_redispute() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     client.submit_proof(
@@ -1408,7 +1430,11 @@ fn test_cooldown_updated_on_resolve() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     client.submit_proof(
@@ -1795,7 +1821,11 @@ fn test_non_whitelisted_token_rejected() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 }
 
@@ -1917,7 +1947,11 @@ fn test_holdback_happy_path() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     client.submit_proof(
@@ -2004,7 +2038,11 @@ fn test_holdback_early_dispute_cancels_hold() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     client.submit_proof(
@@ -2216,7 +2254,11 @@ fn test_multisig_both_buyers_must_confirm() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     client.submit_proof(
@@ -2292,7 +2334,11 @@ fn test_multisig_minority_veto_dispute() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     client.submit_proof(
@@ -2667,7 +2713,11 @@ fn test_deadline_cancellation_success() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     client.submit_proof(
@@ -2722,7 +2772,11 @@ fn test_deadline_cancellation_too_early() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-        },
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
     );
 
     client.submit_proof(

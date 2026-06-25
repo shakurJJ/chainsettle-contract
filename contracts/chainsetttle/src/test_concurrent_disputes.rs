@@ -7,7 +7,7 @@
 use super::*;
 use soroban_sdk::{
     testutils::Address as _,
-    token, vec, Address, Env, String,, Symbol};
+    token, vec, Address, Env, String, Symbol};
 
 // Resolution order: deliberately non-sequential to catch cross-shipment contamination.
 const RESOLUTION_ORDER: [usize; 10] = [5, 2, 8, 1, 6, 0, 9, 3, 7, 4];

@@ -15,7 +15,7 @@ extern crate std;
 use super::*;
 use soroban_sdk::{
     testutils::Address as _,
-    token, vec, Address, Env, String,, Symbol};
+    token, vec, Address, Env, String, Symbol};
 use proptest::prelude::*;
 
 // Fixed slot IDs so we can reference shipments without heap allocation gymnastics
