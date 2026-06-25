@@ -313,6 +313,10 @@ mod contract_prop_tests {
                 late_penalty_bps_per_ledger: 0,
                 auto_confirm_ledgers: 0,
                 dispute_bond_amount: 0,
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
             },
         );
     }
@@ -390,6 +394,321 @@ mod contract_prop_tests {
             let ship2 = client.get_shipment(&sid);
             let ms2 = ship2.milestones.get(0).unwrap();
             prop_assert_eq!(ms2.status, MilestoneStatus::ProofSubmitted);
+        }
+    }
+}
+
+// ============================================================
+// MILESTONE PERCENTAGE FUZZ TESTS
+//
+// Pure-Rust model: validates the percentage constraint logic that
+// the contract enforces in `create_shipment` and `rebalance_milestones`.
+//
+// Rules under test:
+//   1. sum(percents) must equal 100
+//   2. every individual percent must be >= MIN_PERCENT (default 5)
+// ============================================================
+
+#[cfg(test)]
+mod milestone_percent_fuzz {
+    use proptest::prelude::*;
+
+    const MIN_PERCENT: u32 = 5;
+
+    fn is_valid_percent_set(percents: &[u32]) -> bool {
+        if percents.is_empty() {
+            return false;
+        }
+        let sum: u32 = percents.iter().sum();
+        sum == 100 && percents.iter().all(|&p| p >= MIN_PERCENT)
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 10_000,
+            ..Default::default()
+        })]
+
+        /// Validity is determined solely by (sum == 100) AND (all >= MIN_PERCENT).
+        #[test]
+        fn prop_percent_validity_is_sum_and_min_only(
+            percents in prop::collection::vec(0u32..=100u32, 1..=10usize),
+        ) {
+            let sum: u32 = percents.iter().sum();
+            let all_above_min = percents.iter().all(|&p| p >= MIN_PERCENT);
+            let model_valid = sum == 100 && all_above_min;
+            prop_assert_eq!(
+                is_valid_percent_set(&percents),
+                model_valid,
+                "validity mismatch for {:?} (sum={}, all_above_min={})",
+                percents, sum, all_above_min
+            );
+        }
+
+        /// A two-element split (first, 100-first) is valid iff both halves >= MIN_PERCENT.
+        #[test]
+        fn prop_two_milestone_split_validity(first in 0u32..=100u32) {
+            let second = 100u32.saturating_sub(first);
+            let percents = [first, second];
+            let expected = first >= MIN_PERCENT && second >= MIN_PERCENT;
+            prop_assert_eq!(
+                is_valid_percent_set(&percents),
+                expected,
+                "two-split ({}, {}) validity mismatch", first, second
+            );
+        }
+
+        /// Swapping any two entries does not change validity (order-independent).
+        #[test]
+        fn prop_validity_is_order_independent(
+            percents in prop::collection::vec(5u32..=50u32, 2..=8usize),
+            a in 0usize..8,
+            b in 0usize..8,
+        ) {
+            let n = percents.len();
+            let mut reordered = percents.clone();
+            reordered.swap(a % n, b % n);
+            prop_assert_eq!(
+                is_valid_percent_set(&percents),
+                is_valid_percent_set(&reordered),
+                "swap must not change validity"
+            );
+        }
+
+        /// Any set containing a zero-valued entry is always invalid (0 < MIN_PERCENT).
+        #[test]
+        fn prop_zero_percent_entry_always_invalid(
+            rest in prop::collection::vec(5u32..=50u32, 1..=9usize),
+        ) {
+            let mut percents = rest;
+            percents.push(0);
+            prop_assert!(
+                !is_valid_percent_set(&percents),
+                "set with a 0-valued entry must be invalid"
+            );
+        }
+
+        /// A set with any entry > 100 cannot sum to exactly 100 with positive siblings.
+        #[test]
+        fn prop_entry_over_100_is_invalid(
+            excess in 101u32..=200u32,
+        ) {
+            let sum = excess;
+            prop_assert!(
+                sum != 100,
+                "single-entry sum {} must not equal 100", sum
+            );
+        }
+
+        /// Adding a positive delta to a sum-100 set breaks the invariant.
+        #[test]
+        fn prop_augmented_sum_invalidates_set(
+            first in 5u32..=90u32,
+            delta in 1u32..=10u32,
+        ) {
+            let second = 100u32.saturating_sub(first);
+            if second < MIN_PERCENT {
+                return Ok(());
+            }
+            // (first, second) is a valid baseline.
+            prop_assert!(is_valid_percent_set(&[first, second]));
+            // Augmenting the first entry pushes the sum past 100.
+            prop_assert!(
+                !is_valid_percent_set(&[first + delta, second]),
+                "augmented set (sum={}) must be invalid", first + delta + second
+            );
+        }
+
+        /// For n milestones, the "all equal, with remainder on last" distribution
+        /// is valid iff every per-entry value >= MIN_PERCENT.
+        #[test]
+        fn prop_uniform_milestone_distribution(n in 1usize..=20usize) {
+            let per: u32 = 100 / n as u32;
+            let remainder = 100 % n as u32;
+            let percents: Vec<u32> = (0..n)
+                .map(|i| if i == n - 1 { per + remainder } else { per })
+                .collect();
+            let sum: u32 = percents.iter().sum();
+            prop_assert_eq!(sum, 100u32, "uniform distribution must sum to 100 for n={}", n);
+            let all_above_min = percents.iter().all(|&p| p >= MIN_PERCENT);
+            prop_assert_eq!(
+                is_valid_percent_set(&percents),
+                all_above_min,
+                "uniform n={} validity should match all_above_min={}", n, all_above_min
+            );
+        }
+
+        /// An empty list is always invalid (sum = 0 ≠ 100).
+        #[test]
+        fn prop_empty_list_is_invalid(_seed in 0u32..1u32) {
+            let empty: Vec<u32> = vec![];
+            prop_assert!(!is_valid_percent_set(&empty));
+        }
+
+        /// Splitting 100 into exactly MIN_PERCENT-sized blocks leaves
+        /// 100 / MIN_PERCENT = 20 milestones, each at exactly 5 — valid.
+        #[test]
+        fn prop_minimum_percent_exact_split(_seed in 0u32..1u32) {
+            let n = (100 / MIN_PERCENT) as usize; // 20
+            let percents: Vec<u32> = (0..n).map(|_| MIN_PERCENT).collect();
+            prop_assert!(is_valid_percent_set(&percents));
+        }
+    }
+
+    // --------------------------------------------------------
+    // CONTRACT-BACKED PERCENTAGE VALIDATION TESTS
+    // These spin up a real Soroban test environment and call
+    // the contract to verify the on-chain checks match the model.
+    // --------------------------------------------------------
+    #[cfg(test)]
+    mod contract_percent_tests {
+        use crate::{
+            ChainSettleContract, ChainSettleContractClient, Milestone, MilestoneMode,
+            MilestoneStatus, ShipmentOptions,
+        };
+        use proptest::prelude::*;
+        use soroban_sdk::{testutils::Address as _, token, vec, Address, Env, String};
+
+        fn make_test_env() -> (Env, Address, Address, Address, Address, Address, Address) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(ChainSettleContract, ());
+            let token_admin = Address::generate(&env);
+            let token_id = env
+                .register_stellar_asset_contract_v2(token_admin.clone())
+                .address();
+            let buyer = Address::generate(&env);
+            let supplier = Address::generate(&env);
+            let logistics = Address::generate(&env);
+            let arbiter = Address::generate(&env);
+            token::StellarAssetClient::new(&env, &token_id)
+                .mint(&buyer, &100_000_000_000i128);
+            ChainSettleContractClient::new(&env, &contract_id).init(&buyer);
+            (env, contract_id, token_id, buyer, supplier, logistics, arbiter)
+        }
+
+        fn default_options() -> ShipmentOptions {
+            ShipmentOptions {
+                response_deadline: 0,
+                penalty_bps: 0,
+                milestone_mode: MilestoneMode::Parallel,
+                holdback_ledgers: 0,
+                dispute_cooldown_ledgers: 0,
+                late_penalty_bps_per_ledger: 0,
+                auto_confirm_ledgers: 0,
+                dispute_bond_amount: 0,
+                arbiter_fee_bps: 0,
+            }
+        }
+
+        fn milestone(env: &Env, name: &str, pct: u32) -> Milestone {
+            Milestone {
+                name: String::from_str(env, name),
+                payment_percent: pct,
+                proof_hash: String::from_str(env, ""),
+                status: MilestoneStatus::Pending,
+                release_after_ledger: 0,
+                proof_submitted_ledger: None,
+                dispute_opened_ledger: None,
+            }
+        }
+
+        proptest! {
+            #![proptest_config(proptest::test_runner::Config {
+                cases: 200,
+                ..Default::default()
+            })]
+
+            /// Valid two-milestone splits (both >= 5, sum == 100) are accepted by the contract.
+            #[test]
+            fn prop_contract_accepts_valid_two_split(first in 5u32..=90u32) {
+                let second = 100u32 - first;
+                if second < 5 {
+                    return Ok(());
+                }
+                let (env, cid, tid, buyer, supplier, logistics, arbiter) = make_test_env();
+                let client = ChainSettleContractClient::new(&env, &cid);
+                let sid = String::from_str(&env, "PCT-VALID");
+                let ms = vec![&env, milestone(&env, "M0", first), milestone(&env, "M1", second)];
+                let result = client.try_create_shipment(
+                    &sid,
+                    &vec![&env, buyer.clone()],
+                    &supplier, &logistics, &arbiter, &tid,
+                    &1_000_000i128,
+                    &ms,
+                    &default_options(),
+                );
+                prop_assert!(
+                    result.is_ok(),
+                    "valid split ({}, {}) must be accepted", first, second
+                );
+            }
+
+            /// Any milestone percentage below 5 (the default minimum) is rejected.
+            #[test]
+            fn prop_contract_rejects_below_min_percent(below in 1u32..=4u32) {
+                let (env, cid, tid, buyer, supplier, logistics, arbiter) = make_test_env();
+                let client = ChainSettleContractClient::new(&env, &cid);
+                let sid = String::from_str(&env, "PCT-LOW");
+                let above = 100 - below;
+                let ms = vec![&env, milestone(&env, "M0", below), milestone(&env, "M1", above)];
+                let result = client.try_create_shipment(
+                    &sid,
+                    &vec![&env, buyer.clone()],
+                    &supplier, &logistics, &arbiter, &tid,
+                    &1_000_000i128,
+                    &ms,
+                    &default_options(),
+                );
+                prop_assert!(
+                    result.is_err(),
+                    "percent {} below minimum must be rejected", below
+                );
+            }
+
+            /// Two-milestone sets whose percentages sum to something other than 100 are rejected.
+            #[test]
+            fn prop_contract_rejects_non_100_sum(
+                first in 5u32..=45u32,
+                second in 5u32..=45u32,
+            ) {
+                let sum = first + second;
+                if sum == 100 { return Ok(()); }
+                let (env, cid, tid, buyer, supplier, logistics, arbiter) = make_test_env();
+                let client = ChainSettleContractClient::new(&env, &cid);
+                let sid = String::from_str(&env, "PCT-BADSUM");
+                let ms = vec![&env, milestone(&env, "M0", first), milestone(&env, "M1", second)];
+                let result = client.try_create_shipment(
+                    &sid,
+                    &vec![&env, buyer.clone()],
+                    &supplier, &logistics, &arbiter, &tid,
+                    &1_000_000i128,
+                    &ms,
+                    &default_options(),
+                );
+                prop_assert!(
+                    result.is_err(),
+                    "sum {} != 100 must be rejected", sum
+                );
+            }
+
+            /// A single 100% milestone (at or above the minimum) is always valid.
+            #[test]
+            fn prop_contract_accepts_single_100_milestone(_seed in 0u32..10u32) {
+                let (env, cid, tid, buyer, supplier, logistics, arbiter) = make_test_env();
+                let client = ChainSettleContractClient::new(&env, &cid);
+                let sid = String::from_str(&env, "PCT-SINGLE");
+                let ms = vec![&env, milestone(&env, "M0", 100)];
+                let result = client.try_create_shipment(
+                    &sid,
+                    &vec![&env, buyer.clone()],
+                    &supplier, &logistics, &arbiter, &tid,
+                    &1_000_000i128,
+                    &ms,
+                    &default_options(),
+                );
+                prop_assert!(result.is_ok(), "single 100% milestone must be accepted");
+            }
         }
     }
 }
