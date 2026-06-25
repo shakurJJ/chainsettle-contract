@@ -1,8 +1,40 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token, Address, BytesN, Env, String, Vec, Symbol,
+    contract, contractclient, contractimpl, contracttype, token, Address, BytesN, Env, String, Vec, Symbol,
 };
+
+// ============================================================
+// YIELD PROTOCOL INTERFACE
+// ============================================================
+
+mod yield_protocol {
+    use soroban_sdk::{contractclient, Address, Env};
+
+    /// Minimal interface expected of an external yield protocol.
+    /// The ChainSettle contract deposits idle escrow tokens here to earn
+    /// yield while milestones are pending confirmation.
+    ///
+    /// Deposit flow:
+    ///   1. ChainSettle transfers `amount` tokens to the protocol contract.
+    ///   2. ChainSettle calls `deposit` so the protocol records the principal.
+    ///
+    /// Withdraw flow:
+    ///   1. ChainSettle calls `withdraw`; the protocol transfers principal +
+    ///      accrued yield back to `to` and returns the total amount.
+    #[contractclient(name = "YieldProtocolClient")]
+    pub trait YieldProtocol {
+        /// Record a deposit of `amount` units of `token` on behalf of `depositor`.
+        /// The caller must have already transferred the tokens to this contract.
+        fn deposit(env: Env, depositor: Address, token: Address, amount: i128);
+        /// Withdraw all funds (principal + yield) for `depositor`/`token` to `to`.
+        /// Returns the total amount transferred.
+        fn withdraw(env: Env, depositor: Address, token: Address, to: Address) -> i128;
+        /// Current balance (principal + accrued yield) for `depositor` and `token`.
+        fn balance_of(env: Env, depositor: Address, token: Address) -> i128;
+    }
+}
+use yield_protocol::YieldProtocolClient;
 
 // ============================================================
 // DATA TYPES
@@ -169,6 +201,22 @@ pub struct ShipmentOptions {
     pub arbiter_fee_bps: u32,
 }
 
+/// All parameters needed to create a single shipment in a batch call.
+/// Mirrors the individual `create_shipment` parameters without the `Env`.
+#[contracttype]
+#[derive(Clone)]
+pub struct BatchShipmentParams {
+    pub shipment_id: String,
+    pub buyers: Vec<Address>,
+    pub supplier: Address,
+    pub logistics: Address,
+    pub arbiter: Address,
+    pub token: Address,
+    pub total_amount: i128,
+    pub milestones: Vec<Milestone>,
+    pub options: ShipmentOptions,
+}
+
 /// Contract-level statistics for analytics and monitoring.
 #[contracttype]
 #[derive(Clone)]
@@ -301,6 +349,11 @@ pub enum DataKey {
     /// Contested percentage stored when a partial dispute is raised: (shipment_id, milestone_index) -> u32.
     /// Absence of this key means the associated dispute covers 100% of the milestone value.
     DisputeContestedPercent(String, u32),
+    /// Address of the external yield protocol contract (admin-configured; optional).
+    YieldProtocol,
+    /// Cumulative amount deposited to the yield protocol per token address.
+    /// Cleared to 0 on each full withdrawal.
+    YieldDeposited(Address),
 }
 
 // ============================================================
@@ -3417,6 +3470,214 @@ impl ChainSettleContract {
             }
         }
         seen.len() as u32
+    }
+
+    // ----------------------------------------------------------
+    // YIELD PROTOCOL INTEGRATION
+    // ----------------------------------------------------------
+
+    /// Configure the external yield protocol contract address. Admin only.
+    /// Once set, `deposit_idle_to_yield` and `withdraw_from_yield` become callable.
+    pub fn set_yield_protocol(env: Env, admin: Address, protocol: Address) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::YieldProtocol, &protocol);
+        env.events()
+            .publish((Symbol::new(&env, "yield_protocol_set"),), protocol);
+    }
+
+    /// Deposit `amount` idle escrow tokens for `token` into the external yield protocol.
+    ///
+    /// The admin is responsible for ensuring the contract retains sufficient
+    /// liquidity to cover upcoming milestone payments; no automatic check is
+    /// enforced here beyond "don't deposit more than un-deposited escrow balance".
+    ///
+    /// Admin only.
+    pub fn deposit_idle_to_yield(env: Env, admin: Address, token: Address, amount: i128) {
+        Self::assert_not_paused(&env);
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+
+        if amount <= 0 {
+            panic!("amount must be greater than zero");
+        }
+
+        let protocol: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldProtocol)
+            .unwrap_or_else(|| panic!("yield protocol not configured"));
+
+        let total_escrowed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalEscrowed(token.clone()))
+            .unwrap_or(0);
+
+        let already_deposited: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::YieldDeposited(token.clone()))
+            .unwrap_or(0);
+
+        let available = total_escrowed - already_deposited;
+        if amount > available {
+            panic!("amount exceeds available idle escrow balance");
+        }
+
+        // Push tokens to the yield protocol, then record the deposit.
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &protocol, &amount);
+
+        let yield_client = YieldProtocolClient::new(&env, &protocol);
+        yield_client.deposit(&env.current_contract_address(), &token, &amount);
+
+        let new_deposited = already_deposited + amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::YieldDeposited(token.clone()), &new_deposited);
+
+        env.events().publish(
+            (Symbol::new(&env, "yield_deposited"),),
+            (token, amount, new_deposited),
+        );
+    }
+
+    /// Withdraw all deposited funds (principal + accrued yield) from the external
+    /// yield protocol back to this contract.
+    ///
+    /// Any yield earned above the deposited principal is added to `TotalEscrowed`
+    /// so that it can be distributed to suppliers via normal milestone payments.
+    ///
+    /// Returns the total amount received from the protocol (principal + yield).
+    /// Admin only.
+    pub fn withdraw_from_yield(env: Env, admin: Address, token: Address) -> i128 {
+        Self::assert_not_paused(&env);
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+
+        let protocol: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldProtocol)
+            .unwrap_or_else(|| panic!("yield protocol not configured"));
+
+        let deposited: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::YieldDeposited(token.clone()))
+            .unwrap_or(0);
+
+        if deposited == 0 {
+            panic!("no yield deposit to withdraw");
+        }
+
+        let yield_client = YieldProtocolClient::new(&env, &protocol);
+        let withdrawn = yield_client.withdraw(
+            &env.current_contract_address(),
+            &token,
+            &env.current_contract_address(),
+        );
+
+        // Any amount above the original principal is accrued yield — add it to
+        // TotalEscrowed so escrow accounting stays correct.
+        let yield_earned = if withdrawn > deposited {
+            withdrawn - deposited
+        } else {
+            0
+        };
+
+        if yield_earned > 0 {
+            let current_escrowed: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::TotalEscrowed(token.clone()))
+                .unwrap_or(0);
+            env.storage().persistent().set(
+                &DataKey::TotalEscrowed(token.clone()),
+                &(current_escrowed + yield_earned),
+            );
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::YieldDeposited(token.clone()), &0i128);
+
+        env.events().publish(
+            (Symbol::new(&env, "yield_withdrawn"),),
+            (token, withdrawn, yield_earned),
+        );
+
+        withdrawn
+    }
+
+    /// Returns the amount currently tracked as deposited to the yield protocol for `token`.
+    pub fn get_yield_deposited(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::YieldDeposited(token))
+            .unwrap_or(0)
+    }
+
+    /// Query the live balance (principal + accrued yield) directly from the
+    /// external yield protocol. Returns 0 if no protocol is configured.
+    pub fn get_yield_balance(env: Env, token: Address) -> i128 {
+        if let Some(protocol) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::YieldProtocol)
+        {
+            let yield_client = YieldProtocolClient::new(&env, &protocol);
+            yield_client.balance_of(&env.current_contract_address(), &token)
+        } else {
+            0
+        }
+    }
+
+    // ----------------------------------------------------------
+    // BATCH CREATE SHIPMENTS
+    // ----------------------------------------------------------
+
+    /// Create multiple independent shipments in a single atomic transaction.
+    ///
+    /// Every entry in `params` is validated and created in order. Because
+    /// Soroban transactions are atomic, any validation failure reverts all
+    /// preceding creations in the batch.
+    ///
+    /// Returns the ordered list of created shipment IDs.
+    pub fn batch_create_shipments(
+        env: Env,
+        params: Vec<BatchShipmentParams>,
+    ) -> Vec<String> {
+        Self::assert_not_paused(&env);
+
+        let mut created: Vec<String> = Vec::new(&env);
+
+        for i in 0..params.len() {
+            let p = params.get(i).unwrap();
+            let shipment_id = Self::create_shipment(
+                env.clone(),
+                p.shipment_id,
+                p.buyers,
+                p.supplier,
+                p.logistics,
+                p.arbiter,
+                p.token,
+                p.total_amount,
+                p.milestones,
+                p.options,
+            );
+            created.push_back(shipment_id);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_shipments_created"),),
+            created.len() as u32,
+        );
+
+        created
     }
 
     // ----------------------------------------------------------
