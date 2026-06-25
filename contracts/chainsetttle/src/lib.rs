@@ -103,6 +103,8 @@ pub struct Shipment {
     pub open_dispute_count: u32,
     /// Per-dispute bond amount locked by buyer at creation (0 = disabled, backward compatible).
     pub dispute_bond_amount: i128,
+    /// Basis points of disputed payment sent to arbiter on resolution (0 = no arbiter fee).
+    pub arbiter_fee_bps: u32,
 }
 
 /// Cancellation policy stored separately (keeps Shipment within the contracttype field limit).
@@ -163,6 +165,8 @@ pub struct ShipmentOptions {
     pub auto_confirm_ledgers: u32,
     /// Bond amount locked per dispute; 0 = no bond required (default, backward compat).
     pub dispute_bond_amount: i128,
+    /// Basis points of disputed payment sent to arbiter on resolution (0 = no arbiter fee).
+    pub arbiter_fee_bps: u32,
 }
 
 /// Contract-level statistics for analytics and monitoring.
@@ -294,6 +298,9 @@ pub enum DataKey {
     MilestoneProofWhitelist(String, u32),
     /// Declared proof content type recorded at submission time: (shipment_id, milestone_index) -> Symbol.
     SubmittedProofType(String, u32),
+    /// Contested percentage stored when a partial dispute is raised: (shipment_id, milestone_index) -> u32.
+    /// Absence of this key means the associated dispute covers 100% of the milestone value.
+    DisputeContestedPercent(String, u32),
 }
 
 // ============================================================
@@ -334,6 +341,7 @@ pub enum ChainSettleError {
     AdvanceAlreadyApproved = 29,
     ProofTypeNotAllowed = 30,
     RebalanceNotAllowed = 31,
+    InvalidContestedPercent = 32,
 }
 
 // ============================================================
@@ -994,6 +1002,7 @@ impl ChainSettleContract {
             auto_confirm_ledgers,
             open_dispute_count: 0,
             dispute_bond_amount,
+            arbiter_fee_bps: options.arbiter_fee_bps,
         };
 
         Self::append_audit_entry(
@@ -2033,9 +2042,210 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
+    // RAISE PARTIAL DISPUTE
+    // ----------------------------------------------------------
+
+    /// Buyer contests only `contested_percent` (1–99) of a milestone's value.
+    /// The uncontested portion is released to the supplier immediately; the
+    /// contested portion is held in escrow pending arbiter resolution.
+    /// Panics if an approved advance already exists for the milestone — use
+    /// `raise_dispute` instead when an advance has been approved.
+    pub fn raise_partial_dispute(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        contested_percent: u32,
+    ) {
+        Self::assert_not_paused(&env);
+
+        if contested_percent == 0 || contested_percent >= 100 {
+            panic!("contested_percent must be between 1 and 99");
+        }
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::require_buyer_auth(&shipment, &buyer);
+
+        if milestone_index as usize >= shipment.milestones.len() as usize {
+            panic!("invalid milestone index");
+        }
+
+        // Block partial disputes when an approved advance exists to avoid
+        // complex advance-reconciliation across the split portions.
+        let advance_key = DataKey::AdvanceRequest(shipment_id.clone(), milestone_index);
+        if let Some(req) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, AdvanceRequest>(&advance_key)
+        {
+            if req.approved {
+                panic!("partial dispute not allowed when an approved advance exists for this milestone");
+            }
+        }
+
+        let mut milestone = shipment.milestones.get(milestone_index).unwrap();
+        if milestone.status != MilestoneStatus::ProofSubmitted
+            && milestone.status != MilestoneStatus::ConfirmedHeld
+        {
+            panic!("can only dispute a submitted or held proof");
+        }
+
+        // Dispute cooldown check.
+        if shipment.dispute_cooldown_ledgers > 0 {
+            if let Some(last_resolved) = shipment.last_dispute_resolved_ledger {
+                let earliest_allowed = last_resolved + shipment.dispute_cooldown_ledgers;
+                if env.ledger().sequence() < earliest_allowed {
+                    panic!("dispute cooldown period has not elapsed");
+                }
+            }
+        }
+
+        // Auto-confirmation window check.
+        if shipment.auto_confirm_ledgers > 0 {
+            if let Some(proof_ledger) = milestone.proof_submitted_ledger {
+                let auto_confirm_ledger = proof_ledger + shipment.auto_confirm_ledgers;
+                if env.ledger().sequence() >= auto_confirm_ledger {
+                    panic!("milestone has auto-confirmed; dispute window closed");
+                }
+            }
+        }
+
+        let max_open: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxConcurrentDisputes)
+            .unwrap_or(1u32);
+        if shipment.open_dispute_count >= max_open {
+            panic!("DisputeAlreadyOpen");
+        }
+
+        // Compute and immediately release the uncontested portion to the supplier.
+        let full_milestone_payment =
+            (shipment.total_amount * milestone.payment_percent as i128) / 100;
+        let uncontested_payment =
+            (full_milestone_payment * (100 - contested_percent) as i128) / 100;
+
+        if uncontested_payment > 0 {
+            let mut fee_amount: i128 = 0;
+            let net_uncontested =
+                Self::deduct_fee(&env, uncontested_payment, &shipment.token, &mut fee_amount);
+
+            Self::check_circuit_breaker(&env, uncontested_payment);
+
+            let token_client = token::Client::new(&env, &shipment.token);
+            if net_uncontested > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &shipment.supplier,
+                    &net_uncontested,
+                );
+            }
+
+            shipment.released_amount += uncontested_payment;
+
+            // Decrement total escrowed by the outflow.
+            let current_escrowed: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::TotalEscrowed(shipment.token.clone()))
+                .unwrap_or(0);
+            env.storage().persistent().set(
+                &DataKey::TotalEscrowed(shipment.token.clone()),
+                &(current_escrowed - uncontested_payment).max(0),
+            );
+
+            env.events().publish(
+                (
+                    Symbol::new(&env, "partial_uncontested_released"),
+                    shipment_id.clone(),
+                ),
+                (milestone_index, uncontested_payment, fee_amount),
+            );
+        }
+
+        // Store the contested percentage so resolve_dispute knows the scope.
+        env.storage().persistent().set(
+            &DataKey::DisputeContestedPercent(shipment_id.clone(), milestone_index),
+            &contested_percent,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::DisputeContestedPercent(shipment_id.clone(), milestone_index),
+            100_000,
+            6_300_000,
+        );
+
+        shipment.open_dispute_count += 1;
+        milestone.release_after_ledger = 0;
+        milestone.status = MilestoneStatus::Disputed;
+        milestone.dispute_opened_ledger = Some(env.ledger().sequence());
+        shipment.milestones.set(milestone_index, milestone);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        Self::increment_reputation_internal(&env, &shipment.supplier, 0, 1, 0);
+
+        // Add to active disputes list.
+        let mut disputes: Vec<DisputeEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveDisputes)
+            .unwrap_or_else(|| Vec::new(&env));
+        disputes.push_back(DisputeEntry {
+            shipment_id: shipment_id.clone(),
+            milestone_index,
+        });
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveDisputes, &disputes);
+
+        // Increment total disputes stat.
+        let mut stats: ContractStats = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractStats)
+            .unwrap_or(ContractStats {
+                total_shipments: 0,
+                total_volume: 0,
+                total_disputes: 0,
+                completed_shipments: 0,
+            });
+        stats.total_disputes += 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractStats, &stats);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "partial_dispute_raised"),
+                shipment_id.clone(),
+            ),
+            (milestone_index, contested_percent, buyer),
+        );
+    }
+
+    // ----------------------------------------------------------
     // RESOLVE DISPUTE
     // ----------------------------------------------------------
 
+    /// Resolve a dispute (full or partial) raised on a milestone.
+    ///
+    /// For **full disputes** (`raise_dispute`):
+    ///   - `approve = true`  → supplier wins; payment transferred, arbiter fee deducted.
+    ///   - `approve = false` → buyer wins; milestone reset to Pending for resubmission.
+    ///
+    /// For **partial disputes** (`raise_partial_dispute`):
+    ///   - `approve = true`  → supplier wins contested portion; arbiter fee deducted from it.
+    ///   - `approve = false` → buyer wins; contested portion refunded minus arbiter fee;
+    ///                          milestone marked Resolved (uncontested was already released).
+    ///
+    /// The arbiter fee (`shipment.arbiter_fee_bps`) is deducted from the disputed payment
+    /// and transferred to the arbiter address whenever a monetary disbursement occurs.
     pub fn resolve_dispute(
         env: Env,
         arbiter: Address,
@@ -2057,10 +2267,29 @@ impl ChainSettleContract {
             panic!("milestone is not in disputed status");
         }
 
-        if approve {
-            let payment = (shipment.total_amount * milestone.payment_percent as i128) / 100;
+        // Detect whether this is a partial dispute.
+        let contested_key =
+            DataKey::DisputeContestedPercent(shipment_id.clone(), milestone_index);
+        let partial_contested_percent: Option<u32> =
+            env.storage().persistent().get(&contested_key);
+        let is_partial = partial_contested_percent.is_some();
 
-            // Deduct any approved advance for this milestone.
+        let full_payment = (shipment.total_amount * milestone.payment_percent as i128) / 100;
+
+        // The "payment" in scope is the portion subject to this resolution:
+        //   - full dispute  → 100% of milestone value
+        //   - partial dispute → contested_percent% of milestone value
+        let payment = if let Some(cp) = partial_contested_percent {
+            (full_payment * cp as i128) / 100
+        } else {
+            full_payment
+        };
+
+        let token_client = token::Client::new(&env, &shipment.token);
+
+        if approve {
+            // Deduct any approved advance (only relevant for full disputes; partial disputes
+            // block advance approval at raise time).
             let advance_deducted = Self::consume_advance_for_milestone(
                 &env,
                 &mut shipment,
@@ -2071,12 +2300,21 @@ impl ChainSettleContract {
             let mut fee_amount: i128 = 0;
             let net_payment = Self::deduct_fee(&env, payment, &shipment.token, &mut fee_amount);
 
-            // Check circuit breaker before transferring payment
             Self::check_circuit_breaker(&env, payment);
 
+            // Compute and transfer arbiter fee from the disputed payment.
+            let arbiter_fee = (payment * shipment.arbiter_fee_bps as i128) / 10_000;
+            if arbiter_fee > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &shipment.arbiter,
+                    &arbiter_fee,
+                );
+            }
+
             shipment.released_amount += payment;
-            let actual_transfer = net_payment - advance_deducted;
-            let token_client = token::Client::new(&env, &shipment.token);
+
+            let actual_transfer = (net_payment - advance_deducted - arbiter_fee).max(0);
             if actual_transfer > 0 {
                 token_client.transfer(
                     &env.current_contract_address(),
@@ -2084,7 +2322,8 @@ impl ChainSettleContract {
                     &actual_transfer,
                 );
             }
-            // Dispute approved: return the bond unit to the buyer.
+
+            // Return the dispute bond to the buyer (they raised a valid dispute).
             if shipment.dispute_bond_amount > 0 {
                 let primary_buyer = shipment.buyers.get(0).unwrap();
                 token_client.transfer(
@@ -2093,19 +2332,60 @@ impl ChainSettleContract {
                     &shipment.dispute_bond_amount,
                 );
             }
+
             milestone.status = MilestoneStatus::Resolved;
-        } else {
-            milestone.status = MilestoneStatus::Pending;
-            // proof_hash is preserved so submit_proof can detect this as a resubmission.
-            // Dispute rejected: forfeit the bond unit to the supplier.
+        } else if is_partial {
+            // Partial dispute rejection: buyer contested but lost.
+            // Refund the contested portion to the buyer minus arbiter fee, then mark Resolved
+            // (the uncontested portion was already released at raise_partial_dispute time).
+            let arbiter_fee = (payment * shipment.arbiter_fee_bps as i128) / 10_000;
+            if arbiter_fee > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &shipment.arbiter,
+                    &arbiter_fee,
+                );
+            }
+
+            let buyer_refund = (payment - arbiter_fee).max(0);
+            if buyer_refund > 0 {
+                let primary_buyer = shipment.buyers.get(0).unwrap();
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &primary_buyer,
+                    &buyer_refund,
+                );
+            }
+
+            // Track the contested outflow so escrow balance stays consistent.
+            shipment.released_amount += payment;
+
+            // Forfeit the dispute bond to the supplier (buyer's challenge failed).
             if shipment.dispute_bond_amount > 0 {
-                let token_client = token::Client::new(&env, &shipment.token);
                 token_client.transfer(
                     &env.current_contract_address(),
                     &shipment.supplier,
                     &shipment.dispute_bond_amount,
                 );
             }
+
+            milestone.status = MilestoneStatus::Resolved;
+        } else {
+            // Full dispute rejection: milestone goes back to Pending for proof resubmission.
+            // proof_hash is preserved so submit_proof can detect this as a resubmission.
+            if shipment.dispute_bond_amount > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &shipment.supplier,
+                    &shipment.dispute_bond_amount,
+                );
+            }
+            milestone.status = MilestoneStatus::Pending;
+        }
+
+        // Clean up the partial-dispute record.
+        if is_partial {
+            env.storage().persistent().remove(&contested_key);
         }
 
         shipment.milestones.set(milestone_index, milestone);
@@ -2116,7 +2396,6 @@ impl ChainSettleContract {
 
         if Self::all_milestones_done(&shipment) {
             shipment.status = ShipmentStatus::Completed;
-            // Update completed shipments stat.
             let mut stats: ContractStats = env
                 .storage()
                 .instance()
@@ -2132,7 +2411,6 @@ impl ChainSettleContract {
                 .instance()
                 .set(&DataKey::ContractStats, &stats);
             Self::increment_reputation_internal(&env, &shipment.supplier, 1, 0, 0);
-            // Move from Active to Completed status index.
             Self::move_shipment_status_index(
                 &env,
                 ShipmentStatus::Active,
@@ -2166,7 +2444,13 @@ impl ChainSettleContract {
         let remaining_amount = shipment.total_amount - released_amount;
         env.events().publish(
             (Symbol::new(&env, "dispute_resolved"), shipment_id.clone()),
-            (milestone_index, approve, released_amount, remaining_amount),
+            (
+                milestone_index,
+                approve,
+                is_partial,
+                released_amount,
+                remaining_amount,
+            ),
         );
     }
 
