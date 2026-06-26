@@ -105,6 +105,16 @@ pub struct Shipment {
     pub dispute_bond_amount: i128,
     /// Basis points of disputed payment sent to arbiter on resolution (0 = no arbiter fee).
     pub arbiter_fee_bps: u32,
+    /// Basis points deducted from each milestone payment for logistics provider (0 = no fee).
+    pub logistics_fee_bps: u32,
+    /// Ledger at which the shipment expires (None = no expiry).
+    pub expires_at_ledger: Option<u32>,
+    /// Off-chain trade document hash (IPFS CID) attached at creation; immutable after creation.
+    pub metadata_hash: Option<BytesN<32>>,
+    /// Optional referrer who earns a basis-point bonus of the protocol fee on shipment completion.
+    pub referrer: Option<Address>,
+    /// Basis points charged to buyer on buyer-initiated cancellation (0 = no penalty, max 1000).
+    pub buyer_cancel_fee_bps: u32,
 }
 
 /// Cancellation policy stored separately (keeps Shipment within the contracttype field limit).
@@ -167,6 +177,34 @@ pub struct ShipmentOptions {
     pub dispute_bond_amount: i128,
     /// Basis points of disputed payment sent to arbiter on resolution (0 = no arbiter fee).
     pub arbiter_fee_bps: u32,
+    /// Basis points deducted from each milestone payment for logistics provider (0 = no fee).
+    pub logistics_fee_bps: u32,
+    /// Supplier collateral required at creation (0 = no collateral required).
+    pub supplier_collateral: i128,
+    /// Ledger at which shipment expires (None = no expiry).
+    pub expires_at_ledger: Option<u32>,
+    /// Off-chain trade document hash (IPFS CID) attached at creation; immutable after creation.
+    pub metadata_hash: Option<BytesN<32>>,
+    /// Optional referrer who earns a basis-point bonus of the protocol fee on shipment completion.
+    pub referrer: Option<Address>,
+    /// Basis points charged to buyer on buyer-initiated cancellation (0 = no penalty, max 1000).
+    pub buyer_cancel_fee_bps: u32,
+}
+
+/// All parameters needed to create a single shipment in a batch call.
+/// Mirrors the individual `create_shipment` parameters without the `Env`.
+#[contracttype]
+#[derive(Clone)]
+pub struct BatchShipmentParams {
+    pub shipment_id: String,
+    pub buyers: Vec<Address>,
+    pub supplier: Address,
+    pub logistics: Address,
+    pub arbiter: Address,
+    pub token: Address,
+    pub total_amount: i128,
+    pub milestones: Vec<Milestone>,
+    pub options: ShipmentOptions,
 }
 
 /// Contract-level statistics for analytics and monitoring.
@@ -347,6 +385,17 @@ pub enum DataKey {
     /// Contested percentage stored when a partial dispute is raised: (shipment_id, milestone_index) -> u32.
     /// Absence of this key means the associated dispute covers 100% of the milestone value.
     DisputeContestedPercent(String, u32),
+    /// Address of the external yield protocol contract (admin-configured; optional).
+    YieldProtocol,
+    /// Cumulative amount deposited to the yield protocol per token address.
+    /// Cleared to 0 on each full withdrawal.
+    YieldDeposited(Address),
+    /// Supplier collateral amount for a shipment.
+    SupplierCollateral(String),
+    /// Supplier whitelist: Vec<Address>; when non-empty only listed suppliers may create shipments.
+    SupplierWhitelist,
+    /// Referral fee basis points paid to referrer out of the total protocol fee (default 500 = 5%).
+    ReferralFeeBps,
 }
 
 // ============================================================
@@ -464,6 +513,10 @@ impl ChainSettleContract {
         env.storage()
             .instance()
             .set(&DataKey::MaxAdvancePercent, &30u32);
+        // Initialize referral fee bps (default 500 = 5% of total protocol fee).
+        env.storage()
+            .instance()
+            .set(&DataKey::ReferralFeeBps, &500u32);
     }
 
     // ----------------------------------------------------------
@@ -820,6 +873,100 @@ impl ChainSettleContract {
             .is_some()
     }
 
+    // ----------------------------------------------------------
+    // ADMIN: SUPPLIER WHITELIST (Issue #100)
+    // ----------------------------------------------------------
+
+    /// Add an address to the supplier whitelist. Admin only.
+    /// Once the whitelist is non-empty, only whitelisted suppliers may call create_shipment.
+    pub fn add_to_whitelist(env: Env, admin: Address, address: Address) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        let mut list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SupplierWhitelist)
+            .unwrap_or_else(|| Vec::new(&env));
+        for i in 0..list.len() {
+            if list.get(i).unwrap() == address {
+                return; // already present
+            }
+        }
+        list.push_back(address.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::SupplierWhitelist, &list);
+        env.events()
+            .publish((Symbol::new(&env, "supplier_whitelisted"),), address);
+    }
+
+    /// Remove an address from the supplier whitelist. Admin only.
+    pub fn remove_from_whitelist(env: Env, admin: Address, address: Address) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SupplierWhitelist)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_list: Vec<Address> = Vec::new(&env);
+        for i in 0..list.len() {
+            let a = list.get(i).unwrap();
+            if a != address {
+                new_list.push_back(a);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::SupplierWhitelist, &new_list);
+        env.events()
+            .publish((Symbol::new(&env, "supplier_unwhitelisted"),), address);
+    }
+
+    /// Returns true if `address` is on the supplier whitelist, or the whitelist is empty (open mode).
+    pub fn is_whitelisted(env: Env, address: Address) -> bool {
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SupplierWhitelist)
+            .unwrap_or_else(|| Vec::new(&env));
+        if list.is_empty() {
+            return true; // empty whitelist = open mode
+        }
+        for i in 0..list.len() {
+            if list.get(i).unwrap() == address {
+                return true;
+            }
+        }
+        false
+    }
+
+    // ----------------------------------------------------------
+    // ADMIN: REFERRAL FEE (Issue #105)
+    // ----------------------------------------------------------
+
+    /// Set the referral fee basis points (0–10000). Admin only.
+    /// Default is 500 (5% of the total protocol fee paid to the referrer on completion).
+    pub fn set_referral_fee_bps(env: Env, admin: Address, bps: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        if bps > 10_000 {
+            panic!("referral_fee_bps cannot exceed 10000");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::ReferralFeeBps, &bps);
+        env.events()
+            .publish((Symbol::new(&env, "referral_fee_bps_set"),), bps);
+    }
+
+    pub fn get_referral_fee_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ReferralFeeBps)
+            .unwrap_or(500)
+    }
+
     pub fn get_admin_log(env: Env) -> Vec<AuditEntry> {
         env.storage()
             .instance()
@@ -909,6 +1056,16 @@ impl ChainSettleContract {
         let late_penalty_bps_per_ledger = options.late_penalty_bps_per_ledger;
         let auto_confirm_ledgers = options.auto_confirm_ledgers;
         let dispute_bond_amount = options.dispute_bond_amount;
+        let logistics_fee_bps = options.logistics_fee_bps;
+        let supplier_collateral = options.supplier_collateral;
+        let expires_at_ledger = options.expires_at_ledger;
+        let metadata_hash = options.metadata_hash;
+        let referrer = options.referrer;
+        let buyer_cancel_fee_bps = options.buyer_cancel_fee_bps;
+
+        if buyer_cancel_fee_bps > 1000 {
+            panic!("buyer_cancel_fee_bps cannot exceed 1000 (10%)");
+        }
 
         if buyers.is_empty() {
             panic!("at least one buyer is required");
@@ -961,6 +1118,25 @@ impl ChainSettleContract {
                 .get::<DataKey, BytesN<32>>(&DataKey::Blacklisted(addr))
                 .is_some()
             {
+                panic!("unauthorized");
+            }
+        }
+
+        // Enforce supplier whitelist when non-empty.
+        let supplier_whitelist: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SupplierWhitelist)
+            .unwrap_or_else(|| Vec::new(&env));
+        if supplier_whitelist.len() > 0 {
+            let mut whitelisted = false;
+            for i in 0..supplier_whitelist.len() {
+                if supplier_whitelist.get(i).unwrap() == supplier {
+                    whitelisted = true;
+                    break;
+                }
+            }
+            if !whitelisted {
                 panic!("unauthorized");
             }
         }
@@ -1037,6 +1213,11 @@ impl ChainSettleContract {
             open_dispute_count: 0,
             dispute_bond_amount,
             arbiter_fee_bps: options.arbiter_fee_bps,
+            logistics_fee_bps,
+            expires_at_ledger,
+            metadata_hash,
+            referrer,
+            buyer_cancel_fee_bps,
         };
 
         Self::append_audit_entry(
@@ -1141,6 +1322,7 @@ impl ChainSettleContract {
                 shipment.token.clone(),
                 shipment.total_amount,
                 env.ledger().sequence(),
+                shipment.metadata_hash.clone(),
             ),
         );
 
@@ -1653,8 +1835,40 @@ impl ChainSettleContract {
             shipment.released_amount += payment;
 
             // Transfer the net payment minus any advance already sent.
-            let actual_transfer = net_payment - advance_deducted;
+            let mut actual_transfer = net_payment - advance_deducted;
             let token_client = token::Client::new(&env, &shipment.token);
+
+            // Pay referral fee on shipment completion (deducted from final supplier payment).
+            if Self::all_milestones_done(&shipment) {
+                if let Some(referrer_addr) = shipment.referrer.clone() {
+                    let referral_bps: u32 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::ReferralFeeBps)
+                        .unwrap_or(500);
+                    if let Some(fee_cfg) = env
+                        .storage()
+                        .instance()
+                        .get::<DataKey, FeeConfig>(&DataKey::FeeConfig)
+                    {
+                        let total_fee =
+                            (shipment.total_amount * fee_cfg.fee_bps as i128) / 10_000;
+                        let mut referral = (total_fee * referral_bps as i128) / 10_000;
+                        if referral > actual_transfer {
+                            referral = actual_transfer;
+                        }
+                        if referral > 0 {
+                            actual_transfer -= referral;
+                            token_client.transfer(
+                                &env.current_contract_address(),
+                                &referrer_addr,
+                                &referral,
+                            );
+                        }
+                    }
+                }
+            }
+
             if actual_transfer > 0 {
                 token_client.transfer(
                     &env.current_contract_address(),
@@ -1768,8 +1982,39 @@ impl ChainSettleContract {
         shipment.milestones.set(milestone_index, milestone);
         shipment.released_amount += payment;
 
-        let actual_transfer = net_payment - advance_deducted;
+        let mut actual_transfer = net_payment - advance_deducted;
         let token_client = token::Client::new(&env, &shipment.token);
+
+        // Pay referral fee on shipment completion (deducted from final supplier payment).
+        if Self::all_milestones_done(&shipment) {
+            if let Some(referrer_addr) = shipment.referrer.clone() {
+                let referral_bps: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::ReferralFeeBps)
+                    .unwrap_or(500);
+                if let Some(fee_cfg) = env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, FeeConfig>(&DataKey::FeeConfig)
+                {
+                    let total_fee = (shipment.total_amount * fee_cfg.fee_bps as i128) / 10_000;
+                    let mut referral = (total_fee * referral_bps as i128) / 10_000;
+                    if referral > actual_transfer {
+                        referral = actual_transfer;
+                    }
+                    if referral > 0 {
+                        actual_transfer -= referral;
+                        token_client.transfer(
+                            &env.current_contract_address(),
+                            &referrer_addr,
+                            &referral,
+                        );
+                    }
+                }
+            }
+        }
+
         if actual_transfer > 0 {
             token_client.transfer(
                 &env.current_contract_address(),
@@ -1888,8 +2133,40 @@ impl ChainSettleContract {
 
             shipment.released_amount += payment;
 
-            let actual_transfer = net_payment - advance_deducted;
+            let mut actual_transfer = net_payment - advance_deducted;
             let token_client = token::Client::new(&env, &shipment.token);
+
+            // Pay referral fee when this is the completing milestone.
+            if Self::all_milestones_done(&shipment) {
+                if let Some(referrer_addr) = shipment.referrer.clone() {
+                    let referral_bps: u32 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::ReferralFeeBps)
+                        .unwrap_or(500);
+                    if let Some(fee_cfg) = env
+                        .storage()
+                        .instance()
+                        .get::<DataKey, FeeConfig>(&DataKey::FeeConfig)
+                    {
+                        let total_fee =
+                            (shipment.total_amount * fee_cfg.fee_bps as i128) / 10_000;
+                        let mut referral = (total_fee * referral_bps as i128) / 10_000;
+                        if referral > actual_transfer {
+                            referral = actual_transfer;
+                        }
+                        if referral > 0 {
+                            actual_transfer -= referral;
+                            token_client.transfer(
+                                &env.current_contract_address(),
+                                &referrer_addr,
+                                &referral,
+                            );
+                        }
+                    }
+                }
+            }
+
             if actual_transfer > 0 {
                 token_client.transfer(
                     &env.current_contract_address(),
@@ -2520,7 +2797,15 @@ impl ChainSettleContract {
             }
         }
 
-        let refund = shipment.total_amount - shipment.released_amount - shipment.total_advanced_amount;
+        let unreleased = shipment.total_amount - shipment.released_amount - shipment.total_advanced_amount;
+        let cancel_fee = (unreleased * shipment.buyer_cancel_fee_bps as i128) / 10_000;
+        let refund = unreleased - cancel_fee;
+        let primary_buyer = shipment.buyers.get(0).unwrap();
+        let token_client = token::Client::new(&env, &shipment.token);
+
+        if cancel_fee > 0 {
+            token_client.transfer(&env.current_contract_address(), &shipment.supplier, &cancel_fee);
+        }
         if refund > 0 {
             let primary_buyer = shipment.buyers.get(0).unwrap();
             let token_client = token::Client::new(&env, &shipment.token);
@@ -2543,7 +2828,7 @@ impl ChainSettleContract {
             .persistent()
             .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
 
-        // Decrement total escrowed value.
+        // Decrement total escrowed value (full unreleased amount leaves escrow).
         let current_escrowed: i128 = env
             .storage()
             .persistent()
@@ -2551,7 +2836,7 @@ impl ChainSettleContract {
             .unwrap_or(0);
         env.storage().persistent().set(
             &DataKey::TotalEscrowed(shipment.token.clone()),
-            &(current_escrowed - refund).max(0),
+            &(current_escrowed - unreleased).max(0),
         );
 
         // Remove any disputes for this shipment.
@@ -2573,7 +2858,7 @@ impl ChainSettleContract {
 
         env.events().publish(
             (Symbol::new(&env, "shipment_cancelled"), shipment_id.clone()),
-            (refund, buyer.clone(), env.ledger().sequence()),
+            (refund, cancel_fee, buyer.clone(), env.ledger().sequence()),
         );
     }
 
@@ -3052,8 +3337,39 @@ impl ChainSettleContract {
         shipment.milestones.set(milestone_index, milestone);
         shipment.released_amount += payment;
 
-        let actual_transfer = net_payment - advance_deducted;
+        let mut actual_transfer = net_payment - advance_deducted;
         let token_client = token::Client::new(&env, &shipment.token);
+
+        // Pay referral fee on shipment completion (deducted from final supplier payment).
+        if Self::all_milestones_done(&shipment) {
+            if let Some(referrer_addr) = shipment.referrer.clone() {
+                let referral_bps: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::ReferralFeeBps)
+                    .unwrap_or(500);
+                if let Some(fee_cfg) = env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, FeeConfig>(&DataKey::FeeConfig)
+                {
+                    let total_fee = (shipment.total_amount * fee_cfg.fee_bps as i128) / 10_000;
+                    let mut referral = (total_fee * referral_bps as i128) / 10_000;
+                    if referral > actual_transfer {
+                        referral = actual_transfer;
+                    }
+                    if referral > 0 {
+                        actual_transfer -= referral;
+                        token_client.transfer(
+                            &env.current_contract_address(),
+                            &referrer_addr,
+                            &referral,
+                        );
+                    }
+                }
+            }
+        }
+
         if actual_transfer > 0 {
             token_client.transfer(
                 &env.current_contract_address(),
@@ -3853,4 +4169,3 @@ mod test_upgrade;
 mod test_concurrent_disputes;
 mod test_boundaries;
 mod test_chaos;
-mod test_regression;
