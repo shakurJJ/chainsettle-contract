@@ -4290,6 +4290,7 @@ mod test_permissions;
 // mod test_chaos;
 mod property_tests;
 mod test;
+mod test_arbiter_security;
 mod test_oracle;
 mod test_upgrade;
 mod test_concurrent_disputes;
