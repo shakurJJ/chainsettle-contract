@@ -2,7 +2,7 @@ use soroban_sdk::{contracttype, Address, Env, String, Vec};
 
 use crate::{
     constants::{TTL_INITIAL_LEDGERS, TTL_MAX_LEDGERS},
-    AuditEntry, CancelPolicy, ContractStats, DisputeEntry, FeeConfig, MultiAdminConfig, Shipment,
+    AuditEntry, CancelPolicy, ContractStats, DisputeEntry, FeeConfig, MultiAdminConfig, ReputationScore, Shipment,
     ShipmentStatus,
 };
 
