@@ -2073,6 +2073,58 @@ fn test_holdback_early_dispute_cancels_hold() {
     );
 }
 
+#[test]
+#[should_panic(expected = "holdback period not yet expired")]
+fn test_holdback_early_release_rejected() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-HOLD-EARLY");
+    let holdback: u32 = 100;
+
+    client.create_shipment(
+        &shipment_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000_000,
+        &build_milestones(&t.env),
+        &ShipmentOptions {
+            response_deadline: 0,
+            penalty_bps: 0,
+            milestone_mode: MilestoneMode::Parallel,
+            holdback_ledgers: holdback,
+            dispute_cooldown_ledgers: 0,
+            late_penalty_bps_per_ledger: 0,
+            auto_confirm_ledgers: 0,
+            dispute_bond_amount: 0,
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+            },
+    );
+
+    client.submit_proof(
+        &t.supplier,
+        &shipment_id,
+        &0,
+        &String::from_str(&t.env, "ipfs://d"),
+    
+        &Symbol::new(&t.env, "ipfs"),);
+    client.confirm_milestone(&t.buyer, &shipment_id, &0);
+
+    assert_eq!(
+        client.get_milestone(&shipment_id, &0).status,
+        MilestoneStatus::ConfirmedHeld
+    );
+
+    // Attempt release before holdback period has elapsed — must panic.
+    client.release_held_payment(&shipment_id, &0);
+}
+
 // ============================================================
 // BATCH CONFIRM TESTS
 // ============================================================
