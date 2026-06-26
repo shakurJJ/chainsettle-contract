@@ -120,7 +120,13 @@ fn default_options(env: &Env) -> ShipmentOptions {
         logistics_fee_bps: 0,
         supplier_collateral: 0,
         expires_at_ledger: None,
+
         metadata_hash: BytesN::from_array(env, &[0u8; 32]),
+
+        metadata_hash: None,
+        referrer: None,
+        buyer_cancel_fee_bps: 0,
+
     }
 }
 
@@ -436,7 +442,13 @@ fn test_oracle_pattern_dispute_after_rejection() {
         logistics_fee_bps: 0,
         supplier_collateral: 0,
         expires_at_ledger: None,
+
         metadata_hash: BytesN::from_array(&setup.env, &[0u8; 32]),
+
+        metadata_hash: None,
+        referrer: None,
+        buyer_cancel_fee_bps: 0,
+
     };
 
     // Create shipment

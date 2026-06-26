@@ -317,7 +317,13 @@ mod contract_prop_tests {
                 logistics_fee_bps: 0,
                 supplier_collateral: 0,
                 expires_at_ledger: None,
+
                 metadata_hash: BytesN::from_array(&env, &[0u8; 32]),
+
+                metadata_hash: None,
+                referrer: None,
+                buyer_cancel_fee_bps: 0,
+
             },
         );
     }
@@ -602,7 +608,13 @@ mod milestone_percent_fuzz {
                 logistics_fee_bps: 0,
                 supplier_collateral: 0,
                 expires_at_ledger: None,
+
                 metadata_hash: BytesN::from_array(env, &[0u8; 32]),
+
+                metadata_hash: None,
+                referrer: None,
+                buyer_cancel_fee_bps: 0,
+
             }
         }
 

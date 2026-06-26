@@ -243,8 +243,32 @@ chainsetttle-contract/
         ├── Makefile                   ← build / deploy shortcuts
         └── src/
             ├── lib.rs                 ← main contract logic
-            └── test.rs                ← unit tests
+            ├── test.rs                ← test module orchestrator
+            ├── test_common.rs         ← shared test setup, fixtures, helpers
+            ├── test_shipment.rs       ← shipment lifecycle tests (create, confirm, cancel)
+            ├── test_dispute.rs        ← dispute workflow tests (raise, resolve, cooldown)
+            ├── test_admin.rs          ← admin control tests (pause, blacklist, settings)
+            ├── test_query.rs          ← read-only query tests (completion %)
+            ├── constants.rs           ← contract constants
+            ├── storage.rs             ← storage layer
+            ├── admin.rs               ← admin functions
+            ├── benchmarks.rs          ← performance benchmarks
+            └── [other test files]     ← edge cases, stress tests, advanced features
 ```
+
+### Test File Organization
+
+Tests are split by domain for clarity and to reduce merge conflicts:
+
+| File | Purpose | Example Tests |
+|------|---------|---|
+| `test_common.rs` | Shared setup & utilities | `setup()`, `build_milestones()`, `create_standard_shipment()` |
+| `test_shipment.rs` | Shipment lifecycle | `test_create_shipment_success`, `test_full_shipment_lifecycle`, `test_cancel_shipment` |
+| `test_dispute.rs` | Dispute resolution | `test_raise_dispute`, `test_resolve_dispute`, `test_dispute_cooldown_enforced` |
+| `test_admin.rs` | Admin controls | `test_pause_blocks_create_shipment`, `test_blacklist_removal_restores_participation` |
+| `test_query.rs` | Read-only queries | `test_get_completion_percentage_*` |
+
+All shared fixtures and helper functions are centralized in `test_common.rs` to avoid duplication.
 
 ---
 

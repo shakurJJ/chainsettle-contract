@@ -10,7 +10,7 @@
 use super::*;
 use soroban_sdk::{
     testutils::Address as _,
-    token, vec, Address, Env, String, Symbol};
+    token, vec, Address, Env, String,, Symbol};
 
 // Real WASM bytes — the same binary is used for both v1 and v2 in this test,
 // which isolates the state-persistence concern from any logic change.
