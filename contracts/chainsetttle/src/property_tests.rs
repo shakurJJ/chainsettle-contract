@@ -317,6 +317,9 @@ mod contract_prop_tests {
                 logistics_fee_bps: 0,
                 supplier_collateral: 0,
                 expires_at_ledger: None,
+                metadata_hash: None,
+                referrer: None,
+                buyer_cancel_fee_bps: 0,
             },
         );
     }
@@ -598,6 +601,12 @@ mod milestone_percent_fuzz {
                 auto_confirm_ledgers: 0,
                 dispute_bond_amount: 0,
                 arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+                metadata_hash: None,
+                referrer: None,
+                buyer_cancel_fee_bps: 0,
             }
         }
 

@@ -96,6 +96,9 @@ fn opts(env: &Env) -> ShipmentOptions {
         logistics_fee_bps: 0,
         supplier_collateral: 0,
         expires_at_ledger: None,
+        metadata_hash: None,
+        referrer: None,
+        buyer_cancel_fee_bps: 0,
     }
 }
 

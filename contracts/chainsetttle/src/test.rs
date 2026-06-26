@@ -124,6 +124,9 @@ fn default_options(_env: &Env) -> ShipmentOptions {
         logistics_fee_bps: 0,
         supplier_collateral: 0,
         expires_at_ledger: None,
+        metadata_hash: None,
+        referrer: None,
+        buyer_cancel_fee_bps: 0,
     }
 }
 
@@ -1266,6 +1269,9 @@ fn test_dispute_cooldown_enforced() {
                 logistics_fee_bps: 0,
                 supplier_collateral: 0,
                 expires_at_ledger: None,
+                metadata_hash: None,
+                referrer: None,
+                buyer_cancel_fee_bps: 0,
             },
     );
 
@@ -1335,6 +1341,9 @@ fn test_dispute_cooldown_blocks_early_redispute() {
                 logistics_fee_bps: 0,
                 supplier_collateral: 0,
                 expires_at_ledger: None,
+                metadata_hash: None,
+                referrer: None,
+                buyer_cancel_fee_bps: 0,
             },
     );
 
@@ -1434,6 +1443,9 @@ fn test_cooldown_updated_on_resolve() {
                 logistics_fee_bps: 0,
                 supplier_collateral: 0,
                 expires_at_ledger: None,
+                metadata_hash: None,
+                referrer: None,
+                buyer_cancel_fee_bps: 0,
             },
     );
 
@@ -1825,6 +1837,9 @@ fn test_non_whitelisted_token_rejected() {
                 logistics_fee_bps: 0,
                 supplier_collateral: 0,
                 expires_at_ledger: None,
+                metadata_hash: None,
+                referrer: None,
+                buyer_cancel_fee_bps: 0,
             },
     );
 }
@@ -1951,6 +1966,9 @@ fn test_holdback_happy_path() {
                 logistics_fee_bps: 0,
                 supplier_collateral: 0,
                 expires_at_ledger: None,
+                metadata_hash: None,
+                referrer: None,
+                buyer_cancel_fee_bps: 0,
             },
     );
 
@@ -2042,6 +2060,9 @@ fn test_holdback_early_dispute_cancels_hold() {
                 logistics_fee_bps: 0,
                 supplier_collateral: 0,
                 expires_at_ledger: None,
+                metadata_hash: None,
+                referrer: None,
+                buyer_cancel_fee_bps: 0,
             },
     );
 
@@ -2258,6 +2279,9 @@ fn test_multisig_both_buyers_must_confirm() {
                 logistics_fee_bps: 0,
                 supplier_collateral: 0,
                 expires_at_ledger: None,
+                metadata_hash: None,
+                referrer: None,
+                buyer_cancel_fee_bps: 0,
             },
     );
 
@@ -2338,6 +2362,9 @@ fn test_multisig_minority_veto_dispute() {
                 logistics_fee_bps: 0,
                 supplier_collateral: 0,
                 expires_at_ledger: None,
+                metadata_hash: None,
+                referrer: None,
+                buyer_cancel_fee_bps: 0,
             },
     );
 
@@ -2717,6 +2744,9 @@ fn test_deadline_cancellation_success() {
                 logistics_fee_bps: 0,
                 supplier_collateral: 0,
                 expires_at_ledger: None,
+                metadata_hash: None,
+                referrer: None,
+                buyer_cancel_fee_bps: 0,
             },
     );
 
@@ -2776,6 +2806,9 @@ fn test_deadline_cancellation_too_early() {
                 logistics_fee_bps: 0,
                 supplier_collateral: 0,
                 expires_at_ledger: None,
+                metadata_hash: None,
+                referrer: None,
+                buyer_cancel_fee_bps: 0,
             },
     );
 
@@ -4649,4 +4682,337 @@ fn test_shipment_no_expiry() {
         client.expire_shipment(&shipment_id);
     }));
     assert!(result.is_err(), "Should not allow expiry when not configured");
+}
+
+// ============================================================
+// ISSUE #95: IPFS METADATA HASH TESTS
+// ============================================================
+
+#[test]
+fn test_metadata_hash_stored_and_retrievable() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-META-01");
+    let hash = BytesN::from_array(&t.env, &[0x42u8; 32]);
+
+    let mut opts = default_options(&t.env);
+    opts.metadata_hash = Some(hash.clone());
+
+    client.create_shipment(
+        &shipment_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000_000i128,
+        &build_milestones(&t.env),
+        &opts,
+    );
+
+    let shipment = client.get_shipment(&shipment_id);
+    assert_eq!(shipment.metadata_hash, Some(hash));
+}
+
+#[test]
+fn test_no_metadata_hash_shipment() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-NO-META");
+
+    create_standard_shipment(
+        &client, &t.env, &shipment_id,
+        &t.buyer, &t.supplier, &t.logistics, &t.arbiter, &t.token_id, 1_000_000_000,
+    );
+
+    let shipment = client.get_shipment(&shipment_id);
+    assert_eq!(shipment.metadata_hash, None);
+}
+
+// ============================================================
+// ISSUE #100: SUPPLIER WHITELIST TESTS
+// ============================================================
+
+#[test]
+fn test_whitelisted_supplier_can_create_shipment() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    client.add_to_whitelist(&t.buyer, &t.supplier);
+    assert!(client.is_whitelisted(&t.supplier));
+
+    let shipment_id = String::from_str(&t.env, "SHIP-WL-OK");
+    create_standard_shipment(
+        &client, &t.env, &shipment_id,
+        &t.buyer, &t.supplier, &t.logistics, &t.arbiter, &t.token_id, 1_000_000_000,
+    );
+    assert_eq!(client.get_shipment(&shipment_id).status, ShipmentStatus::Active);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_non_whitelisted_supplier_blocked() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let other = Address::generate(&t.env);
+    client.add_to_whitelist(&t.buyer, &other);
+
+    // t.supplier is NOT whitelisted
+    let shipment_id = String::from_str(&t.env, "SHIP-WL-BLOCKED");
+    create_standard_shipment(
+        &client, &t.env, &shipment_id,
+        &t.buyer, &t.supplier, &t.logistics, &t.arbiter, &t.token_id, 1_000_000_000,
+    );
+}
+
+#[test]
+fn test_empty_whitelist_allows_all_suppliers() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    // No whitelist set — open mode
+    assert!(client.is_whitelisted(&t.supplier));
+
+    let shipment_id = String::from_str(&t.env, "SHIP-WL-OPEN");
+    create_standard_shipment(
+        &client, &t.env, &shipment_id,
+        &t.buyer, &t.supplier, &t.logistics, &t.arbiter, &t.token_id, 1_000_000_000,
+    );
+    assert_eq!(client.get_shipment(&shipment_id).status, ShipmentStatus::Active);
+}
+
+#[test]
+fn test_remove_from_whitelist_re_enables_open_mode() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let other = Address::generate(&t.env);
+    // Whitelist non-empty: only `other` is allowed
+    client.add_to_whitelist(&t.buyer, &other);
+
+    // Remove it — whitelist becomes empty again (open mode)
+    client.remove_from_whitelist(&t.buyer, &other);
+    assert!(client.is_whitelisted(&t.supplier));
+
+    let shipment_id = String::from_str(&t.env, "SHIP-WL-REOPEN");
+    create_standard_shipment(
+        &client, &t.env, &shipment_id,
+        &t.buyer, &t.supplier, &t.logistics, &t.arbiter, &t.token_id, 1_000_000_000,
+    );
+    assert_eq!(client.get_shipment(&shipment_id).status, ShipmentStatus::Active);
+}
+
+// ============================================================
+// ISSUE #105: REFERRAL REWARD TESTS
+// ============================================================
+
+#[test]
+fn test_referral_fee_paid_on_completion() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+
+    let fee_bps: u32 = 100; // 1% protocol fee
+    client.set_fee_config(&t.buyer, &fee_bps, &t.treasury);
+    // referral_fee_bps default = 500 (5% of protocol fee)
+
+    let referrer = Address::generate(&t.env);
+    let shipment_id = String::from_str(&t.env, "SHIP-REFERRAL");
+    let total_amount: i128 = 1_000_000_000;
+
+    let mut opts = default_options(&t.env);
+    opts.referrer = Some(referrer.clone());
+
+    client.create_shipment(
+        &shipment_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &total_amount,
+        &build_milestones(&t.env),
+        &opts,
+    );
+
+    // Confirm all 3 milestones
+    for idx in 0u32..3 {
+        client.submit_proof(
+            &t.supplier, &shipment_id, &idx,
+            &String::from_str(&t.env, "ipfs://proof"),
+            &Symbol::new(&t.env, "ipfs"),
+        );
+        client.confirm_milestone(&t.buyer, &shipment_id, &idx);
+    }
+
+    assert_eq!(client.get_shipment(&shipment_id).status, ShipmentStatus::Completed);
+
+    // referral_amount = total_amount * fee_bps / 10_000 * referral_fee_bps / 10_000
+    // = 1_000_000_000 * 100 / 10_000 * 500 / 10_000 = 10_000_000 * 500 / 10_000 = 500_000
+    let expected_referral: i128 = total_amount * fee_bps as i128 / 10_000
+        * client.get_referral_fee_bps() as i128 / 10_000;
+    assert_eq!(token_client.balance(&referrer), expected_referral);
+}
+
+#[test]
+fn test_no_referrer_no_referral_transfer() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+
+    client.set_fee_config(&t.buyer, &100u32, &t.treasury);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-NO-REFERRAL");
+    let total_amount: i128 = 1_000_000_000;
+    let supplier_balance_before = token_client.balance(&t.supplier);
+
+    create_standard_shipment(
+        &client, &t.env, &shipment_id,
+        &t.buyer, &t.supplier, &t.logistics, &t.arbiter, &t.token_id, total_amount,
+    );
+
+    for idx in 0u32..3 {
+        client.submit_proof(
+            &t.supplier, &shipment_id, &idx,
+            &String::from_str(&t.env, "ipfs://p"), &Symbol::new(&t.env, "ipfs"),
+        );
+        client.confirm_milestone(&t.buyer, &shipment_id, &idx);
+    }
+
+    assert_eq!(client.get_shipment(&shipment_id).status, ShipmentStatus::Completed);
+    // Supplier gets full net payment (fee 1%) when no referrer
+    let gross = total_amount;
+    let fee = gross * 100 / 10_000;
+    assert_eq!(token_client.balance(&t.supplier), supplier_balance_before + gross - fee);
+}
+
+// ============================================================
+// ISSUE #108: BUYER CANCELLATION FEE TESTS
+// ============================================================
+
+#[test]
+fn test_buyer_cancel_fee_sent_to_supplier() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-CANCEL-FEE");
+    let total_amount: i128 = 1_000_000_000;
+    let cancel_fee_bps: u32 = 500; // 5%
+
+    let mut opts = default_options(&t.env);
+    opts.buyer_cancel_fee_bps = cancel_fee_bps;
+
+    client.create_shipment(
+        &shipment_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &total_amount,
+        &build_milestones(&t.env),
+        &opts,
+    );
+
+    let buyer_before = token_client.balance(&t.buyer);
+    let supplier_before = token_client.balance(&t.supplier);
+
+    client.cancel_shipment(&t.buyer, &shipment_id);
+
+    let fee = total_amount * cancel_fee_bps as i128 / 10_000;
+    let refund = total_amount - fee;
+
+    assert_eq!(token_client.balance(&t.supplier), supplier_before + fee);
+    assert_eq!(token_client.balance(&t.buyer), buyer_before + refund);
+}
+
+#[test]
+fn test_supplier_cancel_no_buyer_fee() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-SUP-CANCEL-NOFEE");
+    let total_amount: i128 = 1_000_000_000;
+    let cancel_fee_bps: u32 = 500;
+
+    // Even with buyer_cancel_fee_bps set, supplier cancel should NOT apply it
+    let mut opts = default_options(&t.env);
+    opts.response_deadline = 100;
+    opts.penalty_bps = 0;
+    opts.buyer_cancel_fee_bps = cancel_fee_bps;
+
+    client.create_shipment(
+        &shipment_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &total_amount,
+        &build_milestones(&t.env),
+        &opts,
+    );
+
+    client.submit_proof(
+        &t.supplier, &shipment_id, &0,
+        &String::from_str(&t.env, "ipfs://p"), &Symbol::new(&t.env, "ipfs"),
+    );
+    t.env.ledger().set_sequence_number(200);
+
+    let buyer_before = token_client.balance(&t.buyer);
+    client.supplier_cancel(&t.supplier, &shipment_id);
+
+    // Supplier cancel does not apply buyer_cancel_fee_bps; buyer gets full refund
+    assert_eq!(token_client.balance(&t.supplier), 0);
+    assert_eq!(token_client.balance(&t.buyer), buyer_before + total_amount);
+}
+
+#[test]
+#[should_panic(expected = "buyer_cancel_fee_bps cannot exceed 1000")]
+fn test_buyer_cancel_fee_cap_enforced() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let mut opts = default_options(&t.env);
+    opts.buyer_cancel_fee_bps = 1001; // exceeds 10% cap
+
+    client.create_shipment(
+        &String::from_str(&t.env, "SHIP-CAP-FAIL"),
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000_000i128,
+        &build_milestones(&t.env),
+        &opts,
+    );
+}
+
+#[test]
+fn test_buyer_cancel_fee_zero_no_fee() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token_client = token::Client::new(&t.env, &t.token_id);
+
+    let shipment_id = String::from_str(&t.env, "SHIP-ZERO-FEE");
+    let total_amount: i128 = 1_000_000_000;
+
+    // Default options: buyer_cancel_fee_bps = 0
+    create_standard_shipment(
+        &client, &t.env, &shipment_id,
+        &t.buyer, &t.supplier, &t.logistics, &t.arbiter, &t.token_id, total_amount,
+    );
+
+    let buyer_before = token_client.balance(&t.buyer);
+    client.cancel_shipment(&t.buyer, &shipment_id);
+
+    // Full refund, no fee to supplier
+    assert_eq!(token_client.balance(&t.supplier), 0);
+    assert_eq!(token_client.balance(&t.buyer), buyer_before + total_amount);
 }

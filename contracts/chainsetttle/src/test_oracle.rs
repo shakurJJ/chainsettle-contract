@@ -117,6 +117,12 @@ fn default_options(env: &Env) -> ShipmentOptions {
         auto_confirm_ledgers: 0,
         dispute_bond_amount: 0,
         arbiter_fee_bps: 0,
+        logistics_fee_bps: 0,
+        supplier_collateral: 0,
+        expires_at_ledger: None,
+        metadata_hash: None,
+        referrer: None,
+        buyer_cancel_fee_bps: 0,
     }
 }
 
@@ -429,6 +435,12 @@ fn test_oracle_pattern_dispute_after_rejection() {
         auto_confirm_ledgers: 0,
         dispute_bond_amount: 0,
         arbiter_fee_bps: 0,
+        logistics_fee_bps: 0,
+        supplier_collateral: 0,
+        expires_at_ledger: None,
+        metadata_hash: None,
+        referrer: None,
+        buyer_cancel_fee_bps: 0,
     };
 
     // Create shipment
