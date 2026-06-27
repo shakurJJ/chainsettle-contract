@@ -8,7 +8,7 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _, Symbol},
+    testutils::{Address as _, Ledger as _},
     token, vec, Address, BytesN, Env, String,
 };
 
@@ -97,7 +97,7 @@ fn opts(env: &Env) -> ShipmentOptions {
         supplier_collateral: 0,
         expires_at_ledger: None,
 
-        metadata_hash: BytesN::from_array(env, &[0u8; 32]),
+        metadata_hash: Some(BytesN::from_array(env, &[0u8; 32])),
 
         metadata_hash: None,
         referrer: None,

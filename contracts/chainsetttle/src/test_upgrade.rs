@@ -10,7 +10,7 @@
 use super::*;
 use soroban_sdk::{
     testutils::Address as _,
-    token, vec, Address, Env, String,, Symbol};
+    token, vec, Address, Env, String, Symbol};
 
 // Real WASM bytes — the same binary is used for both v1 and v2 in this test,
 // which isolates the state-persistence concern from any logic change.
@@ -30,6 +30,8 @@ fn two_milestone_vec(env: &Env) -> soroban_sdk::Vec<Milestone> {
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
+            proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
         },
         Milestone {
             name: String::from_str(env, "Phase 2"),
@@ -37,6 +39,8 @@ fn two_milestone_vec(env: &Env) -> soroban_sdk::Vec<Milestone> {
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
+            proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
         },
     ]
 }

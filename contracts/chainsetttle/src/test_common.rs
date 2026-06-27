@@ -4,7 +4,7 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _, Symbol},
+    testutils::{Address as _, Ledger as _},
     token, vec, Address, BytesN, Env, String,
 };
 use std::format;
@@ -110,6 +110,13 @@ pub fn default_options(_env: &Env) -> ShipmentOptions {
         late_penalty_bps_per_ledger: 0,
         auto_confirm_ledgers: 0,
         dispute_bond_amount: 0,
+        arbiter_fee_bps: 0,
+        logistics_fee_bps: 0,
+        supplier_collateral: 0,
+        expires_at_ledger: None,
+        metadata_hash: None,
+        referrer: None,
+        buyer_cancel_fee_bps: 0,
     }
 }
 

@@ -4,7 +4,7 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _, Symbol},
+    testutils::{Address as _, Ledger as _},
     token, vec, Address, BytesN, Env, String,
 };
 use std::format;
@@ -114,8 +114,6 @@ fn default_options(_env: &Env) -> ShipmentOptions {
         logistics_fee_bps: 0,
         supplier_collateral: 0,
         expires_at_ledger: None,
-
-        metadata_hash: BytesN::from_array(_env, &[0u8; 32]),
 
         metadata_hash: None,
         referrer: None,
@@ -1264,8 +1262,6 @@ fn test_dispute_cooldown_enforced() {
                 supplier_collateral: 0,
                 expires_at_ledger: None,
 
-                metadata_hash: BytesN::from_array(&t.env, &[0u8; 32]),
-
                 metadata_hash: None,
                 referrer: None,
                 buyer_cancel_fee_bps: 0,
@@ -1339,8 +1335,6 @@ fn test_dispute_cooldown_blocks_early_redispute() {
                 logistics_fee_bps: 0,
                 supplier_collateral: 0,
                 expires_at_ledger: None,
-
-                metadata_hash: BytesN::from_array(&t.env, &[0u8; 32]),
 
                 metadata_hash: None,
                 referrer: None,
@@ -1445,8 +1439,6 @@ fn test_cooldown_updated_on_resolve() {
                 logistics_fee_bps: 0,
                 supplier_collateral: 0,
                 expires_at_ledger: None,
-
-                metadata_hash: BytesN::from_array(&t.env, &[0u8; 32]),
 
                 metadata_hash: None,
                 referrer: None,
@@ -1844,8 +1836,6 @@ fn test_non_whitelisted_token_rejected() {
                 supplier_collateral: 0,
                 expires_at_ledger: None,
 
-                metadata_hash: BytesN::from_array(&t.env, &[0u8; 32]),
-
                 metadata_hash: None,
                 referrer: None,
                 buyer_cancel_fee_bps: 0,
@@ -1977,8 +1967,6 @@ fn test_holdback_happy_path() {
                 supplier_collateral: 0,
                 expires_at_ledger: None,
 
-                metadata_hash: BytesN::from_array(&t.env, &[0u8; 32]),
-
                 metadata_hash: None,
                 referrer: None,
                 buyer_cancel_fee_bps: 0,
@@ -2075,8 +2063,6 @@ fn test_holdback_early_dispute_cancels_hold() {
                 supplier_collateral: 0,
                 expires_at_ledger: None,
 
-                metadata_hash: BytesN::from_array(&t.env, &[0u8; 32]),
-
                 metadata_hash: None,
                 referrer: None,
                 buyer_cancel_fee_bps: 0,
@@ -2139,11 +2125,14 @@ fn test_holdback_early_release_rejected() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
-                arbiter_fee_bps: 0,
-                logistics_fee_bps: 0,
-                supplier_collateral: 0,
-                expires_at_ledger: None,
-            },
+            arbiter_fee_bps: 0,
+            logistics_fee_bps: 0,
+            supplier_collateral: 0,
+            expires_at_ledger: None,
+            metadata_hash: None,
+            referrer: None,
+            buyer_cancel_fee_bps: 0,
+        },
     );
 
     client.submit_proof(
@@ -2350,8 +2339,6 @@ fn test_multisig_both_buyers_must_confirm() {
                 supplier_collateral: 0,
                 expires_at_ledger: None,
 
-                metadata_hash: BytesN::from_array(&t.env, &[0u8; 32]),
-
                 metadata_hash: None,
                 referrer: None,
                 buyer_cancel_fee_bps: 0,
@@ -2436,8 +2423,6 @@ fn test_multisig_minority_veto_dispute() {
                 logistics_fee_bps: 0,
                 supplier_collateral: 0,
                 expires_at_ledger: None,
-
-                metadata_hash: BytesN::from_array(&t.env, &[0u8; 32]),
 
                 metadata_hash: None,
                 referrer: None,
@@ -2823,8 +2808,6 @@ fn test_deadline_cancellation_success() {
                 supplier_collateral: 0,
                 expires_at_ledger: None,
 
-                metadata_hash: BytesN::from_array(&t.env, &[0u8; 32]),
-
                 metadata_hash: None,
                 referrer: None,
                 buyer_cancel_fee_bps: 0,
@@ -2888,8 +2871,6 @@ fn test_deadline_cancellation_too_early() {
                 logistics_fee_bps: 0,
                 supplier_collateral: 0,
                 expires_at_ledger: None,
-
-                metadata_hash: BytesN::from_array(&t.env, &[0u8; 32]),
 
                 metadata_hash: None,
                 referrer: None,
