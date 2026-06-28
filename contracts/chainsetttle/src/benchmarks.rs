@@ -5,7 +5,7 @@ extern crate std;
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
-    token, vec, Address, Env, String as SorobanString, Symbol,
+    token, vec, Address, BytesN, Env, String as SorobanString, Symbol,
 };
 use std::fs;
 use std::path::Path;

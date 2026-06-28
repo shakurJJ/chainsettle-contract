@@ -21,7 +21,7 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _, Symbol},
+    testutils::{Address as _, Ledger as _},
     token, vec, Address, Env, String,
 };
 
