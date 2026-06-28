@@ -10,7 +10,7 @@ extern crate std;
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
-    token, vec, Address, BytesN, Env, String, Symbol,
+    token, vec, Address, Env, String, Symbol,
 };
 
 // ============================================================
@@ -49,7 +49,7 @@ fn setup() -> Setup {
     Setup { env, contract_id, token_id, buyer, supplier, logistics, arbiter }
 }
 
-fn default_options(env: &Env) -> ShipmentOptions {
+fn default_options(_env: &Env) -> ShipmentOptions {
     ShipmentOptions {
         response_deadline: 0,
         penalty_bps: 0,
@@ -66,6 +66,8 @@ fn default_options(env: &Env) -> ShipmentOptions {
         metadata_hash: None,
         referrer: None,
         buyer_cancel_fee_bps: 0,
+        early_bonus_pool: 0,
+        review_window_ledgers: None,
     }
 }
 
@@ -84,6 +86,8 @@ fn one_hundred_percent_milestone(env: &Env) -> soroban_sdk::Vec<Milestone> {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
     ]
 }
@@ -114,6 +118,8 @@ fn build_ten_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         });
     }
     ms

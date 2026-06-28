@@ -68,6 +68,8 @@ fn build_valid_milestone(env: &Env) -> soroban_sdk::Vec<Milestone> {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
     ]
 }
@@ -83,6 +85,8 @@ fn build_zero_percent_milestone(env: &Env) -> soroban_sdk::Vec<Milestone> {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
     ]
 }
@@ -98,6 +102,8 @@ fn build_low_percent_milestone(env: &Env) -> soroban_sdk::Vec<Milestone> {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
     ]
 }
@@ -113,6 +119,8 @@ fn build_multi_milestone_with_zero(env: &Env) -> soroban_sdk::Vec<Milestone> {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
         Milestone {
             name: String::from_str(env, "Milestone 2 (Zero Percent)"),
@@ -122,6 +130,8 @@ fn build_multi_milestone_with_zero(env: &Env) -> soroban_sdk::Vec<Milestone> {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
         Milestone {
             name: String::from_str(env, "Milestone 3"),
@@ -131,6 +141,8 @@ fn build_multi_milestone_with_zero(env: &Env) -> soroban_sdk::Vec<Milestone> {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
     ]
 }
@@ -156,6 +168,8 @@ fn default_options(_env: &Env) -> ShipmentOptions {
         metadata_hash: None,
         referrer: None,
         buyer_cancel_fee_bps: 0,
+        early_bonus_pool: 0,
+        review_window_ledgers: None,
     }
 }
 
@@ -388,6 +402,8 @@ fn test_create_shipment_milestone_min_percent_accepted() {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
         Milestone {
             name: String::from_str(&t.env, "Milestone 2"),
@@ -397,6 +413,8 @@ fn test_create_shipment_milestone_min_percent_accepted() {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
     ];
 
@@ -443,6 +461,8 @@ fn test_create_shipment_below_min_percent_rejected() {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
         Milestone {
             name: String::from_str(&t.env, "Milestone 2"),
@@ -452,6 +472,8 @@ fn test_create_shipment_below_min_percent_rejected() {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
     ];
 

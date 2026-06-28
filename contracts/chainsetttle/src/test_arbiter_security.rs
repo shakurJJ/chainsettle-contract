@@ -67,6 +67,8 @@ fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
     ]
 }
@@ -92,6 +94,8 @@ fn default_options(_env: &Env) -> ShipmentOptions {
         metadata_hash: None,
         referrer: None,
         buyer_cancel_fee_bps: 0,
+        early_bonus_pool: 0,
+        review_window_ledgers: None,
     }
 }
 

@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use soroban_sdk::{token, Address, BytesN, Env, String, Symbol, Vec};
+use soroban_sdk::{token, Address, Env, String, Symbol, Vec};
 
 use crate::{
     ChainSettleContract, Milestone, MilestoneMode, MilestoneStatus, ShipmentOptions, ShipmentStatus,
@@ -70,6 +70,8 @@ fn build_single_milestone(env: &Env) -> Vec<Milestone> {
         release_after_ledger: 0,
         proof_submitted_ledger: None,
         dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
     });
     v
 }
@@ -84,6 +86,8 @@ fn build_three_milestones(env: &Env) -> Vec<Milestone> {
         release_after_ledger: 0,
         proof_submitted_ledger: None,
         dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
     });
     v.push_back(Milestone {
         name: String::from_str(&env, "Transit"),
@@ -93,6 +97,8 @@ fn build_three_milestones(env: &Env) -> Vec<Milestone> {
         release_after_ledger: 0,
         proof_submitted_ledger: None,
         dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
     });
     v.push_back(Milestone {
         name: String::from_str(&env, "Delivery"),
@@ -102,6 +108,8 @@ fn build_three_milestones(env: &Env) -> Vec<Milestone> {
         release_after_ledger: 0,
         proof_submitted_ledger: None,
         dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
     });
     v
 }
@@ -124,6 +132,8 @@ fn default_options(env: &Env) -> ShipmentOptions {
         metadata_hash: None,
         referrer: None,
         buyer_cancel_fee_bps: 0,
+        early_bonus_pool: 0,
+        review_window_ledgers: None,
 
     }
 }
@@ -444,6 +454,8 @@ fn test_oracle_pattern_dispute_after_rejection() {
         metadata_hash: None,
         referrer: None,
         buyer_cancel_fee_bps: 0,
+        early_bonus_pool: 0,
+        review_window_ledgers: None,
 
     };
 
