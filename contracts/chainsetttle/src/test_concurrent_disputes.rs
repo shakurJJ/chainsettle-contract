@@ -7,7 +7,7 @@
 use super::*;
 use soroban_sdk::{
     testutils::Address as _,
-    token, vec, Address, Env, String,, Symbol};
+    token, vec, Address, Env, String, Symbol};
 
 // Resolution order: deliberately non-sequential to catch cross-shipment contamination.
 const RESOLUTION_ORDER: [usize; 10] = [5, 2, 8, 1, 6, 0, 9, 3, 7, 4];
@@ -21,6 +21,10 @@ fn three_milestone_vec(env: &Env) -> soroban_sdk::Vec<Milestone> {
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
+            proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
         Milestone {
             name: String::from_str(env, "Transit"),
@@ -28,6 +32,10 @@ fn three_milestone_vec(env: &Env) -> soroban_sdk::Vec<Milestone> {
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
+            proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
         Milestone {
             name: String::from_str(env, "Delivery"),
@@ -35,6 +43,10 @@ fn three_milestone_vec(env: &Env) -> soroban_sdk::Vec<Milestone> {
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
+            proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
     ]
 }

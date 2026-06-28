@@ -145,6 +145,15 @@ fn test_dispute_cooldown_enforced() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
+            arbiter_fee_bps: 0,
+            logistics_fee_bps: 0,
+            supplier_collateral: 0,
+            expires_at_ledger: None,
+            metadata_hash: None,
+            referrer: None,
+            buyer_cancel_fee_bps: 0,
+            early_bonus_pool: 0,
+            review_window_ledgers: None,
         },
     );
 
@@ -207,6 +216,15 @@ fn test_dispute_cooldown_blocks_early_redispute() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
+            arbiter_fee_bps: 0,
+            logistics_fee_bps: 0,
+            supplier_collateral: 0,
+            expires_at_ledger: None,
+            metadata_hash: None,
+            referrer: None,
+            buyer_cancel_fee_bps: 0,
+            early_bonus_pool: 0,
+            review_window_ledgers: None,
         },
     );
 
@@ -302,6 +320,15 @@ fn test_cooldown_updated_on_resolve() {
             late_penalty_bps_per_ledger: 0,
             auto_confirm_ledgers: 0,
             dispute_bond_amount: 0,
+            arbiter_fee_bps: 0,
+            logistics_fee_bps: 0,
+            supplier_collateral: 0,
+            expires_at_ledger: None,
+            metadata_hash: None,
+            referrer: None,
+            buyer_cancel_fee_bps: 0,
+            early_bonus_pool: 0,
+            review_window_ledgers: None,
         },
     );
 

@@ -45,6 +45,10 @@ pub struct Milestone {
     pub proof_submitted_ledger: Option<u32>,
     /// Ledger at which dispute was opened; used for escalation threshold check.
     pub dispute_opened_ledger: Option<u32>,
+    /// Ledger by which proof must be submitted to avoid late-delivery penalty and earn early bonus (0 = no deadline).
+    pub deadline_ledger: u32,
+    /// Basis points penalty per overdue ledger past deadline_ledger (0 = use shipment-level or disabled).
+    pub penalty_bps_per_ledger: u32,
 }
 
 #[contracttype]
@@ -110,16 +114,19 @@ pub struct Shipment {
     /// Ledger at which the shipment expires (None = no expiry).
     pub expires_at_ledger: Option<u32>,
 
-    /// 32-byte provenance metadata hash for the NFT mint hook event (Issue #104).
-    /// Zero-bytes means no metadata hash; set at shipment creation via ShipmentOptions.
-    pub metadata_hash: BytesN<32>,
-
     /// Off-chain trade document hash (IPFS CID) attached at creation; immutable after creation.
     pub metadata_hash: Option<BytesN<32>>,
     /// Optional referrer who earns a basis-point bonus of the protocol fee on shipment completion.
     pub referrer: Option<Address>,
     /// Basis points charged to buyer on buyer-initiated cancellation (0 = no penalty, max 1000).
     pub buyer_cancel_fee_bps: u32,
+
+    /// Total early-completion bonus pool funded by buyer at creation (0 = disabled).
+    pub early_bonus_pool: i128,
+    /// Remaining early-completion bonus not yet awarded; returned to buyer on shipment completion.
+    pub early_bonus_remaining: i128,
+    /// Per-shipment proof review window override (None = use auto_confirm_ledgers or global default, Some(0) = opt-out).
+    pub review_window_ledgers: Option<u32>,
 
 }
 
@@ -190,16 +197,17 @@ pub struct ShipmentOptions {
     /// Ledger at which shipment expires (None = no expiry).
     pub expires_at_ledger: Option<u32>,
 
-    /// 32-byte provenance metadata hash embedded in the NFT mint hook event on final completion.
-    /// Pass `BytesN::from_array(&env, &[0u8; 32])` if no metadata hash is needed.
-    pub metadata_hash: BytesN<32>,
-
     /// Off-chain trade document hash (IPFS CID) attached at creation; immutable after creation.
     pub metadata_hash: Option<BytesN<32>>,
     /// Optional referrer who earns a basis-point bonus of the protocol fee on shipment completion.
     pub referrer: Option<Address>,
     /// Basis points charged to buyer on buyer-initiated cancellation (0 = no penalty, max 1000).
     pub buyer_cancel_fee_bps: u32,
+
+    /// Early-completion bonus pool funded by buyer (0 = disabled).
+    pub early_bonus_pool: i128,
+    /// Per-shipment proof review window override (None = use global default, Some(0) = disable auto-confirm for this shipment).
+    pub review_window_ledgers: Option<u32>,
 
 }
 
@@ -412,6 +420,8 @@ pub enum DataKey {
     SupplierWhitelist,
     /// Referral fee basis points paid to referrer out of the total protocol fee (default 500 = 5%).
     ReferralFeeBps,
+    /// Global default auto-confirm review window in ledgers (0 = globally disabled).
+    AutoConfirmThreshold,
 
 }
 
@@ -1110,12 +1120,11 @@ impl ChainSettleContract {
         let logistics_fee_bps = options.logistics_fee_bps;
         let supplier_collateral = options.supplier_collateral;
         let expires_at_ledger = options.expires_at_ledger;
-
-        let metadata_hash = options.metadata_hash.clone();
-
         let metadata_hash = options.metadata_hash;
         let referrer = options.referrer;
         let buyer_cancel_fee_bps = options.buyer_cancel_fee_bps;
+        let early_bonus_pool = options.early_bonus_pool;
+        let review_window_ledgers = options.review_window_ledgers;
 
         if buyer_cancel_fee_bps > 1000 {
             panic!("buyer_cancel_fee_bps cannot exceed 1000 (10%)");
@@ -1129,6 +1138,11 @@ impl ChainSettleContract {
         // All co-buyers must authorise the creation.
         for i in 0..buyers.len() {
             buyers.get(i).unwrap().require_auth();
+        }
+
+        // Supplier must authorise creation when they are required to lock collateral.
+        if supplier_collateral > 0 {
+            supplier.require_auth();
         }
 
         if total_amount <= 0 {
@@ -1232,7 +1246,21 @@ impl ChainSettleContract {
             token_client.transfer(&primary_buyer, &env.current_contract_address(), &bond_total);
         }
 
-        // Normalise milestones: clear any caller-supplied state.
+        // Transfer early bonus pool from buyer (separate from escrow; 0 = disabled).
+        if early_bonus_pool > 0 {
+            token_client.transfer(&primary_buyer, &env.current_contract_address(), &early_bonus_pool);
+        }
+
+        // Lock supplier collateral: transfer from supplier and store separately.
+        if supplier_collateral > 0 {
+            token_client.transfer(&supplier, &env.current_contract_address(), &supplier_collateral);
+            env.storage().persistent().set(
+                &DataKey::SupplierCollateral(shipment_id.clone()),
+                &supplier_collateral,
+            );
+        }
+
+        // Normalise milestones: clear caller-supplied runtime state but preserve deadline fields.
         let mut clean_milestones: Vec<Milestone> = Vec::new(&env);
         for i in 0..milestones.len() {
             let mut m = milestones.get(i).unwrap();
@@ -1241,6 +1269,7 @@ impl ChainSettleContract {
             m.release_after_ledger = 0;
             m.proof_submitted_ledger = None;
             m.dispute_opened_ledger = None;
+            // deadline_ledger and penalty_bps_per_ledger are caller-supplied configuration — keep them.
             clean_milestones.push_back(m);
         }
 
@@ -1271,10 +1300,11 @@ impl ChainSettleContract {
             logistics_fee_bps,
             expires_at_ledger,
             metadata_hash,
-
             referrer,
             buyer_cancel_fee_bps,
-
+            early_bonus_pool,
+            early_bonus_remaining: early_bonus_pool,
+            review_window_ledgers,
         };
 
         Self::append_audit_entry(
@@ -1833,32 +1863,41 @@ impl ChainSettleContract {
         }
 
         // Check if auto-confirmation window has passed; if so, reject manual confirmation.
-        if shipment.auto_confirm_ledgers > 0 {
+        let effective_window = Self::get_effective_auto_confirm_window(&env, &shipment);
+        if effective_window > 0 {
             if let Some(proof_ledger) = milestone.proof_submitted_ledger {
-                let auto_confirm_ledger = proof_ledger + shipment.auto_confirm_ledgers;
+                let auto_confirm_ledger = proof_ledger + effective_window;
                 if env.ledger().sequence() >= auto_confirm_ledger {
                     panic!("milestone has auto-confirmed; use claim_auto_confirmation");
                 }
             }
         }
 
-        let mut payment = (shipment.total_amount * milestone.payment_percent as i128) / 100;
+        let gross_payment = (shipment.total_amount * milestone.payment_percent as i128) / 100;
+        let mut payment = gross_payment;
 
         // Deduct any approved advance for this milestone.
         let advance_deducted =
             Self::consume_advance_for_milestone(&env, &mut shipment, &shipment_id, milestone_index);
 
-        // Apply late-delivery penalty if configured.
+        // Apply late-delivery penalty based on deadline_ledger (0 = no deadline, no penalty).
         let mut penalty_deducted: i128 = 0;
-        if shipment.late_penalty_bps_per_ledger > 0 {
-            if let Some(proof_ledger) = milestone.proof_submitted_ledger {
-                let delay_ledgers = env.ledger().sequence() - proof_ledger;
-                let penalty = (payment
-                    * (shipment.late_penalty_bps_per_ledger as i128 * delay_ledgers as i128))
-                    / 10_000;
-                if penalty > 0 && penalty < payment {
-                    penalty_deducted = penalty;
-                    payment -= penalty;
+        if milestone.deadline_ledger > 0 {
+            let penalty_bps = if milestone.penalty_bps_per_ledger > 0 {
+                milestone.penalty_bps_per_ledger
+            } else {
+                shipment.late_penalty_bps_per_ledger
+            };
+            if penalty_bps > 0 {
+                let proof_ledger = milestone.proof_submitted_ledger.unwrap_or(0);
+                let overdue_ledgers = proof_ledger.saturating_sub(milestone.deadline_ledger);
+                if overdue_ledgers > 0 {
+                    let raw_penalty =
+                        (gross_payment * (penalty_bps as i128 * overdue_ledgers as i128))
+                            / 10_000;
+                    let cap = gross_payment / 2;
+                    penalty_deducted = raw_penalty.min(cap);
+                    payment -= penalty_deducted;
                 }
             }
         }
@@ -1867,6 +1906,27 @@ impl ChainSettleContract {
             milestone.release_after_ledger = env.ledger().sequence() + shipment.holdback_ledgers;
             milestone.status = MilestoneStatus::ConfirmedHeld;
             shipment.milestones.set(milestone_index, milestone.clone());
+
+            // Pay early bonus immediately even for held milestones (bonus is based on delivery time).
+            let mut early_bonus_paid: i128 = 0;
+            if shipment.early_bonus_pool > 0
+                && milestone.deadline_ledger > 0
+                && env.ledger().sequence() <= milestone.deadline_ledger
+                && shipment.early_bonus_remaining > 0
+            {
+                let total_milestones = shipment.milestones.len() as i128;
+                let bonus = shipment.early_bonus_pool / total_milestones;
+                if bonus > 0 && bonus <= shipment.early_bonus_remaining {
+                    early_bonus_paid = bonus;
+                    shipment.early_bonus_remaining -= bonus;
+                    let token_client = token::Client::new(&env, &shipment.token);
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &shipment.supplier,
+                        &bonus,
+                    );
+                }
+            }
 
             env.storage()
                 .persistent()
@@ -1878,6 +1938,7 @@ impl ChainSettleContract {
                     milestone_index,
                     milestone.release_after_ledger,
                     penalty_deducted,
+                    early_bonus_paid,
                 ),
             );
         } else {
@@ -1887,6 +1948,7 @@ impl ChainSettleContract {
             // Check circuit breaker before transferring payment
             Self::check_circuit_breaker(&env, payment);
 
+            let milestone_deadline = milestone.deadline_ledger;
             milestone.status = MilestoneStatus::Confirmed;
             shipment.milestones.set(milestone_index, milestone);
             shipment.released_amount += payment;
@@ -1894,6 +1956,19 @@ impl ChainSettleContract {
             // Transfer the net payment minus any advance already sent.
             let mut actual_transfer = net_payment - advance_deducted;
             let token_client = token::Client::new(&env, &shipment.token);
+
+            // Deduct logistics fee and pay logistics provider.
+            if shipment.logistics_fee_bps > 0 {
+                let logistics_fee = (payment * shipment.logistics_fee_bps as i128) / 10_000;
+                if logistics_fee > 0 && logistics_fee <= actual_transfer {
+                    actual_transfer -= logistics_fee;
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &shipment.logistics,
+                        &logistics_fee,
+                    );
+                }
+            }
 
             // Pay referral fee on shipment completion (deducted from final supplier payment).
             if Self::all_milestones_done(&shipment) {
@@ -1926,6 +2001,24 @@ impl ChainSettleContract {
                 }
             }
 
+            // Pay early bonus to supplier if confirmed on or before deadline.
+            if shipment.early_bonus_pool > 0
+                && milestone_deadline > 0
+                && env.ledger().sequence() <= milestone_deadline
+                && shipment.early_bonus_remaining > 0
+            {
+                let total_milestones = shipment.milestones.len() as i128;
+                let bonus = shipment.early_bonus_pool / total_milestones;
+                if bonus > 0 && bonus <= shipment.early_bonus_remaining {
+                    shipment.early_bonus_remaining -= bonus;
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &shipment.supplier,
+                        &bonus,
+                    );
+                }
+            }
+
             if actual_transfer > 0 {
                 token_client.transfer(
                     &env.current_contract_address(),
@@ -1946,6 +2039,16 @@ impl ChainSettleContract {
 
             if Self::all_milestones_done(&shipment) {
                 shipment.status = ShipmentStatus::Completed;
+                // Return unused early bonus pool to buyer on completion.
+                if shipment.early_bonus_remaining > 0 {
+                    let primary_buyer = shipment.buyers.get(0).unwrap();
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &primary_buyer,
+                        &shipment.early_bonus_remaining,
+                    );
+                    shipment.early_bonus_remaining = 0;
+                }
                 // Update completed shipments stat using pre-fetched context.
                 let mut stats = ctx.contract_stats;
                 stats.completed_shipments += 1;
@@ -2074,6 +2177,19 @@ impl ChainSettleContract {
         let mut actual_transfer = net_payment - advance_deducted;
         let token_client = token::Client::new(&env, &shipment.token);
 
+        // Deduct logistics fee and pay logistics provider.
+        if shipment.logistics_fee_bps > 0 {
+            let logistics_fee = (payment * shipment.logistics_fee_bps as i128) / 10_000;
+            if logistics_fee > 0 && logistics_fee <= actual_transfer {
+                actual_transfer -= logistics_fee;
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &shipment.logistics,
+                    &logistics_fee,
+                );
+            }
+        }
+
         // Pay referral fee on shipment completion (deducted from final supplier payment).
         if Self::all_milestones_done(&shipment) {
             if let Some(referrer_addr) = shipment.referrer.clone() {
@@ -2113,6 +2229,16 @@ impl ChainSettleContract {
         }
 
         if Self::all_milestones_done(&shipment) {
+            // Return unused early bonus pool to buyer on completion.
+            if shipment.early_bonus_remaining > 0 {
+                let primary_buyer = shipment.buyers.get(0).unwrap();
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &primary_buyer,
+                    &shipment.early_bonus_remaining,
+                );
+                shipment.early_bonus_remaining = 0;
+            }
             shipment.status = ShipmentStatus::Completed;
             // Update completed shipments stat.
             let mut stats: ContractStats = env
@@ -2358,9 +2484,10 @@ impl ChainSettleContract {
         }
 
         // Check if auto-confirmation window has passed; if so, reject dispute.
-        if shipment.auto_confirm_ledgers > 0 {
+        let effective_window = Self::get_effective_auto_confirm_window(&env, &shipment);
+        if effective_window > 0 {
             if let Some(proof_ledger) = milestone.proof_submitted_ledger {
-                let auto_confirm_ledger = proof_ledger + shipment.auto_confirm_ledgers;
+                let auto_confirm_ledger = proof_ledger + effective_window;
                 if env.ledger().sequence() >= auto_confirm_ledger {
                     panic!("milestone has auto-confirmed; dispute window closed");
                 }
@@ -2489,9 +2616,10 @@ impl ChainSettleContract {
         }
 
         // Auto-confirmation window check.
-        if shipment.auto_confirm_ledgers > 0 {
+        let effective_window = Self::get_effective_auto_confirm_window(&env, &shipment);
+        if effective_window > 0 {
             if let Some(proof_ledger) = milestone.proof_submitted_ledger {
-                let auto_confirm_ledger = proof_ledger + shipment.auto_confirm_ledgers;
+                let auto_confirm_ledger = proof_ledger + effective_window;
                 if env.ledger().sequence() >= auto_confirm_ledger {
                     panic!("milestone has auto-confirmed; dispute window closed");
                 }
@@ -2896,9 +3024,17 @@ impl ChainSettleContract {
             token_client.transfer(&env.current_contract_address(), &shipment.supplier, &cancel_fee);
         }
         if refund > 0 {
-            let primary_buyer = shipment.buyers.get(0).unwrap();
-            let token_client = token::Client::new(&env, &shipment.token);
             token_client.transfer(&env.current_contract_address(), &primary_buyer, &refund);
+        }
+
+        // Forfeit supplier collateral to buyer on buyer-initiated cancellation.
+        let collateral: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SupplierCollateral(shipment_id.clone()))
+            .unwrap_or(0);
+        if collateral > 0 {
+            token_client.transfer(&env.current_contract_address(), &primary_buyer, &collateral);
         }
 
         shipment.status = ShipmentStatus::Cancelled;
@@ -3375,7 +3511,8 @@ impl ChainSettleContract {
             panic!("invalid milestone index");
         }
 
-        if shipment.auto_confirm_ledgers == 0 {
+        let effective_window = Self::get_effective_auto_confirm_window(&env, &shipment);
+        if effective_window == 0 {
             panic!("auto-confirmation not enabled for this shipment");
         }
 
@@ -3386,7 +3523,7 @@ impl ChainSettleContract {
         }
 
         if let Some(proof_ledger) = milestone.proof_submitted_ledger {
-            let auto_confirm_ledger = proof_ledger + shipment.auto_confirm_ledgers;
+            let auto_confirm_ledger = proof_ledger + effective_window;
             if env.ledger().sequence() < auto_confirm_ledger {
                 panic!("auto-confirmation window has not expired");
             }
@@ -3394,23 +3531,31 @@ impl ChainSettleContract {
             panic!("proof_submitted_ledger not set");
         }
 
-        let mut payment = (shipment.total_amount * milestone.payment_percent as i128) / 100;
+        let gross_payment = (shipment.total_amount * milestone.payment_percent as i128) / 100;
+        let mut payment = gross_payment;
 
         // Deduct any approved advance for this milestone.
         let advance_deducted =
             Self::consume_advance_for_milestone(&env, &mut shipment, &shipment_id, milestone_index);
 
-        // Apply late-delivery penalty if configured.
+        // Apply late-delivery penalty based on deadline_ledger (0 = no deadline, no penalty).
         let mut penalty_deducted: i128 = 0;
-        if shipment.late_penalty_bps_per_ledger > 0 {
-            if let Some(proof_ledger) = milestone.proof_submitted_ledger {
-                let delay_ledgers = env.ledger().sequence() - proof_ledger;
-                let penalty = (payment
-                    * (shipment.late_penalty_bps_per_ledger as i128 * delay_ledgers as i128))
-                    / 10_000;
-                if penalty > 0 && penalty < payment {
-                    penalty_deducted = penalty;
-                    payment -= penalty;
+        if milestone.deadline_ledger > 0 {
+            let penalty_bps = if milestone.penalty_bps_per_ledger > 0 {
+                milestone.penalty_bps_per_ledger
+            } else {
+                shipment.late_penalty_bps_per_ledger
+            };
+            if penalty_bps > 0 {
+                let proof_ledger = milestone.proof_submitted_ledger.unwrap_or(0);
+                let overdue_ledgers = proof_ledger.saturating_sub(milestone.deadline_ledger);
+                if overdue_ledgers > 0 {
+                    let raw_penalty =
+                        (gross_payment * (penalty_bps as i128 * overdue_ledgers as i128))
+                            / 10_000;
+                    let cap = gross_payment / 2;
+                    penalty_deducted = raw_penalty.min(cap);
+                    payment -= penalty_deducted;
                 }
             }
         }
@@ -3421,6 +3566,7 @@ impl ChainSettleContract {
         // Check circuit breaker before transferring payment
         Self::check_circuit_breaker(&env, payment);
 
+        let milestone_deadline = milestone.deadline_ledger;
         milestone.status = MilestoneStatus::Confirmed;
         milestone.proof_submitted_ledger = None;
         shipment.milestones.set(milestone_index, milestone);
@@ -3428,6 +3574,37 @@ impl ChainSettleContract {
 
         let mut actual_transfer = net_payment - advance_deducted;
         let token_client = token::Client::new(&env, &shipment.token);
+
+        // Deduct logistics fee and pay logistics provider.
+        if shipment.logistics_fee_bps > 0 {
+            let logistics_fee = (payment * shipment.logistics_fee_bps as i128) / 10_000;
+            if logistics_fee > 0 && logistics_fee <= actual_transfer {
+                actual_transfer -= logistics_fee;
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &shipment.logistics,
+                    &logistics_fee,
+                );
+            }
+        }
+
+        // Pay early bonus to supplier if proof was submitted on or before deadline.
+        if shipment.early_bonus_pool > 0
+            && milestone_deadline > 0
+            && env.ledger().sequence() <= milestone_deadline
+            && shipment.early_bonus_remaining > 0
+        {
+            let total_milestones = shipment.milestones.len() as i128;
+            let bonus = shipment.early_bonus_pool / total_milestones;
+            if bonus > 0 && bonus <= shipment.early_bonus_remaining {
+                shipment.early_bonus_remaining -= bonus;
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &shipment.supplier,
+                    &bonus,
+                );
+            }
+        }
 
         // Pay referral fee on shipment completion (deducted from final supplier payment).
         if Self::all_milestones_done(&shipment) {
@@ -3478,6 +3655,16 @@ impl ChainSettleContract {
         }
 
         if Self::all_milestones_done(&shipment) {
+            // Return unused early bonus pool to buyer on completion.
+            if shipment.early_bonus_remaining > 0 {
+                let primary_buyer = shipment.buyers.get(0).unwrap();
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &primary_buyer,
+                    &shipment.early_bonus_remaining,
+                );
+                shipment.early_bonus_remaining = 0;
+            }
             shipment.status = ShipmentStatus::Completed;
             // Update completed shipments stat.
             let mut stats: ContractStats = env
@@ -3503,17 +3690,17 @@ impl ChainSettleContract {
             );
         }
 
-            // Decrement total escrowed value.
-            let net_outflow = payment - advance_deducted;
-            let current_escrowed: i128 = env
-                .storage()
-                .persistent()
-                .get(&DataKey::TotalEscrowed(shipment.token.clone()))
-                .unwrap_or(0);
-            env.storage().persistent().set(
-                &DataKey::TotalEscrowed(shipment.token.clone()),
-                &(current_escrowed - net_outflow).max(0),
-            );
+        // Decrement total escrowed value.
+        let net_outflow = payment - advance_deducted;
+        let current_escrowed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalEscrowed(shipment.token.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::TotalEscrowed(shipment.token.clone()),
+            &(current_escrowed - net_outflow).max(0),
+        );
 
         env.storage()
             .persistent()
@@ -3640,19 +3827,29 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
-    // UPGRADE
+    // ADMIN: AUTO-CONFIRM THRESHOLD (#96)
     // ----------------------------------------------------------
 
-    /// Admin upgrades the contract WASM. Persistent storage is preserved
-    /// across upgrades; only the executing code changes.
-    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic!("not initialised"));
+    /// Set the global default auto-confirm review window.
+    /// Shipments with review_window_ledgers = None fall back to this value.
+    /// 0 disables auto-confirmation globally.
+    pub fn set_auto_confirm_threshold(env: Env, admin: Address, window_ledgers: u32) {
         admin.require_auth();
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::AutoConfirmThreshold, &window_ledgers);
+        env.events().publish(
+            (Symbol::new(&env, "auto_confirm_threshold_set"),),
+            window_ledgers,
+        );
+    }
+
+    pub fn get_auto_confirm_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AutoConfirmThreshold)
+            .unwrap_or(0)
     }
 
     // ----------------------------------------------------------
@@ -3831,6 +4028,26 @@ impl ChainSettleContract {
     // ----------------------------------------------------------
     // INTERNAL HELPERS
     // ----------------------------------------------------------
+
+    /// Returns the effective auto-confirm window for a shipment.
+    /// Priority: per-shipment review_window_ledgers > auto_confirm_ledgers > global AutoConfirmThreshold.
+    /// Returns 0 if auto-confirmation is disabled.
+    fn get_effective_auto_confirm_window(env: &Env, shipment: &Shipment) -> u32 {
+        match shipment.review_window_ledgers {
+            Some(0) => 0,
+            Some(n) => n,
+            None => {
+                if shipment.auto_confirm_ledgers > 0 {
+                    shipment.auto_confirm_ledgers
+                } else {
+                    env.storage()
+                        .instance()
+                        .get(&DataKey::AutoConfirmThreshold)
+                        .unwrap_or(0)
+                }
+            }
+        }
+    }
 
     fn assert_not_paused(env: &Env) {
         let paused: bool = env
@@ -4262,3 +4479,4 @@ mod test_upgrade;
 mod test_concurrent_disputes;
 mod test_boundaries;
 mod test_chaos;
+mod test_features;

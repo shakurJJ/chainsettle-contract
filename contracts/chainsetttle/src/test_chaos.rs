@@ -15,7 +15,7 @@ extern crate std;
 use super::*;
 use soroban_sdk::{
     testutils::Address as _,
-    token, vec, Address, Env, String,, Symbol};
+    token, vec, Address, Env, String, Symbol};
 use proptest::prelude::*;
 
 // Fixed slot IDs so we can reference shipments without heap allocation gymnastics
@@ -75,6 +75,10 @@ fn two_milestone_chaos(env: &Env) -> soroban_sdk::Vec<Milestone> {
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
+            proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
         Milestone {
             name: String::from_str(env, "B"),
@@ -82,6 +86,10 @@ fn two_milestone_chaos(env: &Env) -> soroban_sdk::Vec<Milestone> {
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
             release_after_ledger: 0,
+            proof_submitted_ledger: None,
+            dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
     ]
 }

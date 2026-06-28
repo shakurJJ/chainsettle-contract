@@ -166,6 +166,8 @@ fn test_min_milestone_percent_accepts_threshold() {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
         Milestone {
             name: String::from_str(&t.env, "In Transit"),
@@ -175,6 +177,8 @@ fn test_min_milestone_percent_accepts_threshold() {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
         Milestone {
             name: String::from_str(&t.env, "Delivered"),
@@ -184,6 +188,8 @@ fn test_min_milestone_percent_accepts_threshold() {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
     ];
 
@@ -222,6 +228,8 @@ fn test_min_milestone_percent_rejects_below_threshold() {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
         Milestone {
             name: String::from_str(&t.env, "In Transit"),
@@ -231,6 +239,8 @@ fn test_min_milestone_percent_rejects_below_threshold() {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
         Milestone {
             name: String::from_str(&t.env, "Delivered"),
@@ -240,6 +250,8 @@ fn test_min_milestone_percent_rejects_below_threshold() {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
     ];
 
@@ -275,6 +287,8 @@ fn test_min_milestone_percent_updates_via_admin() {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
         Milestone {
             name: String::from_str(&t.env, "In Transit"),
@@ -284,6 +298,8 @@ fn test_min_milestone_percent_updates_via_admin() {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
         Milestone {
             name: String::from_str(&t.env, "Delivered"),
@@ -293,6 +309,8 @@ fn test_min_milestone_percent_updates_via_admin() {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         },
     ];
 
