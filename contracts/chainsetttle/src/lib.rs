@@ -32,6 +32,14 @@ pub enum MilestoneMode {
     Parallel,
 }
 
+/// Default resolution applied when a dispute auto-resolves after timeout (#165).
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub enum Resolution {
+    Buyer,
+    Supplier,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub struct Milestone {
@@ -57,6 +65,8 @@ pub enum ShipmentStatus {
     Active,
     Completed,
     Cancelled,
+    /// Set by claim_deadline_refund when a per-milestone timestamp deadline is breached (#164).
+    Expired,
 }
 
 #[contracttype]
@@ -128,6 +138,15 @@ pub struct Shipment {
     /// Per-shipment proof review window override (None = use auto_confirm_ledgers or global default, Some(0) = opt-out).
     pub review_window_ledgers: Option<u32>,
 
+    // ── #165 Dispute auto-resolution timeout ──────────────────
+    /// Seconds after dispute opens before auto-resolution fires (0 = disabled).
+    pub dispute_timeout_seconds: u64,
+    /// Resolution applied when dispute_timeout_seconds elapses without arbiter action.
+    pub default_resolution: Resolution,
+
+    // ── #162 Sequential milestone tracking ────────────────────
+    /// Index of the most recently confirmed milestone; None if none confirmed yet.
+    pub last_confirmed_milestone_index: Option<u32>,
 }
 
 /// Cancellation policy stored separately (keeps Shipment within the contracttype field limit).
@@ -235,6 +254,21 @@ pub struct ShipmentOptions {
     /// Per-shipment proof review window override (None = use global default, Some(0) = disable auto-confirm for this shipment).
     pub review_window_ledgers: Option<u32>,
 
+    // ── #160 Configurable milestone splits ────────────────────
+    /// Per-milestone splits in basis points (sum must equal 10000, length must match milestones).
+    /// Empty Vec = use per-milestone payment_percent field instead.
+    pub milestone_splits: Vec<u32>,
+
+    // ── #164 Per-milestone timestamp deadlines ────────────────
+    /// Unix timestamp deadlines per milestone (0 = no deadline for that milestone).
+    /// Empty Vec = no timestamp deadlines. Non-empty length must match milestones.
+    pub deadlines: Vec<u64>,
+
+    // ── #165 Dispute auto-resolution timeout ──────────────────
+    /// Seconds after dispute opens before anyone can call resolve_dispute_timeout (0 = disabled).
+    pub dispute_timeout_seconds: u64,
+    /// Resolution applied by resolve_dispute_timeout when timeout elapses.
+    pub default_resolution: Resolution,
 }
 
 /// All parameters needed to create a single shipment in a batch call.
@@ -471,8 +505,17 @@ pub enum DataKey {
     /// Effective deadline ledger per milestone (0 = unset).
     MilestoneDeadline(String, u32),
 
+    // ── #160 Configurable milestone splits ─────────────────────
+    /// Per-milestone basis-point splits for a shipment: Vec<u32> summing to 10000.
+    MilestoneSplits(String),
 
+    // ── #164 Per-milestone timestamp deadlines ──────────────────
+    /// Per-milestone Unix timestamp deadlines for a shipment: Vec<u64>.
+    MilestoneTimestampDeadlines(String),
 
+    // ── #165 Dispute auto-resolution timeout ────────────────────
+    /// Unix timestamp at which a dispute was opened: (shipment_id, milestone_index) -> u64.
+    DisputeOpenedAt(String, u32),
 }
 
 // ============================================================
@@ -515,6 +558,14 @@ pub enum ChainSettleError {
     RebalanceNotAllowed = 31,
     InvalidContestedPercent = 32,
     NoArbitersAvailable = 33,
+    /// milestone_splits length or sum is invalid (#160).
+    InvalidSplitConfiguration = 34,
+    /// claim_deadline_refund called before deadline elapsed (#164).
+    DeadlineNotReached = 35,
+    /// resolve_dispute_timeout called before timeout elapsed (#165).
+    DisputeTimeoutNotReached = 36,
+    /// submit_proof called out of order in Sequential mode (#162).
+    MilestoneOutOfOrder = 37,
 }
 
 // ============================================================
@@ -1463,6 +1514,10 @@ impl ChainSettleContract {
         let buyer_cancel_fee_bps = options.buyer_cancel_fee_bps;
         let early_bonus_pool = options.early_bonus_pool;
         let review_window_ledgers = options.review_window_ledgers;
+        let milestone_splits = options.milestone_splits.clone();
+        let deadlines = options.deadlines.clone();
+        let dispute_timeout_seconds = options.dispute_timeout_seconds;
+        let default_resolution = options.default_resolution.clone();
 
         if buyer_cancel_fee_bps > 1000 {
             panic!("buyer_cancel_fee_bps cannot exceed 1000 (10%)");
@@ -1553,16 +1608,36 @@ impl ChainSettleContract {
         }
 
         let min_pct = ctx.min_pct;
-        let mut total_percent: u32 = 0;
-        for i in 0..milestones.len() {
-            let percent = milestones.get(i).unwrap().payment_percent;
-            if percent < min_pct {
-                panic!("InvalidPercentages");
+
+        // #160: Validate milestone_splits when provided; otherwise fall back to payment_percent.
+        if milestone_splits.len() > 0 {
+            if milestone_splits.len() != milestones.len() {
+                panic!("InvalidSplitConfiguration");
             }
-            total_percent += percent;
+            let mut total_bps: u32 = 0;
+            for i in 0..milestone_splits.len() {
+                total_bps += milestone_splits.get(i).unwrap();
+            }
+            if total_bps != 10_000 {
+                panic!("InvalidSplitConfiguration");
+            }
+        } else {
+            let mut total_percent: u32 = 0;
+            for i in 0..milestones.len() {
+                let percent = milestones.get(i).unwrap().payment_percent;
+                if percent < min_pct {
+                    panic!("InvalidPercentages");
+                }
+                total_percent += percent;
+            }
+            if total_percent != 100 {
+                panic!("milestone percentages must sum to 100");
+            }
         }
-        if total_percent != 100 {
-            panic!("milestone percentages must sum to 100");
+
+        // #164: Validate deadlines length when provided.
+        if deadlines.len() > 0 && deadlines.len() != milestones.len() {
+            panic!("deadline count must match milestone count");
         }
 
         if env
@@ -1647,6 +1722,9 @@ impl ChainSettleContract {
             early_bonus_pool,
             early_bonus_remaining: early_bonus_pool,
             review_window_ledgers,
+            dispute_timeout_seconds,
+            default_resolution: default_resolution.clone(),
+            last_confirmed_milestone_index: None,
         };
 
         Self::append_audit_entry(
@@ -1679,6 +1757,30 @@ impl ChainSettleContract {
             100_000,
             6_300_000,
         );
+
+        // #160: Store basis-point splits when provided.
+        if milestone_splits.len() > 0 {
+            env.storage()
+                .persistent()
+                .set(&DataKey::MilestoneSplits(shipment_id.clone()), &milestone_splits);
+            env.storage().persistent().extend_ttl(
+                &DataKey::MilestoneSplits(shipment_id.clone()),
+                100_000,
+                6_300_000,
+            );
+        }
+
+        // #164: Store per-milestone Unix timestamp deadlines when provided.
+        if deadlines.len() > 0 {
+            env.storage()
+                .persistent()
+                .set(&DataKey::MilestoneTimestampDeadlines(shipment_id.clone()), &deadlines);
+            env.storage().persistent().extend_ttl(
+                &DataKey::MilestoneTimestampDeadlines(shipment_id.clone()),
+                100_000,
+                6_300_000,
+            );
+        }
 
         // #113: Resolve and lock the buyer's effective fee tier at creation.
         {
@@ -2144,12 +2246,12 @@ impl ChainSettleContract {
             }
         }
 
-        // Sequential mode: previous milestone must be complete.
+        // #162: Sequential mode — milestone N requires milestone N-1 to be Confirmed or Resolved.
         if shipment.milestone_mode == MilestoneMode::Sequential && milestone_index > 0 {
             let prev = shipment.milestones.get(milestone_index - 1).unwrap();
             if prev.status != MilestoneStatus::Confirmed && prev.status != MilestoneStatus::Resolved
             {
-                panic!("previous milestone not yet complete");
+                panic!("MilestoneOutOfOrder");
             }
         }
 
@@ -2232,7 +2334,7 @@ impl ChainSettleContract {
             }
         }
 
-        let gross_payment = (shipment.total_amount * milestone.payment_percent as i128) / 100;
+        let gross_payment = Self::milestone_gross_payment(&env, &shipment, milestone_index);
         let mut payment = gross_payment;
 
         // Deduct any approved advance for this milestone.
@@ -2311,6 +2413,8 @@ impl ChainSettleContract {
             milestone.status = MilestoneStatus::Confirmed;
             shipment.milestones.set(milestone_index, milestone);
             shipment.released_amount += payment;
+            // #162: Track last confirmed milestone for sequential enforcement queries.
+            shipment.last_confirmed_milestone_index = Some(milestone_index);
 
             // #113: Accumulate lifetime volume for the primary buyer.
             {
@@ -2524,7 +2628,7 @@ impl ChainSettleContract {
             panic!("holdback period not yet expired");
         }
 
-        let payment = (shipment.total_amount * milestone.payment_percent as i128) / 100;
+        let payment = Self::milestone_gross_payment(&env, &shipment, milestone_index);
 
         // Deduct any approved advance for this milestone.
         let advance_deducted =
@@ -2540,6 +2644,8 @@ impl ChainSettleContract {
         milestone.release_after_ledger = 0;
         shipment.milestones.set(milestone_index, milestone);
         shipment.released_amount += payment;
+        // #162: Track last confirmed milestone.
+        shipment.last_confirmed_milestone_index = Some(milestone_index);
 
         let mut actual_transfer = net_payment - advance_deducted;
         let token_client = token::Client::new(&env, &shipment.token);
@@ -2700,8 +2806,10 @@ impl ChainSettleContract {
             let mut milestone = shipment.milestones.get(idx).unwrap();
             milestone.status = MilestoneStatus::Confirmed;
             shipment.milestones.set(idx, milestone.clone());
+            // #162: Track last confirmed milestone.
+            shipment.last_confirmed_milestone_index = Some(idx);
 
-            let payment = (shipment.total_amount * milestone.payment_percent as i128) / 100;
+            let payment = Self::milestone_gross_payment(&env, &shipment, idx);
 
             // Deduct any approved advance for this milestone.
             let advance_deducted =
@@ -2911,6 +3019,10 @@ impl ChainSettleContract {
         milestone.release_after_ledger = 0;
         milestone.status = MilestoneStatus::Disputed;
         milestone.dispute_opened_ledger = Some(env.ledger().sequence());
+        // #165: Store Unix timestamp so resolve_dispute_timeout can check elapsed seconds.
+        let dispute_opened_at_key = DataKey::DisputeOpenedAt(shipment_id.clone(), milestone_index);
+        env.storage().persistent().set(&dispute_opened_at_key, &env.ledger().timestamp());
+        env.storage().persistent().extend_ttl(&dispute_opened_at_key, 100_000, 6_300_000);
         shipment.milestones.set(milestone_index, milestone);
 
         env.storage()
@@ -3039,8 +3151,7 @@ impl ChainSettleContract {
         }
 
         // Compute and immediately release the uncontested portion to the supplier.
-        let full_milestone_payment =
-            (shipment.total_amount * milestone.payment_percent as i128) / 100;
+        let full_milestone_payment = Self::milestone_gross_payment(&env, &shipment, milestone_index);
         let uncontested_payment =
             (full_milestone_payment * (100 - contested_percent) as i128) / 100;
 
@@ -3097,6 +3208,10 @@ impl ChainSettleContract {
         milestone.release_after_ledger = 0;
         milestone.status = MilestoneStatus::Disputed;
         milestone.dispute_opened_ledger = Some(env.ledger().sequence());
+        // #165: Store Unix timestamp so resolve_dispute_timeout can check elapsed seconds.
+        let dispute_opened_at_key = DataKey::DisputeOpenedAt(shipment_id.clone(), milestone_index);
+        env.storage().persistent().set(&dispute_opened_at_key, &env.ledger().timestamp());
+        env.storage().persistent().extend_ttl(&dispute_opened_at_key, 100_000, 6_300_000);
         shipment.milestones.set(milestone_index, milestone);
 
         env.storage()
@@ -3187,7 +3302,7 @@ impl ChainSettleContract {
         // Use pre-fetched partial contested percent from context.
         let is_partial = ctx.partial_contested_percent.is_some();
 
-        let full_payment = (shipment.total_amount * milestone.payment_percent as i128) / 100;
+        let full_payment = Self::milestone_gross_payment(&env, &shipment, milestone_index);
 
         // The "payment" in scope is the portion subject to this resolution:
         //   - full dispute  → 100% of milestone value
@@ -3958,7 +4073,7 @@ impl ChainSettleContract {
             panic!("proof_submitted_ledger not set");
         }
 
-        let gross_payment = (shipment.total_amount * milestone.payment_percent as i128) / 100;
+        let gross_payment = Self::milestone_gross_payment(&env, &shipment, milestone_index);
         let mut payment = gross_payment;
 
         // Deduct any approved advance for this milestone.
@@ -3996,6 +4111,7 @@ impl ChainSettleContract {
         let milestone_deadline = milestone.deadline_ledger;
         milestone.status = MilestoneStatus::Confirmed;
         milestone.proof_submitted_ledger = None;
+        shipment.last_confirmed_milestone_index = Some(milestone_index);
         shipment.milestones.set(milestone_index, milestone);
         shipment.released_amount += payment;
 
@@ -4254,6 +4370,285 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
+    // RESOLVE DISPUTE TIMEOUT (#165)
+    // ----------------------------------------------------------
+
+    /// Anyone may call this after dispute_timeout_seconds have elapsed without arbiter action.
+    /// Applies the shipment's default_resolution: pays the supplier or refunds the buyer.
+    /// Arbiter resolution before the timeout window always takes priority.
+    pub fn resolve_dispute_timeout(env: Env, shipment_id: String, milestone_index: u32) {
+        Self::assert_not_paused(&env);
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+
+        if milestone_index as usize >= shipment.milestones.len() as usize {
+            panic!("invalid milestone index");
+        }
+
+        let mut milestone = shipment.milestones.get(milestone_index).unwrap();
+        if milestone.status != MilestoneStatus::Disputed {
+            panic!("milestone is not in disputed status");
+        }
+
+        if shipment.dispute_timeout_seconds == 0 {
+            panic!("dispute timeout not configured for this shipment");
+        }
+
+        let opened_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeOpenedAt(shipment_id.clone(), milestone_index))
+            .unwrap_or_else(|| panic!("dispute opened timestamp not recorded"));
+
+        let current_timestamp = env.ledger().timestamp();
+        if current_timestamp < opened_at + shipment.dispute_timeout_seconds {
+            panic!("DisputeTimeoutNotReached");
+        }
+
+        // Determine payment scope: partial dispute holds only the contested portion.
+        let partial_cp: Option<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeContestedPercent(shipment_id.clone(), milestone_index));
+        let full_payment = Self::milestone_gross_payment(&env, &shipment, milestone_index);
+        let payment = if let Some(cp) = partial_cp {
+            (full_payment * cp as i128) / 100
+        } else {
+            full_payment
+        };
+
+        let token_client = token::Client::new(&env, &shipment.token);
+        let is_supplier = shipment.default_resolution == Resolution::Supplier;
+
+        if is_supplier {
+            let mut fee_amount: i128 = 0;
+            let net_payment = Self::deduct_fee_for_shipment(
+                &env,
+                payment,
+                &shipment.token,
+                &shipment_id,
+                &mut fee_amount,
+            );
+            Self::check_circuit_breaker(&env, payment);
+            if net_payment > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &shipment.supplier,
+                    &net_payment,
+                );
+            }
+            shipment.released_amount += payment;
+        } else {
+            // Resolution::Buyer — refund contested portion to buyer.
+            let primary_buyer = shipment.buyers.get(0).unwrap();
+            if payment > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &primary_buyer,
+                    &payment,
+                );
+            }
+        }
+
+        // Update escrowed value.
+        let current_escrowed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalEscrowed(shipment.token.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::TotalEscrowed(shipment.token.clone()),
+            &(current_escrowed - payment).max(0),
+        );
+
+        // Clean up partial-dispute and opened-at records.
+        if partial_cp.is_some() {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::DisputeContestedPercent(shipment_id.clone(), milestone_index));
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::DisputeOpenedAt(shipment_id.clone(), milestone_index));
+
+        milestone.status = MilestoneStatus::Resolved;
+        shipment.milestones.set(milestone_index, milestone);
+        shipment.open_dispute_count = shipment.open_dispute_count.saturating_sub(1);
+        shipment.last_dispute_resolved_ledger = Some(env.ledger().sequence());
+
+        // Remove from active disputes list.
+        let disputes: Vec<DisputeEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveDisputes)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_disputes: Vec<DisputeEntry> = Vec::new(&env);
+        for i in 0..disputes.len() {
+            let d = disputes.get(i).unwrap();
+            if !(d.shipment_id == shipment_id && d.milestone_index == milestone_index) {
+                new_disputes.push_back(d);
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveDisputes, &new_disputes);
+
+        if Self::all_milestones_done(&shipment) {
+            shipment.status = ShipmentStatus::Completed;
+            let mut stats: ContractStats = env
+                .storage()
+                .instance()
+                .get(&DataKey::ContractStats)
+                .unwrap_or(ContractStats {
+                    total_shipments: 0,
+                    total_volume: 0,
+                    total_disputes: 0,
+                    completed_shipments: 0,
+                });
+            stats.completed_shipments += 1;
+            env.storage()
+                .instance()
+                .set(&DataKey::ContractStats, &stats);
+            Self::increment_reputation_internal(&env, &shipment.supplier, 1, 0, 0);
+            Self::move_shipment_status_index(
+                &env,
+                ShipmentStatus::Active,
+                ShipmentStatus::Completed,
+                &shipment_id,
+            );
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        let resolution_sym = if is_supplier {
+            Symbol::new(&env, "supplier")
+        } else {
+            Symbol::new(&env, "buyer")
+        };
+        env.events().publish(
+            (Symbol::new(&env, "dispute_auto_resolved"), shipment_id.clone()),
+            (milestone_index, resolution_sym),
+        );
+    }
+
+    // ----------------------------------------------------------
+    // CLAIM DEADLINE REFUND (#164)
+    // ----------------------------------------------------------
+
+    /// Buyer triggers a full escrow refund when a per-milestone Unix timestamp deadline
+    /// has elapsed without the milestone being confirmed.
+    /// Marks the shipment Expired and returns all remaining escrowed funds to the buyer.
+    pub fn claim_deadline_refund(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        milestone_index: u32,
+    ) {
+        Self::assert_not_paused(&env);
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::require_buyer_auth(&shipment, &buyer);
+
+        if milestone_index as usize >= shipment.milestones.len() as usize {
+            panic!("invalid milestone index");
+        }
+
+        // Load the per-milestone timestamp deadlines stored at creation.
+        let deadlines: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MilestoneTimestampDeadlines(shipment_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if (milestone_index as usize) >= deadlines.len() as usize {
+            panic!("no timestamp deadline set for this milestone");
+        }
+        let deadline = deadlines.get(milestone_index).unwrap();
+        if deadline == 0 {
+            panic!("no timestamp deadline set for this milestone");
+        }
+
+        let current_timestamp = env.ledger().timestamp();
+        if current_timestamp <= deadline {
+            panic!("DeadlineNotReached");
+        }
+
+        // Milestone must still be unconfirmed for the refund to apply.
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        if milestone.status == MilestoneStatus::Confirmed
+            || milestone.status == MilestoneStatus::Resolved
+        {
+            panic!("milestone already confirmed or resolved");
+        }
+
+        // Release all remaining escrowed funds back to the primary buyer.
+        let refund_amount = shipment.total_amount
+            - shipment.released_amount
+            - shipment.total_advanced_amount;
+
+        let primary_buyer = shipment.buyers.get(0).unwrap();
+        let token_client = token::Client::new(&env, &shipment.token);
+
+        if refund_amount > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &primary_buyer,
+                &refund_amount,
+            );
+        }
+
+        // Return any locked supplier collateral to the buyer (supplier failed to deliver).
+        let collateral: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SupplierCollateral(shipment_id.clone()))
+            .unwrap_or(0);
+        if collateral > 0 {
+            token_client.transfer(&env.current_contract_address(), &primary_buyer, &collateral);
+        }
+
+        // Update total escrowed tracking.
+        let current_escrowed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalEscrowed(shipment.token.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::TotalEscrowed(shipment.token.clone()),
+            &(current_escrowed - refund_amount).max(0),
+        );
+
+        // Transition shipment to Expired.
+        Self::move_shipment_status_index(
+            &env,
+            ShipmentStatus::Active,
+            ShipmentStatus::Expired,
+            &shipment_id,
+        );
+        shipment.status = ShipmentStatus::Expired;
+        Self::increment_reputation_internal(&env, &shipment.supplier, 0, 0, 1);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        env.events().publish(
+            (Symbol::new(&env, "milestone_expired"), shipment_id.clone()),
+            (milestone_index, refund_amount, primary_buyer),
+        );
+    }
+
+    // ----------------------------------------------------------
     // ADMIN: AUTO-CONFIRM THRESHOLD (#96)
     // ----------------------------------------------------------
 
@@ -4455,6 +4850,24 @@ impl ChainSettleContract {
     // ----------------------------------------------------------
     // INTERNAL HELPERS
     // ----------------------------------------------------------
+
+    /// #160: Returns gross payment for a milestone using stored basis-point splits when available,
+    /// otherwise falls back to the milestone's payment_percent field.
+    fn milestone_gross_payment(env: &Env, shipment: &Shipment, milestone_index: u32) -> i128 {
+        let splits_key = DataKey::MilestoneSplits(shipment.id.clone());
+        if let Some(splits) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<u32>>(&splits_key)
+        {
+            if (milestone_index as usize) < splits.len() as usize {
+                let bps = splits.get(milestone_index).unwrap();
+                return (shipment.total_amount * bps as i128) / 10_000;
+            }
+        }
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        (shipment.total_amount * milestone.payment_percent as i128) / 100
+    }
 
     /// Returns the effective auto-confirm window for a shipment.
     /// Priority: per-shipment review_window_ledgers > auto_confirm_ledgers > global AutoConfirmThreshold.
