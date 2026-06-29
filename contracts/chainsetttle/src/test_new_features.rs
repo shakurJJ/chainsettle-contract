@@ -67,6 +67,8 @@ fn test_fee_tier_upgrade_after_volume_accumulation() {
                 release_after_ledger: 0,
                 proof_submitted_ledger: None,
                 dispute_opened_ledger: None,
+                deadline_ledger: 0,
+                penalty_bps_per_ledger: 0,
             }
         ],
         &default_options(&t.env),
@@ -193,6 +195,8 @@ fn single_milestone(env: &Env, name: &str) -> soroban_sdk::Vec<Milestone> {
             release_after_ledger: 0,
             proof_submitted_ledger: None,
             dispute_opened_ledger: None,
+            deadline_ledger: 0,
+            penalty_bps_per_ledger: 0,
         }
     ]
 }
