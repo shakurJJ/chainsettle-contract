@@ -387,6 +387,7 @@ pub struct DisputeBondDecayConfig {
 
 /// All parameters needed to create a single shipment in a batch call.
 /// Mirrors the individual `create_shipment` parameters without the `Env`.
+/// Mirrors the individual `create_shipment` parameters without the `Env`.
 #[contracttype]
 #[derive(Clone)]
 pub struct BatchShipmentParams {
@@ -562,6 +563,7 @@ pub struct DisputeVote {
     pub approve: bool,
 }
 
+/// Feature C – A single payee entry: address + basis-point share (shares must sum to 100).
 /// Feature C – A single payee entry: address + basis-point share (shares must sum to 100).
 #[contracttype]
 #[derive(Clone)]
@@ -1073,6 +1075,7 @@ pub enum SupplierTier {
 }
 
 /// Admin-configured thresholds and collateral multipliers per tier.
+/// Admin-configured thresholds and collateral multipliers per tier.
 /// A supplier reaches Gold before Silver is checked (Gold takes priority).
 /// Multipliers are basis points of the base (Bronze) collateral requirement
 /// (10 000 = no discount; lower = cheaper collateral for that tier).
@@ -1307,6 +1310,7 @@ impl ChainSettleContract {
         proposal_id
     }
 
+    /// Approve a pending upgrade proposal. Executes the upgrade once `threshold`
     /// Approve a pending upgrade proposal. Executes the upgrade once `threshold`
     /// distinct admin keys have approved. Rejects a second approval from the same key.
     pub fn approve_upgrade(env: Env, admin: Address, proposal_id: u64) {
