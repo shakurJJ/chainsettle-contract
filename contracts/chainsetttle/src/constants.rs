@@ -39,3 +39,12 @@ pub const DEFAULT_EMERGENCY_FREEZE_SUPERMAJORITY_BPS: u32 = 8_000;
 /// dispute bond (#391) when the admin has not set a stricter cap via
 /// `set_max_dispute_bond_bps`. 2000 = 20% of shipment value.
 pub const DEFAULT_MAX_DISPUTE_BOND_BPS: u32 = 2_000;
+
+/// Default supplier onboarding stake amount (can be configured by admin).
+pub const DEFAULT_SUPPLIER_STAKE: i128 = 1_000_000;
+
+/// Number of dispute losses before supplier stake is slashed (default 3).
+pub const DEFAULT_DISPUTE_LOSS_THRESHOLD: u32 = 3;
+
+/// Percentage of stake slashed per dispute loss (default 33.33% = 3333 bps).
+pub const DEFAULT_SLASH_PERCENTAGE_BPS: u32 = 3_333;
