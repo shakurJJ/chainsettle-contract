@@ -13179,3 +13179,4 @@ mod test_jurisdiction_tag;
 mod test_max_allowed_tokens;
 mod test_fee_waiver;
 mod test_payout_preview;
+mod test_milestone_insurance_and_oracle;
