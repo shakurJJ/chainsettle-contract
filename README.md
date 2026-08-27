@@ -1124,6 +1124,65 @@ Auto-blacklisting operates in addition to the manual blacklist. If a supplier tr
 
 This supplier whitelist is separate from the approved-token whitelist and the
 per-milestone proof content-type whitelist.
+
+### Supplier Exposure Cap
+
+The supplier exposure cap limits how much total USDC a single supplier can have locked across all of their active shipments at any one time. It protects against over-concentration of escrow risk on a single counterparty and gives the admin a simple way to enforce per-supplier credit limits.
+
+The cap is disabled by default (`0`). Once set to a non-zero value, `create_shipment` checks the supplier's current exposure before accepting the new shipment.
+
+Function | Who | Behaviour
+--- | --- | ---
+`set_supplier_exposure_cap(admin, cap: i128)` | Admin only | Sets the global supplier exposure cap. `cap = 0` disables the check (default). `cap` must be non-negative. Emits `supplier_exposure_cap_set`.
+`get_supplier_exposure_cap() → i128` | Anyone (read-only) | Returns the configured cap, or `0` if none has been set.
+`get_supplier_exposure(supplier) → i128` | Anyone (read-only) | Returns the supplier's current aggregate locked escrow across all `Active` shipments.
+
+**How exposure is calculated**
+
+`get_supplier_exposure` walks every shipment associated with the supplier address and sums the unreleased escrow balance for each `Active` shipment:
+
+```
+exposure = Σ (total_amount − released_amount)  for each Active shipment where supplier matches
+```
+
+Shipments in `Completed` or `Cancelled` status are excluded — only live, in-flight shipments contribute to the exposure figure.
+
+**Enforcement at shipment creation**
+
+When `create_shipment` is called and the global cap is non-zero, the contract:
+
+1. Reads the current cap via `DataKeyExt::SupplierExposureCap`.
+2. Calls `compute_supplier_exposure` to get the supplier's live exposure.
+3. If `current_exposure + total_amount > cap`, the call panics with `"SupplierExposureCapExceeded"` and no shipment is created.
+
+If the cap is `0` (default), the check is skipped entirely — there is no limit on exposure for any supplier.
+
+Example — set a 500,000 USDC exposure cap and inspect a supplier's current exposure:
+
+```bash
+# Set the cap to 500,000 USDC (in stroops: 500_000 × 10^7)
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source admin-account \
+  --network testnet \
+  -- set_supplier_exposure_cap \
+  --admin <ADMIN_ADDRESS> \
+  --cap 5000000000000
+
+# Query the configured cap
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_supplier_exposure_cap
+
+# Query a specific supplier's current exposure
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_supplier_exposure \
+  --supplier <SUPPLIER_ADDRESS>
+```
+
 Arbiter Pool & Assignment
 ChainSettle supports an active pool of trusted arbiters, allowing for automatic assignment to distribute the dispute resolution workload.
 `add_arbiter_to_pool(admin, arbiter: Address)`: Admin-only. Adds an arbiter address to the active pool.
