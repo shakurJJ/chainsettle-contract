@@ -228,6 +228,11 @@ pub struct Shipment {
     /// Empty = not set (`None`). One entry = the reason.
     /// (`Option<CancellationReason>` is not supported by Soroban `#[contracttype]`.)
     pub cancellation_reason: Vec<CancellationReason>,
+
+    // ── New features ───────────────────────────────────────────
+    /// Configurable grace period (in ledgers) before late-delivery penalty accrual starts.
+    /// When set > 0, penalties only start counting from (deadline + grace_period_ledgers).
+    pub grace_period_ledgers: u32,
 }
 
 /// Cancellation policy stored separately (keeps Shipment within the contracttype field limit).
@@ -401,6 +406,10 @@ pub struct ShipmentOptions {
     /// Optional jurisdiction/regulatory category (e.g. "US", "EU_MIFID") for
     /// off-chain compliance filtering. Immutable after creation. None = untagged.
     pub jurisdiction: Option<Symbol>,
+
+    // ── New features ───────────────────────────────────────────
+    /// Configurable grace period (in ledgers) before late-delivery penalty accrual starts.
+    pub grace_period_ledgers: u32,
 }
 
 /// Configuration for time-decayed dispute bonds.
@@ -1165,6 +1174,16 @@ pub enum DataKeyExt2 {
     /// Active fee waiver granted to a partner address: (waiver_bps, expires_at
     /// unix timestamp; 0 = no expiry).
     FeeWaiver(Address),
+
+    // ── New Features ──────────────────────────────────────────────────────
+    /// KYC attestation hash for buyer addresses (32-byte hash).
+    BuyerKycHash(Address),
+    /// KYC attestation hash for supplier addresses (32-byte hash).
+    SupplierKycHash(Address),
+    /// Supplier onboarding stake amount locked (slashed on repeated disputes).
+    SupplierStake(Address),
+    /// Dispute loss count for slashing calculation (reset on successful periods).
+    SupplierDisputeLossCount(Address),
 }
 
 /// Partial joint-confirmation progress for a high-value shipment's milestone (#367).
