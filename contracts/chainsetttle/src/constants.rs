@@ -34,3 +34,8 @@ pub const DEFAULT_MAX_MILESTONE_COUNT: u32 = 50;
 /// required to activate/lift an emergency global freeze (#402) when the
 /// admin has not configured an override. 8000 = 80%.
 pub const DEFAULT_EMERGENCY_FREEZE_SUPERMAJORITY_BPS: u32 = 8_000;
+
+/// Maximum basis points a shipment creator may configure for a value-scaled
+/// dispute bond (#391) when the admin has not set a stricter cap via
+/// `set_max_dispute_bond_bps`. 2000 = 20% of shipment value.
+pub const DEFAULT_MAX_DISPUTE_BOND_BPS: u32 = 2_000;

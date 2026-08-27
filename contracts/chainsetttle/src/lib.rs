@@ -190,6 +190,9 @@ pub struct Shipment {
     pub open_dispute_count: u32,
     /// Per-dispute bond amount locked by buyer at creation (0 = disabled, backward compatible).
     pub dispute_bond_amount: i128,
+    /// #391: Basis points of total_amount added to the per-dispute bond, scaling the
+    /// bond with shipment value (0 = disabled). Stacks with `dispute_bond_amount`.
+    pub dispute_bond_bps: u32,
     /// Basis points of disputed payment sent to arbiter on resolution (0 = no arbiter fee).
     pub arbiter_fee_bps: u32,
     /// Basis points deducted from each milestone payment for logistics provider (0 = no fee).
@@ -338,6 +341,10 @@ pub struct ShipmentOptions {
     pub auto_confirm_ledgers: u32,
     /// Bond amount locked per dispute; 0 = no bond required (default, backward compat).
     pub dispute_bond_amount: i128,
+    /// #391: Basis points of total_amount added to the per-dispute bond, scaling the
+    /// bond with shipment value (0 = disabled). Stacks with `dispute_bond_amount`.
+    /// Subject to the admin-configured `MaxDisputeBondBps` cap.
+    pub dispute_bond_bps: u32,
     /// Basis points of disputed payment sent to arbiter on resolution (0 = no arbiter fee).
     pub arbiter_fee_bps: u32,
     /// Basis points deducted from each milestone payment for logistics provider (0 = no fee).
@@ -2134,6 +2141,28 @@ impl ChainSettleContract {
             .unwrap_or(0)
     }
 
+    /// #391: Cap the basis points a shipment creator may configure for a
+    /// value-scaled dispute bond via `ShipmentOptions.dispute_bond_bps`.
+    pub fn set_max_dispute_bond_bps(env: Env, admin: Address, max_bps: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        if max_bps > 10_000 {
+            panic!("max_bps must not exceed 10000");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKeyExt2::MaxDisputeBondBps, &max_bps);
+        env.events()
+            .publish((Symbol::new(&env, "max_dispute_bond_bps_set"),), max_bps);
+    }
+
+    pub fn get_max_dispute_bond_bps(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt2::MaxDisputeBondBps)
+            .unwrap_or(constants::DEFAULT_MAX_DISPUTE_BOND_BPS)
+    }
+
     pub fn get_reputation(env: Env, supplier: Address) -> ReputationScore {
         env.storage()
             .persistent()
@@ -3507,7 +3536,21 @@ impl ChainSettleContract {
         let dispute_cooldown_ledgers = options.dispute_cooldown_ledgers;
         let late_penalty_bps_per_ledger = options.late_penalty_bps_per_ledger;
         let auto_confirm_ledgers = options.auto_confirm_ledgers;
-        let dispute_bond_amount = options.dispute_bond_amount;
+        let dispute_bond_bps = options.dispute_bond_bps;
+        // #391: Scale the per-dispute bond by shipment value (bps), on top of any flat
+        // `dispute_bond_amount`, capped by the admin-configured `MaxDisputeBondBps`.
+        if dispute_bond_bps > 0 {
+            let max_bps: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKeyExt2::MaxDisputeBondBps)
+                .unwrap_or(constants::DEFAULT_MAX_DISPUTE_BOND_BPS);
+            if dispute_bond_bps > max_bps {
+                panic!("dispute_bond_bps exceeds maximum allowed");
+            }
+        }
+        let scaled_bond = (total_amount * dispute_bond_bps as i128) / 10_000;
+        let dispute_bond_amount = options.dispute_bond_amount + scaled_bond;
         let logistics_fee_bps = options.logistics_fee_bps;
         let supplier_collateral = options.supplier_collateral;
         let expires_at_ledger = options.expires_at_ledger;
@@ -3802,6 +3845,7 @@ impl ChainSettleContract {
             auto_confirm_ledgers,
             open_dispute_count: 0,
             dispute_bond_amount,
+            dispute_bond_bps,
             arbiter_fee_bps: options.arbiter_fee_bps,
             logistics_fee_bps,
             expires_at_ledger,
@@ -4209,6 +4253,112 @@ impl ChainSettleContract {
         env.storage()
             .persistent()
             .set(&usage_key, &(effective_start, used));
+        env.storage().persistent().extend_ttl(
+            &usage_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
+    // ----------------------------------------------------------
+    // #392 — SUPPLIER CANCELLATION COOLDOWN
+    // ----------------------------------------------------------
+
+    /// Admin caps how many times `supplier` may call `supplier_cancel` within a
+    /// rolling window of `window_ledgers`; once the cap is hit, further
+    /// cancellations are blocked until `cooldown_ledgers` have elapsed.
+    /// `max_cancellations == 0` disables/clears the limit for this supplier.
+    pub fn set_supplier_cancel_cooldown(
+        env: Env,
+        admin: Address,
+        supplier: Address,
+        max_cancellations: u32,
+        window_ledgers: u32,
+        cooldown_ledgers: u32,
+    ) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        let key = DataKeyExt2::SupplierCancelCooldownConfig(supplier.clone());
+        env.storage().persistent().set(
+            &key,
+            &(max_cancellations, window_ledgers, cooldown_ledgers),
+        );
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "supplier_cancel_cooldown_set"), supplier),
+            (max_cancellations, window_ledgers, cooldown_ledgers),
+        );
+    }
+
+    /// Returns the supplier's configured (max_cancellations, window_ledgers,
+    /// cooldown_ledgers), if any.
+    pub fn get_supplier_cancel_cooldown(
+        env: Env,
+        supplier: Address,
+    ) -> Option<(u32, u32, u32)> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt2::SupplierCancelCooldownConfig(supplier))
+    }
+
+    /// Checks the configured rolling-window cancellation cap for `supplier` and,
+    /// if within bounds, records this cancellation against the window. Panics if
+    /// the supplier is currently cooling down or the cap would be exceeded.
+    /// No-op if the supplier has no configured limit (or it is set to 0).
+    fn check_and_record_supplier_cancellation(env: &Env, supplier: &Address) {
+        let cooldown_until: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt2::SupplierCancelCooldownUntil(supplier.clone()))
+            .unwrap_or(0);
+        let current_ledger = env.ledger().sequence();
+        if cooldown_until > current_ledger {
+            panic!("supplier cancellation cooldown active");
+        }
+
+        let cfg: Option<(u32, u32, u32)> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt2::SupplierCancelCooldownConfig(supplier.clone()));
+        let Some((max_cancellations, window, cooldown_ledgers)) = cfg else {
+            return;
+        };
+        if max_cancellations == 0 {
+            return;
+        }
+
+        let (window_start, mut count): (u32, u32) = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt2::SupplierCancelUsage(supplier.clone()))
+            .unwrap_or((0, 0));
+
+        let mut effective_start = window_start;
+        if window == 0 || current_ledger >= window_start + window {
+            count = 0;
+            effective_start = current_ledger;
+        }
+
+        count += 1;
+
+        if count > max_cancellations {
+            if cooldown_ledgers > 0 {
+                env.storage().persistent().set(
+                    &DataKeyExt2::SupplierCancelCooldownUntil(supplier.clone()),
+                    &(current_ledger + cooldown_ledgers),
+                );
+            }
+            panic!("supplier cancellation cooldown active");
+        }
+
+        let usage_key = DataKeyExt2::SupplierCancelUsage(supplier.clone());
+        env.storage()
+            .persistent()
+            .set(&usage_key, &(effective_start, count));
         env.storage().persistent().extend_ttl(
             &usage_key,
             constants::TTL_INITIAL_LEDGERS,
@@ -5237,6 +5387,10 @@ impl ChainSettleContract {
         if milestone.status != MilestoneStatus::ProofSubmitted {
             panic!("milestone proof not yet submitted");
         }
+
+        // #390: If an N-of-M oracle group is assigned to this shipment, require the
+        // configured attestation threshold before allowing confirmation.
+        Self::assert_oracle_attestation_met(&env, &shipment_id, milestone_index);
 
         Self::assert_shipment_not_paused(&env, &shipment_id);
 
@@ -7251,6 +7405,9 @@ impl ChainSettleContract {
             panic!("unauthorized");
         }
 
+        // #392: Enforce the supplier's rolling-window cancellation cooldown, if configured.
+        Self::check_and_record_supplier_cancellation(&env, &supplier);
+
         let policy: CancelPolicy = env
             .storage()
             .persistent()
@@ -8727,6 +8884,167 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
+    // #390 — N-OF-M ORACLE ATTESTATION REQUIREMENT
+    // ----------------------------------------------------------
+
+    /// Admin defines (or replaces) an N-of-M oracle set for a given verification
+    /// `purpose`. `threshold` must be > 0 and <= `oracles.len()`.
+    pub fn register_oracle_group(env: Env, admin: Address, purpose: Symbol, oracles: Vec<Address>, threshold: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        if oracles.is_empty() {
+            panic!("oracle group must have at least one member");
+        }
+        if threshold == 0 || threshold > oracles.len() {
+            panic!("threshold must be between 1 and oracles.len()");
+        }
+        let key = DataKeyExt2::OracleGroup(purpose.clone());
+        env.storage().persistent().set(&key, &(oracles.clone(), threshold));
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "oracle_group_registered"), purpose),
+            (oracles.len() as u32, threshold),
+        );
+    }
+
+    pub fn get_oracle_group(env: Env, purpose: Symbol) -> Option<(Vec<Address>, u32)> {
+        env.storage().persistent().get(&DataKeyExt2::OracleGroup(purpose))
+    }
+
+    /// Assigns a registered oracle group `purpose` to gate milestone confirmation for
+    /// `shipment_id`. Admin only. Passing an unregistered purpose is allowed (the gate
+    /// simply has no effect until the group is registered).
+    pub fn set_shipment_oracle_purpose(env: Env, admin: Address, shipment_id: String, purpose: Symbol) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        let key = DataKeyExt2::ShipmentOraclePurpose(shipment_id.clone());
+        env.storage().persistent().set(&key, &purpose);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "shipment_oracle_purpose_set"), shipment_id),
+            purpose,
+        );
+    }
+
+    /// A registered oracle attests to a milestone's off-chain verification purpose.
+    /// Each oracle may attest at most once per (shipment_id, milestone_index).
+    pub fn submit_oracle_attestation(
+        env: Env,
+        oracle: Address,
+        shipment_id: String,
+        milestone_index: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        oracle.require_auth();
+
+        let purpose: Symbol = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt2::ShipmentOraclePurpose(shipment_id.clone()))
+            .unwrap_or_else(|| panic!("no oracle group assigned to this shipment"));
+        let (oracles, _threshold): (Vec<Address>, u32) = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt2::OracleGroup(purpose.clone()))
+            .unwrap_or_else(|| panic!("oracle group not registered"));
+
+        let mut is_member = false;
+        for i in 0..oracles.len() {
+            if oracles.get(i).unwrap() == oracle {
+                is_member = true;
+                break;
+            }
+        }
+        if !is_member {
+            panic!("caller is not a member of the assigned oracle group");
+        }
+
+        let key = DataKeyExt2::OracleAttestations(shipment_id.clone(), milestone_index, purpose);
+        let mut attestations: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        for i in 0..attestations.len() {
+            if attestations.get(i).unwrap() == oracle {
+                panic!("oracle has already attested to this milestone");
+            }
+        }
+        attestations.push_back(oracle.clone());
+        env.storage().persistent().set(&key, &attestations);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle_attestation_submitted"), shipment_id),
+            (milestone_index, oracle),
+        );
+    }
+
+    pub fn get_oracle_attestation_count(
+        env: Env,
+        shipment_id: String,
+        milestone_index: u32,
+    ) -> u32 {
+        let Some(purpose) = env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt2, Symbol>(&DataKeyExt2::ShipmentOraclePurpose(shipment_id.clone()))
+        else {
+            return 0;
+        };
+        let attestations: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt2::OracleAttestations(shipment_id, milestone_index, purpose))
+            .unwrap_or_else(|| Vec::new(&env));
+        attestations.len()
+    }
+
+    /// Panics if `shipment_id` has an oracle group assigned but the milestone has not
+    /// yet received the required threshold of attestations. No-op if no oracle group
+    /// is assigned (backward compatible — existing shipments are unaffected).
+    fn assert_oracle_attestation_met(env: &Env, shipment_id: &String, milestone_index: u32) {
+        let Some(purpose) = env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt2, Symbol>(&DataKeyExt2::ShipmentOraclePurpose(shipment_id.clone()))
+        else {
+            return;
+        };
+        let Some((_oracles, threshold)) = env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt2, (Vec<Address>, u32)>(&DataKeyExt2::OracleGroup(purpose.clone()))
+        else {
+            return;
+        };
+        let attestations: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt2::OracleAttestations(
+                shipment_id.clone(),
+                milestone_index,
+                purpose,
+            ))
+            .unwrap_or_else(|| Vec::new(env));
+        if attestations.len() < threshold {
+            panic!("required oracle attestation threshold not yet met");
+        }
+    }
+
+    // ----------------------------------------------------------
     // CLAIM DEADLINE REFUND (#164)
     // ----------------------------------------------------------
 
@@ -8836,6 +9154,222 @@ impl ChainSettleContract {
         env.events().publish(
             (Symbol::new(&env, "milestone_expired"), shipment_id.clone()),
             (milestone_index, refund_amount, primary_buyer),
+        );
+        Self::emit_shipment_cancelled(
+            &env,
+            &shipment_id,
+            refund_amount,
+            CancellationReason::DeadlineRefund,
+        );
+    }
+
+    // ----------------------------------------------------------
+    // #389 — ESCROW SWEEP OF UNCLAIMED REFUNDS TO TREASURY
+    // ----------------------------------------------------------
+
+    /// Admin configures how many ledgers a buyer has to call `claim_deadline_refund`
+    /// after a milestone's timestamp deadline passes before the admin may sweep the
+    /// unclaimed refund to the configured treasury instead. `ledgers == 0` disables
+    /// sweeping (refunds remain claimable indefinitely — the original behaviour).
+    pub fn set_refund_sweep_window(env: Env, admin: Address, ledgers: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKeyExt2::UnclaimedRefundSweepWindow, &ledgers);
+        env.events().publish(
+            (Symbol::new(&env, "refund_sweep_window_set"),),
+            ledgers,
+        );
+    }
+
+    pub fn get_refund_sweep_window(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt2::UnclaimedRefundSweepWindow)
+            .unwrap_or(0)
+    }
+
+    /// Admin sweeps an unclaimed deadline refund to the configured treasury once the
+    /// buyer has failed to call `claim_deadline_refund` within the admin-configured
+    /// sweep window after the milestone's timestamp deadline elapsed. Requires
+    /// `FeeConfig.treasury` to be set (via `set_fee_config`) as the sweep destination.
+    /// Mirrors `claim_deadline_refund`'s eligibility checks and payout computation,
+    /// except funds go to the treasury instead of the buyer.
+    /// Anyone may call this once a milestone's timestamp deadline has passed, to record
+    /// the ledger at which its refund became claimable. Idempotent — a second call is a
+    /// harmless no-op. This checkpoint anchors the `sweep_unclaimed_refund` window so it
+    /// measures from first-eligibility rather than from whenever the admin happens to
+    /// call the sweep. Does not move funds.
+    pub fn mark_refund_claimable(env: Env, shipment_id: String, milestone_index: u32) {
+        Self::assert_not_paused(&env);
+
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if milestone_index as usize >= shipment.milestones.len() as usize {
+            panic!("invalid milestone index");
+        }
+
+        let deadlines: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt::MilestoneTimestampDeadlines(
+                shipment_id.clone(),
+            ))
+            .unwrap_or_else(|| Vec::new(&env));
+        if (milestone_index as usize) >= deadlines.len() as usize {
+            panic!("no timestamp deadline set for this milestone");
+        }
+        let deadline = deadlines.get(milestone_index).unwrap();
+        if deadline == 0 {
+            panic!("no timestamp deadline set for this milestone");
+        }
+        if env.ledger().timestamp() <= deadline {
+            panic!("DeadlineNotReached");
+        }
+
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        if milestone.status == MilestoneStatus::Confirmed
+            || milestone.status == MilestoneStatus::Resolved
+        {
+            panic!("milestone already confirmed or resolved");
+        }
+
+        let claimable_key = DataKeyExt2::RefundClaimableAtLedger(shipment_id, milestone_index);
+        if env.storage().persistent().has(&claimable_key) {
+            return;
+        }
+        let now = env.ledger().sequence();
+        env.storage().persistent().set(&claimable_key, &now);
+        env.storage().persistent().extend_ttl(
+            &claimable_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
+    pub fn sweep_unclaimed_refund(env: Env, admin: Address, shipment_id: String, milestone_index: u32) {
+        Self::assert_not_paused(&env);
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+
+        let sweep_window: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt2::UnclaimedRefundSweepWindow)
+            .unwrap_or(0);
+        if sweep_window == 0 {
+            panic!("unclaimed refund sweeping is not enabled");
+        }
+
+        let fee_config: FeeConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeConfig)
+            .unwrap_or_else(|| panic!("no treasury configured (call set_fee_config first)"));
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if milestone_index as usize >= shipment.milestones.len() as usize {
+            panic!("invalid milestone index");
+        }
+
+        let deadlines: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt::MilestoneTimestampDeadlines(
+                shipment_id.clone(),
+            ))
+            .unwrap_or_else(|| Vec::new(&env));
+        if (milestone_index as usize) >= deadlines.len() as usize {
+            panic!("no timestamp deadline set for this milestone");
+        }
+        let deadline = deadlines.get(milestone_index).unwrap();
+        if deadline == 0 {
+            panic!("no timestamp deadline set for this milestone");
+        }
+        if env.ledger().timestamp() <= deadline {
+            panic!("DeadlineNotReached");
+        }
+
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        if milestone.status == MilestoneStatus::Confirmed
+            || milestone.status == MilestoneStatus::Resolved
+        {
+            panic!("milestone already confirmed or resolved");
+        }
+
+        // The sweep window is measured from `mark_refund_claimable`'s checkpoint, not from
+        // "now" — this call never creates that checkpoint itself, since doing so and then
+        // panicking on the same invocation would roll back the write along with the panic.
+        let claimable_key = DataKeyExt2::RefundClaimableAtLedger(shipment_id.clone(), milestone_index);
+        let claimable_at: u32 = env
+            .storage()
+            .persistent()
+            .get(&claimable_key)
+            .unwrap_or_else(|| panic!("call mark_refund_claimable first"));
+        if env.ledger().sequence() < claimable_at + sweep_window {
+            panic!("sweep window has not elapsed");
+        }
+
+        let refund_amount =
+            shipment.total_amount - shipment.released_amount - shipment.total_advanced_amount;
+
+        let token_client = token::Client::new(&env, &shipment.token);
+        if refund_amount > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &fee_config.treasury,
+                &refund_amount,
+            );
+        }
+
+        let collateral: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SupplierCollateral(shipment_id.clone()))
+            .unwrap_or(0);
+        if collateral > 0 {
+            token_client.transfer(&env.current_contract_address(), &fee_config.treasury, &collateral);
+        }
+
+        let current_escrowed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalEscrowed(shipment.token.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::TotalEscrowed(shipment.token.clone()),
+            &(current_escrowed - refund_amount).max(0),
+        );
+
+        Self::move_shipment_status_index(
+            &env,
+            ShipmentStatus::Active,
+            ShipmentStatus::Expired,
+            &shipment_id,
+        );
+        shipment.status = ShipmentStatus::Expired;
+        shipment.cancellation_reason = Vec::from_array(&env, [CancellationReason::DeadlineRefund]);
+        Self::increment_reputation_internal(&env, &shipment.supplier, 0, 0, 1);
+
+        env.storage().persistent().remove(&claimable_key);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        Self::append_admin_action(
+            &env,
+            Symbol::new(&env, "sweep_unclaimed_refund"),
+            Symbol::new(&env, "unclaimed_refund_swept"),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "unclaimed_refund_swept"), shipment_id.clone()),
+            (milestone_index, refund_amount, fee_config.treasury),
         );
         Self::emit_shipment_cancelled(
             &env,
@@ -12596,6 +13130,7 @@ mod test_common;
 mod test_correct_proof;
 mod test_feat_four;
 mod test_issues_366_369;
+mod test_issues_389_390_391_392;
 mod test_new_features;
 
 // Legacy test modules — some have pre-existing compilation issues.
