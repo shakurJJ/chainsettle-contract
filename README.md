@@ -684,6 +684,48 @@ stellar contract invoke \
   --address <ADDRESS>
 ```
 
+`get_contract_stats() → ContractStats` (read-only)
+
+Returns contract-level aggregate statistics. No authorization is required. All counters default to `0` if no shipments have been created yet.
+
+```rust
+pub struct ContractStats {
+    pub total_shipments: u64,       // total number of shipments ever created
+    pub total_volume: i128,         // cumulative USDC locked across all shipments (in stroops)
+    pub total_disputes: u64,        // total number of disputes ever raised
+    pub completed_shipments: u64,   // total number of shipments that reached Completed status
+}
+```
+
+Field descriptions:
+
+| Field | Type | Description |
+|---|---|---|
+| `total_shipments` | `u64` | Incremented once each time `create_shipment` succeeds. |
+| `total_volume` | `i128` | Sum of `total_amount` across all created shipments, in the token's smallest unit (stroops for USDC). |
+| `total_disputes` | `u64` | Incremented each time `raise_dispute` or `raise_partial_dispute` is called successfully. |
+| `completed_shipments` | `u64` | Incremented when all milestones in a shipment reach a settled state and the shipment transitions to `Completed`. |
+
+Example:
+
+```bash
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_contract_stats
+```
+
+Example response:
+
+```json
+{
+  "total_shipments": 42,
+  "total_volume": "420000000000000",
+  "total_disputes": 5,
+  "completed_shipments": 38
+}
+```
+
 ---
 
 Milestone Deadline Extensions
