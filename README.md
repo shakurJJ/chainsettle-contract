@@ -1283,6 +1283,69 @@ How it differs from `recuse_arbiter()`:
 
 Both functions require the shipment to be `Active` and are blocked by the emergency pause.
 
+Arbiter Recusal
+An arbiter may voluntarily step down from a shipment using `recuse_arbiter()`. This is distinct from rotation (which is party-initiated) — recusal is an arbiter-initiated action.
+
+When to use recusal:
+- The arbiter has a conflict of interest (e.g., personal relationship with a party)
+- The arbiter is unable to continue due to workload or availability constraints
+- The arbiter believes another arbiter would be better suited for the specific dispute
+
+`recuse_arbiter(arbiter, shipment_id)`
+
+Preconditions:
+- Only the current arbiter assigned to the shipment may call this function
+- The shipment must be in `Active` status (not Completed, Cancelled, or Disputed)
+- The contract must not be paused
+- The arbiter pool must contain at least one other arbiter
+
+Execution flow:
+1. The contract verifies the caller is the current arbiter for the shipment
+2. The contract loads the arbiter pool and retrieves the current pool index
+3. Starting from the current pool index, it iterates through the pool looking for the first arbiter who is not the recusing arbiter
+4. The replacement arbiter is selected (round-robin selection)
+5. The pool index is advanced to the next position for future assignments
+6. The shipment's `arbiter` field is updated to the new arbiter
+7. An `arbiter_recused` event is emitted with both the old and new arbiter addresses
+
+Replacement selection details:
+- The replacement is selected automatically using round-robin from the active pool
+- The recusing arbiter is always skipped during selection
+- The pool index is persisted for subsequent assignments across all shipments
+- If the pool contains multiple arbiters, the selection cycles through them evenly
+
+State changes:
+- `shipment.arbiter` is updated to the new arbiter address
+- `arb_pool_idx` is advanced (mod pool length) for round-robin tracking
+- An `arbiter_recused` event is published to the event stream
+
+Failure cases:
+- Panics with `"shipment is not active"` if the shipment is not in Active status
+- Panics with `"only the current arbiter can recuse"` if the caller is not the assigned arbiter
+- Panics with `"no available arbiter for reassignment"` if the pool is empty or contains only the recusing arbiter
+
+Important: The replacement happens atomically in the same transaction — there is no waiting period. If no replacement is available, the transaction fails and no state changes occur. The shipment remains with the original arbiter until a valid replacement can be found.
+
+Comparison with other arbiter changes:
+
+| Mechanism | Initiator | Replacement | When to use |
+|---|---|---|---|
+| `recuse_arbiter()` | Arbiter | Auto-assigned from pool | Arbiter voluntarily steps down |
+| `propose_arbiter_rotation()` | Buyer & supplier | Explicitly nominated | Parties lose confidence in arbiter |
+| `activate_backup_arbiter()` | Anyone (after threshold) | Pre-configured backup | Arbiter is inactive during dispute |
+| `slash_arbiter()` | Contract (automatic) | Removed from pool | Arbiter's decisions are overturned |
+
+```bash
+# Arbiter recuses themselves from a shipment
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source arbiter-account \
+  --network testnet \
+  -- recuse_arbiter \
+  --arbiter <ARBITER_ADDRESS> \
+  --shipment_id "SHIP-001"
+```
+
 Supplier Payout Batching
 By default, every milestone payment (confirmation, dispute resolution,
 advance approval) transfers tokens to the supplier immediately in the same
