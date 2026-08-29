@@ -409,6 +409,28 @@ Admin-only. Sets the dispute escalation threshold in ledgers (`0` = disabled). `
 `cancel_shipment(buyer, shipment_id)`
 Cancels the shipment if no milestones have been confirmed yet.
 Returns all locked funds to the buyer.
+`claim_deadline_refund(buyer, shipment_id, milestone_index)`
+Buyer invokes a deadline-based refund for a specific milestone when the
+milestone's stored Unix-timestamp deadline has already passed and the
+milestone has not been confirmed or resolved yet. This is a shipment-level
+`Active`-only escape hatch: the shipment must still be `Active`, the caller
+must be the registered buyer, the milestone must exist, and the relevant
+`MilestoneTimestampDeadlines` entry must be set and non-zero.
+The function panics unless all of the following are true:
+- `shipment.status == Active`
+- the caller is authorized as the buyer for the shipment
+- `milestone_index` is valid for the shipment
+- a timestamp deadline exists for that milestone and `current_timestamp > deadline`
+- the milestone is not already `Confirmed` or `Resolved`
+If all checks pass, the contract computes the remaining unclaimed value as:
+`refund_amount = total_amount - released_amount - total_advanced_amount`
+It transfers that amount to the primary buyer, returns any locked supplier
+collateral to the buyer, reduces the per-token aggregate escrow tracking,
+transitions the shipment to `Expired`, records the cancellation reason as
+`DeadlineRefund`, and increments the supplier's `cancelled` reputation count.
+This makes the buyer whole when a milestone deadline is missed without the
+supplier confirming the work, while also marking the shipment as expired and
+freezing the remaining escrow so it cannot continue settling under the old state.
 `top_up_escrow(buyer, shipment_id, additional_amount)`
 Buyer adds more funds to an already active shipment's escrow.
 Use this when the shipment scope or expected payout increases after
