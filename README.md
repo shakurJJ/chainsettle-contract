@@ -1030,6 +1030,78 @@ at the same time.
 
 ---
 
+Dispute Evidence Submission
+Once a milestone is `Disputed`, the parties involved can attach supporting
+evidence on-chain, and — for shipments created with an arbiter panel — panel
+members vote to resolve it.
+
+**Who can submit evidence**
+
+`submit_dispute_evidence(caller, shipment_id, milestone_index, evidence_hash, evidence_type)`
+
+- Callable by the shipment's supplier, its logistics address, or any of its
+  buyers while the milestone's status is `Disputed`; any other caller panics
+  with `"unauthorized"`.
+- `caller` must authorize the call (`caller.require_auth()`).
+- Panics with `"invalid milestone index"` if `milestone_index` is out of range,
+  and with `"evidence can only be submitted while milestone is Disputed"` if the
+  milestone isn't currently disputed.
+- Entries are appended, never overwritten — evidence submitted earlier in the
+  dispute (e.g. an initial claim, followed by a rebuttal) all remains visible.
+- Emits `dispute_evidence_submitted` with `(milestone_index, caller,
+  evidence_hash, evidence_type)`.
+
+**Evidence shape**
+
+Each call appends one `DisputeEvidence` entry:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `submitter` | `Address` | Who submitted this entry (supplier, logistics, or a buyer) |
+| `evidence_hash` | `String` | IPFS CID or other off-chain evidence pointer |
+| `evidence_type` | `Symbol` | Caller-supplied category tag, e.g. `"invoice"`, `"photo"`, `"affidavit"` |
+| `submitted_ledger` | `u32` | Ledger sequence at submission time |
+
+**Caps**
+
+Dispute evidence entries themselves are not capped — a party may submit as
+many as the dispute needs. (The separate per-milestone cap configured by
+`set_max_evidence_per_milestone`, default `5`, applies to initial `submit_proof`
+calls, not to dispute evidence entries.)
+
+`get_dispute_evidence(shipment_id, milestone_index) → Vec<DisputeEvidence>` (read-only)
+Returns every evidence entry submitted for that milestone's dispute, in
+submission order.
+
+**Arbiter panel voting**
+
+Shipments created with `ShipmentOptions::arbiter_panel` (at least 3 members)
+resolve disputes by panel vote instead of a single arbiter's call to
+`resolve_dispute`.
+
+`cast_dispute_vote(arbiter, shipment_id, milestone_index, approve: bool)`
+
+- Callable only by an address in the shipment's arbiter panel; panics with
+  `"NotPanelMember"` otherwise, and with `"shipment has no arbiter panel"` if
+  the shipment wasn't created with one.
+- `arbiter` must authorize the call. Each panel member may vote exactly once
+  per milestone dispute.
+- `approve = true` is a vote to resolve for the supplier; `approve = false` is
+  a vote to resolve for the buyer.
+- A vote panics with `"DisputeAlreadyResolved"` if the milestone is no longer
+  `Disputed` (e.g. a majority already resolved it).
+- Quorum is a simple majority — `panel.len() / 2 + 1` votes in the same
+  direction. Once quorum is reached, the dispute resolves automatically using
+  the same payout logic as `resolve_dispute`. Until then — including a tie or
+  an incomplete vote — the dispute stays open.
+
+`get_dispute_votes(shipment_id, milestone_index) → Vec<DisputeVote>` (read-only)
+Returns the votes cast so far: each entry is `{ arbiter, approve }`. The
+vector is empty before any votes are cast, and empty again once a majority has
+automatically resolved the dispute.
+
+---
+
 Advance Payment Lifecycle
 The advance payment flow lets a supplier request early access to a
 portion of a milestone's payment before submitting proof. This is useful

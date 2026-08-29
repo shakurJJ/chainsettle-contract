@@ -1197,6 +1197,13 @@ pub enum DataKeyExt2 {
     SupplierStake(Address),
     /// Dispute loss count for slashing calculation (reset on successful periods).
     SupplierDisputeLossCount(Address),
+
+    // ── #417 Mutual buyer+supplier pre-approval ────────────────────────────
+    /// Per-supplier allowlist of buyers the supplier has pre-approved.
+    ApprovedBuyers(Address),
+    /// Admin flag: when true, create_shipment requires every named buyer to
+    /// appear in the named supplier's approved-buyer list. Default: false.
+    RequireMutualPreapproval,
 }
 
 /// Partial joint-confirmation progress for a high-value shipment's milestone (#367).
@@ -3021,6 +3028,98 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
+    // MUTUAL BUYER+SUPPLIER PRE-APPROVAL (Issue #417)
+    // ----------------------------------------------------------
+
+    /// Supplier adds `buyer` to their own approved-buyer allowlist. Supplier-managed:
+    /// requires the supplier's own authorization, not admin's.
+    pub fn add_approved_buyer(env: Env, supplier: Address, buyer: Address) {
+        supplier.require_auth();
+        let key = DataKeyExt2::ApprovedBuyers(supplier.clone());
+        let mut list: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        for i in 0..list.len() {
+            if list.get(i).unwrap() == buyer {
+                return; // already present
+            }
+        }
+        list.push_back(buyer.clone());
+        env.storage().persistent().set(&key, &list);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "approved_buyer_added"), supplier),
+            buyer,
+        );
+    }
+
+    /// Supplier removes `buyer` from their approved-buyer allowlist.
+    pub fn remove_approved_buyer(env: Env, supplier: Address, buyer: Address) {
+        supplier.require_auth();
+        let key = DataKeyExt2::ApprovedBuyers(supplier.clone());
+        let list: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_list: Vec<Address> = Vec::new(&env);
+        for i in 0..list.len() {
+            let a = list.get(i).unwrap();
+            if a != buyer {
+                new_list.push_back(a);
+            }
+        }
+        env.storage().persistent().set(&key, &new_list);
+        env.events().publish(
+            (Symbol::new(&env, "approved_buyer_removed"), supplier),
+            buyer,
+        );
+    }
+
+    /// Returns the buyers `supplier` has pre-approved. Read-only.
+    pub fn get_approved_buyers(env: Env, supplier: Address) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt2::ApprovedBuyers(supplier))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Admin toggles the mutual pre-approval gate. When enabled, `create_shipment`
+    /// requires every named buyer to appear in the named supplier's approved-buyer
+    /// list (see `add_approved_buyer`). Disabled by default, matching prior behaviour
+    /// where only supplier whitelisting (buyer-side gate) applies.
+    pub fn set_require_mutual_preapproval(env: Env, admin: Address, enabled: bool) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKeyExt2::RequireMutualPreapproval, &enabled);
+        Self::append_admin_action(
+            &env,
+            Symbol::new(&env, "set_require_mutual_preapproval"),
+            Symbol::new(&env, "mutual_preapproval_config_updated"),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "mutual_preapproval_config_updated"),),
+            (admin, enabled, env.ledger().sequence()),
+        );
+    }
+
+    /// Returns true if the mutual buyer+supplier pre-approval gate is currently enabled.
+    pub fn get_require_mutual_preapproval(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt2::RequireMutualPreapproval)
+            .unwrap_or(false)
+    }
+
+    // ----------------------------------------------------------
     // ADMIN: REFERRAL FEE (Issue #105)
     // ----------------------------------------------------------
 
@@ -3049,6 +3148,48 @@ impl ChainSettleContract {
             .instance()
             .get(&DataKey::AdminActionLog)
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Filtered view over the admin audit trail (Issue #419). All parameters are
+    /// optional and independently combinable: `action` matches entries whose
+    /// `action` symbol equals the given value; `from_ledger`/`to_ledger` bound the
+    /// entry's `ledger` (inclusive) to that range. `get_admin_log()` remains
+    /// available unchanged for callers that want the full history.
+    pub fn get_admin_log_filtered(
+        env: Env,
+        action: Option<Symbol>,
+        from_ledger: Option<u32>,
+        to_ledger: Option<u32>,
+    ) -> Vec<AuditEntry> {
+        let log: Vec<AuditEntry> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminActionLog)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut filtered: Vec<AuditEntry> = Vec::new(&env);
+        for i in 0..log.len() {
+            let entry = log.get(i).unwrap();
+
+            if let Some(ref a) = action {
+                if entry.action != *a {
+                    continue;
+                }
+            }
+            if let Some(from) = from_ledger {
+                if entry.ledger < from {
+                    continue;
+                }
+            }
+            if let Some(to) = to_ledger {
+                if entry.ledger > to {
+                    continue;
+                }
+            }
+
+            filtered.push_back(entry);
+        }
+        filtered
     }
 
     // ----------------------------------------------------------
@@ -3754,6 +3895,35 @@ impl ChainSettleContract {
             }
             if !whitelisted {
                 panic!("unauthorized");
+            }
+        }
+
+        // #417: When enabled, require every named buyer to appear in the supplier's
+        // own approved-buyer allowlist (mutual pre-approval, symmetric to the
+        // supplier whitelist above). Disabled by default.
+        let require_mutual_preapproval: bool = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt2::RequireMutualPreapproval)
+            .unwrap_or(false);
+        if require_mutual_preapproval {
+            let approved_buyers: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKeyExt2::ApprovedBuyers(supplier.clone()))
+                .unwrap_or_else(|| Vec::new(&env));
+            for i in 0..buyers.len() {
+                let b = buyers.get(i).unwrap();
+                let mut approved = false;
+                for j in 0..approved_buyers.len() {
+                    if approved_buyers.get(j).unwrap() == b {
+                        approved = true;
+                        break;
+                    }
+                }
+                if !approved {
+                    panic!("BuyerNotPreapproved");
+                }
             }
         }
 
@@ -8405,6 +8575,48 @@ impl ChainSettleContract {
         let current_timestamp = env.ledger().timestamp();
         if current_timestamp < opened_at + shipment.dispute_timeout_seconds {
             panic!("DisputeTimeoutNotReached");
+        }
+
+        // #421: When a backup arbiter is configured and hasn't already taken over this
+        // shipment, hand off to it instead of applying the default outcome. The backup
+        // arbiter gets its own fresh timeout window (opened_at reset to now); if it also
+        // times out, this branch is skipped on the next call (shipment.arbiter == backup
+        // by then) and the default-outcome logic below finally applies.
+        let backup_arbiter: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt::BackupArbiter(shipment_id.clone()));
+        if let Some(backup) = backup_arbiter {
+            if shipment.arbiter != backup {
+                let old_arbiter = shipment.arbiter.clone();
+                shipment.arbiter = backup.clone();
+
+                env.storage().persistent().set(
+                    &DataKeyExt::DisputeOpenedAt(shipment_id.clone(), milestone_index),
+                    &current_timestamp,
+                );
+
+                Self::append_audit_entry(
+                    &env,
+                    &mut shipment,
+                    old_arbiter.clone(),
+                    Symbol::new(&env, "dispute_timeout_handoff"),
+                    Symbol::new(&env, "resolve_dispute_timeout"),
+                );
+
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "dispute_timeout_handoff"),
+                        shipment_id.clone(),
+                    ),
+                    (milestone_index, old_arbiter, backup),
+                );
+                return;
+            }
         }
 
         // Determine payment scope: partial dispute holds only the contested portion.
