@@ -113,6 +113,17 @@ pub enum Resolution {
     Supplier,
 }
 
+/// Why an arbiter reached a dispute resolution.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResolutionReason {
+    ProofValid,
+    ProofInvalid,
+    ProofLate,
+    InsufficientEvidence,
+    MutualSettlement,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub struct Milestone {
@@ -1119,6 +1130,8 @@ pub enum DataKeyExt2 {
     /// (shipment_id, milestone_index) — read by `appeal_dispute` to snapshot
     /// the original decision before reassignment.
     DisputeResolvedApprove(String, u32),
+    /// The reason supplied for the most recent dispute resolution.
+    DisputeResolutionReason(String, u32),
 
     // ── #402 Emergency global freeze (supermajority multisig) ────────────
     /// Admin-configured supermajority percentage (basis points, e.g. 8000 =
@@ -6597,8 +6610,15 @@ impl ChainSettleContract {
         shipment_id: String,
         milestone_index: u32,
         approve: bool,
+        reason: Option<ResolutionReason>,
     ) {
         Self::assert_not_paused(&env);
+
+        let reason = reason.unwrap_or(if approve {
+            ResolutionReason::ProofValid
+        } else {
+            ResolutionReason::ProofInvalid
+        });
 
         // Batch read shipment, dispute status, stats and active disputes in a single context fetch.
         let ctx = Self::fetch_resolve_dispute_ctx(&env, &shipment_id, milestone_index);
@@ -6790,6 +6810,10 @@ impl ChainSettleContract {
             &DataKeyExt2::DisputeResolvedApprove(shipment_id.clone(), milestone_index),
             &approve,
         );
+        env.storage().persistent().set(
+            &DataKeyExt2::DisputeResolutionReason(shipment_id.clone(), milestone_index),
+            &reason,
+        );
 
         // #372: If this resolution is the second (appeal) resolution of this
         // dispute cycle, compare it against the original arbiter's outcome —
@@ -6903,6 +6927,7 @@ impl ChainSettleContract {
                 is_partial,
                 released_amount,
                 remaining_amount,
+                reason,
             ),
         );
         let resolution = if approve {
@@ -6910,7 +6935,14 @@ impl ChainSettleContract {
         } else {
             Symbol::new(&env, "buyer")
         };
-        Self::emit_dispute_resolved(&env, &shipment_id, milestone_index, resolution, &arbiter);
+        Self::emit_dispute_resolved(
+            &env,
+            &shipment_id,
+            milestone_index,
+            resolution,
+            &arbiter,
+            Some(reason),
+        );
     }
 
     // ----------------------------------------------------------
@@ -6922,7 +6954,7 @@ impl ChainSettleContract {
     pub fn batch_resolve_disputes(
         env: Env,
         arbiter: Address,
-        resolutions: Vec<(String, u32, bool)>,
+        resolutions: Vec<(String, u32, bool, Option<ResolutionReason>)>,
     ) {
         Self::assert_not_paused(&env);
 
@@ -6932,7 +6964,7 @@ impl ChainSettleContract {
 
         // Validate all entries before mutating anything
         for i in 0..resolutions.len() {
-            let (shipment_id, milestone_index, _approve) = resolutions.get(i).unwrap();
+            let (shipment_id, milestone_index, _approve, _reason) = resolutions.get(i).unwrap();
             let shipment = Self::get_shipment_internal(&env, &shipment_id);
 
             if shipment.status != ShipmentStatus::Active {
@@ -6952,13 +6984,14 @@ impl ChainSettleContract {
 
         // Execute resolutions
         for i in 0..resolutions.len() {
-            let (shipment_id, milestone_index, approve) = resolutions.get(i).unwrap();
+            let (shipment_id, milestone_index, approve, reason) = resolutions.get(i).unwrap();
             Self::resolve_dispute(
                 env.clone(),
                 arbiter.clone(),
                 shipment_id,
                 milestone_index,
                 approve,
+                reason,
             );
         }
     }
@@ -7086,6 +7119,7 @@ impl ChainSettleContract {
             milestone_index,
             Symbol::new(&env, "supplier"),
             &shipment.arbiter,
+            Some(ResolutionReason::ProofValid),
         );
     }
 
@@ -8533,6 +8567,7 @@ impl ChainSettleContract {
             milestone_index,
             resolution_sym,
             &shipment.arbiter,
+            None,
         );
     }
 
@@ -8903,7 +8938,14 @@ impl ChainSettleContract {
             (Symbol::new(env, "mediation_accepted"), shipment_id.clone()),
             (milestone_index, resolution_sym.clone(), mediator.clone()),
         );
-        Self::emit_dispute_resolved(env, shipment_id, milestone_index, resolution_sym, mediator);
+        Self::emit_dispute_resolved(
+            env,
+            shipment_id,
+            milestone_index,
+            resolution_sym,
+            mediator,
+            None,
+        );
     }
 
     // ----------------------------------------------------------
@@ -10102,7 +10144,14 @@ impl ChainSettleContract {
         } else {
             Symbol::new(env, "buyer")
         };
-        Self::emit_dispute_resolved(env, &shipment_id, milestone_index, resolution, &resolver);
+        Self::emit_dispute_resolved(
+            env,
+            &shipment_id,
+            milestone_index,
+            resolution,
+            &resolver,
+            None,
+        );
     }
 
     /// Returns the current votes for a panel dispute identified by shipment and milestone.
@@ -11047,6 +11096,18 @@ impl ChainSettleContract {
             .persistent()
             .get(&DataKey::ActiveDisputes)
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns the reason recorded for the most recent resolution of a dispute.
+    pub fn get_dispute_resolution_reason(
+        env: Env,
+        shipment_id: String,
+        milestone_index: u32,
+    ) -> Option<ResolutionReason> {
+        env.storage().persistent().get(&DataKeyExt2::DisputeResolutionReason(
+            shipment_id,
+            milestone_index,
+        ))
     }
 
     pub fn get_contract_stats(env: Env) -> ContractStats {
@@ -12838,6 +12899,7 @@ impl ChainSettleContract {
         milestone_index: u32,
         resolution: Symbol,
         resolver: &Address,
+        reason: Option<ResolutionReason>,
     ) {
         let mut data: Map<Symbol, Val> = Map::new(env);
         data.set(Symbol::new(env, "shipment_id"), shipment_id.into_val(env));
@@ -12847,6 +12909,12 @@ impl ChainSettleContract {
         );
         data.set(Symbol::new(env, "resolution"), resolution.into_val(env));
         data.set(Symbol::new(env, "resolver"), resolver.into_val(env));
+        let reason = reason.unwrap_or(if resolution == Symbol::new(env, "supplier") {
+            ResolutionReason::ProofValid
+        } else {
+            ResolutionReason::ProofInvalid
+        });
+        data.set(Symbol::new(env, "reason"), reason.into_val(env));
         env.events().publish(
             (
                 Symbol::new(env, "chainsettle"),
