@@ -1198,12 +1198,11 @@ pub enum DataKeyExt2 {
     /// Dispute loss count for slashing calculation (reset on successful periods).
     SupplierDisputeLossCount(Address),
 
-    // ── #417 Mutual buyer+supplier pre-approval ────────────────────────────
-    /// Per-supplier allowlist of buyers the supplier has pre-approved.
-    ApprovedBuyers(Address),
-    /// Admin flag: when true, create_shipment requires every named buyer to
-    /// appear in the named supplier's approved-buyer list. Default: false.
-    RequireMutualPreapproval,
+    // ── Shipment observers (read-only notification recipients) ─────────────
+    /// Read-only observer addresses for a shipment: Vec<Address>.
+    /// Observers have zero on-chain authority; this list is intended as a hook
+    /// for off-chain event-routing tooling.
+    ShipmentObservers(String),
 }
 
 /// Partial joint-confirmation progress for a high-value shipment's milestone (#367).
@@ -2805,6 +2804,96 @@ impl ChainSettleContract {
         env.storage()
             .persistent()
             .get(&DataKey::ConfirmationDelegate(shipment_id))
+    }
+
+    // ----------------------------------------------------------
+    // SHIPMENT OBSERVERS (read-only notification recipients)
+    // ----------------------------------------------------------
+
+    /// Add a read-only observer to a shipment. Observers receive no on-chain
+    /// authority; this list exists as a hook for off-chain event-routing tooling.
+    /// Buyer only.
+    pub fn add_shipment_observer(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        observer_address: Address,
+    ) {
+        Self::assert_not_paused(&env);
+        buyer.require_auth();
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        Self::assert_is_buyer(&shipment, &buyer);
+        let key = DataKeyExt2::ShipmentObservers(shipment_id.clone());
+        let mut observers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !observers.contains(&observer_address) {
+            observers.push_back(observer_address.clone());
+            env.storage().persistent().set(&key, &observers);
+            env.storage().persistent().extend_ttl(
+                &key,
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+        }
+        env.events().publish(
+            (
+                Symbol::new(&env, "observer_added"),
+                shipment_id.clone(),
+            ),
+            (buyer, observer_address),
+        );
+    }
+
+    /// Return the list of read-only observers for a shipment.
+    pub fn get_shipment_observers(env: Env, shipment_id: String) -> Vec<Address> {
+        let key = DataKeyExt2::ShipmentObservers(shipment_id);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Remove a read-only observer from a shipment. Buyer only.
+    pub fn remove_shipment_observer(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        observer_address: Address,
+    ) {
+        Self::assert_not_paused(&env);
+        buyer.require_auth();
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        Self::assert_is_buyer(&shipment, &buyer);
+        let key = DataKeyExt2::ShipmentObservers(shipment_id.clone());
+        let mut observers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let original_len = observers.len();
+        observers.retain(|addr| addr != &observer_address);
+        if observers.len() != original_len {
+            if observers.is_empty() {
+                env.storage().persistent().remove(&key);
+            } else {
+                env.storage().persistent().set(&key, &observers);
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    constants::TTL_INITIAL_LEDGERS,
+                    constants::TTL_MAX_LEDGERS,
+                );
+            }
+        }
+        env.events().publish(
+            (
+                Symbol::new(&env, "observer_removed"),
+                shipment_id.clone(),
+            ),
+            (buyer, observer_address),
+        );
     }
 
     // ----------------------------------------------------------
