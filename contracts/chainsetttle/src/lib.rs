@@ -1073,6 +1073,11 @@ pub enum DataKeyExt2 {
     /// (shipment_id, milestone_index) — enforces "fires only once".
     DeadlineWarningFired(String, u32),
 
+    // ── #410 Dispute filing window after missed deadline ────────────────
+    /// Maximum number of ledgers after a milestone deadline during which a
+    /// dispute may still be raised for that milestone (0 = disabled / no cap).
+    DisputeFilingWindowLedgers,
+
     // ── #367 Co-buyer joint confirmation ────────────────────────────────
     /// Admin-configured shipment value above which joint (buyer + co-buyer)
     /// confirmation is required (0 = disabled).
@@ -1178,6 +1183,20 @@ pub enum DataKeyExt2 {
     /// Admin-configured cap on the number of entries in the allowed-token
     /// list (0/unset = no cap).
     MaxAllowedTokens,
+
+    // ── #410 Buyer-specific token allowlist ───────────────────────────────
+    /// Per-buyer token override: subset of the global approved-token list that
+    /// this buyer may use when creating shipments. Absent = no buyer override,
+    /// so the existing global allowlist behavior remains unchanged.
+    BuyerAllowedTokens(Address),
+
+    // ── #411 Configurable maximum extension requests per milestone ───────
+    /// Admin-configured cap on how many times a single milestone may request
+    /// an extension (0/unset = no cap).
+    MaxExtensionRequestsPerMilestone,
+    /// Total number of extension requests ever made for a specific
+    /// (shipment_id, milestone_index), regardless of approval outcome.
+    ExtensionRequestCount(String, u32),
 
     // ── #388 VIP partner fee waiver via governance vote ───────────────────
     /// Monotonic counter for fee-waiver proposal ids.
@@ -2081,6 +2100,33 @@ impl ChainSettleContract {
         env.storage()
             .instance()
             .get(&DataKeyExt2::WarningLeadLedgers)
+            .unwrap_or(0)
+    }
+
+    // ----------------------------------------------------------
+    // ADMIN: DISPUTE FILING WINDOW AFTER MISSED DEADLINE (#410)
+    // ----------------------------------------------------------
+
+    /// Set the maximum number of ledgers after a milestone deadline during which
+    /// a dispute may still be raised for that milestone (0 = disabled/no window).
+    pub fn set_dispute_filing_window_ledgers(env: Env, admin: Address, ledgers: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKeyExt2::DisputeFilingWindowLedgers, &ledgers);
+        env.events().publish(
+            (Symbol::new(&env, "dispute_filing_window_ledgers_set"),),
+            ledgers,
+        );
+    }
+
+    /// Returns the configured dispute filing window after a missed deadline.
+    /// `0` means no filing window is enforced.
+    pub fn get_dispute_filing_window_ledgers(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt2::DisputeFilingWindowLedgers)
             .unwrap_or(0)
     }
 
@@ -3434,6 +3480,38 @@ impl ChainSettleContract {
         if env.storage().persistent().has(&key) {
             panic!("extension request already pending");
         }
+
+        let max_requests: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt2::MaxExtensionRequestsPerMilestone)
+            .unwrap_or(0);
+        if max_requests > 0 {
+            let count_key = DataKeyExt2::ExtensionRequestCount(shipment_id.clone(), milestone_index);
+            let request_count: u32 = env
+                .storage()
+                .persistent()
+                .get(&count_key)
+                .unwrap_or(0);
+            if request_count >= max_requests {
+                panic!("max extension requests reached");
+            }
+        }
+
+        let count_key = DataKeyExt2::ExtensionRequestCount(shipment_id.clone(), milestone_index);
+        let next_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&count_key)
+            .unwrap_or(0)
+            + 1;
+        env.storage().persistent().set(&count_key, &next_count);
+        env.storage().persistent().extend_ttl(
+            &count_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
         env.storage()
             .persistent()
             .set(&key, &ExtensionReq { extra_ledgers });
@@ -3571,6 +3649,57 @@ impl ChainSettleContract {
             .instance()
             .get(&DataKeyExt2::MaxAllowedTokens)
             .unwrap_or(0)
+    }
+
+    /// Configure the subset of globally allowed tokens that a given buyer may
+    /// use when creating shipments. Empty list means the buyer has no override,
+    /// which is interpreted as "no restriction beyond the global allowlist".
+    /// Each entry must already be in the global allowlist (or the global list is
+    /// empty, meaning all tokens are globally allowed).
+    pub fn set_buyer_allowed_tokens(env: Env, admin: Address, buyer: Address, tokens: Vec<Address>) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+
+        let global_tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if global_tokens.len() > 0 {
+            for i in 0..tokens.len() {
+                let token = tokens.get(i).unwrap();
+                let mut allowed = false;
+                for j in 0..global_tokens.len() {
+                    if global_tokens.get(j).unwrap() == token {
+                        allowed = true;
+                        break;
+                    }
+                }
+                if !allowed {
+                    panic!("token is not in the approved whitelist");
+                }
+            }
+        }
+
+        env.storage().persistent().set(&DataKeyExt2::BuyerAllowedTokens(buyer.clone()), &tokens);
+        env.storage().persistent().extend_ttl(
+            &DataKeyExt2::BuyerAllowedTokens(buyer.clone()),
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "buyer_allowed_tokens_set"), buyer),
+            tokens,
+        );
+    }
+
+    /// Returns the buyer-specific allowlist, or an empty list when no override is set.
+    pub fn get_buyer_allowed_tokens(env: Env, buyer: Address) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt2::BuyerAllowedTokens(buyer))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     pub fn remove_allowed_token(env: Env, token: Address) {
@@ -3904,6 +4033,30 @@ impl ChainSettleContract {
             }
             if !found {
                 panic!("token is not in the approved whitelist");
+            }
+        }
+
+        // #410: Buyer-specific token allowlist, when configured, is an additional
+        // restriction on top of the global allowlist. If a buyer has no configured
+        // override, their behavior remains unchanged.
+        for i in 0..buyers.len() {
+            let buyer = buyers.get(i).unwrap();
+            let buyer_allowed: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKeyExt2::BuyerAllowedTokens(buyer.clone()))
+                .unwrap_or_else(|| Vec::new(&env));
+            if buyer_allowed.len() > 0 {
+                let mut found = false;
+                for j in 0..buyer_allowed.len() {
+                    if buyer_allowed.get(j).unwrap() == token {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    panic!("token is not allowed for this buyer");
+                }
             }
         }
 
@@ -6428,6 +6581,26 @@ impl ChainSettleContract {
     // RAISE DISPUTE
     // ----------------------------------------------------------
 
+    fn assert_dispute_filing_window_ok(env: &Env, shipment: &Shipment, milestone_index: u32) {
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        let deadline = milestone.deadline_ledger;
+        if deadline == 0 {
+            return;
+        }
+        let window = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt2::DisputeFilingWindowLedgers)
+            .unwrap_or(0);
+        if window == 0 {
+            return;
+        }
+        let current_ledger = env.ledger().sequence();
+        if current_ledger >= deadline + window {
+            panic!("dispute filing window has elapsed");
+        }
+    }
+
     pub fn raise_dispute(env: Env, buyer: Address, shipment_id: String, milestone_index: u32) {
         Self::assert_not_paused(&env);
 
@@ -6467,6 +6640,8 @@ impl ChainSettleContract {
                 }
             }
         }
+
+        Self::assert_dispute_filing_window_ok(&env, &shipment, milestone_index);
 
         let max_open: u32 = env
             .storage()
@@ -6667,6 +6842,8 @@ impl ChainSettleContract {
                 }
             }
         }
+
+        Self::assert_dispute_filing_window_ok(&env, &shipment, milestone_index);
 
         let max_open: u32 = env
             .storage()
@@ -13296,6 +13473,32 @@ impl ChainSettleContract {
             .instance()
             .get(&DataKeyExt2::MaxMilestoneCount)
             .unwrap_or(constants::DEFAULT_MAX_MILESTONE_COUNT)
+    }
+
+    // ----------------------------------------------------------
+    // #411: ADMIN — CONFIGURABLE MAX EXTENSION REQUESTS PER MILESTONE
+    // ----------------------------------------------------------
+
+    /// Set the maximum number of extension requests allowed per milestone.
+    /// `0` means unlimited (the historic default).
+    pub fn set_max_extension_requests_per_milestone(env: Env, admin: Address, max_requests: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKeyExt2::MaxExtensionRequestsPerMilestone, &max_requests);
+        env.events().publish(
+            (Symbol::new(&env, "max_extension_requests_per_milestone_set"),),
+            max_requests,
+        );
+    }
+
+    /// Read the configured max extension requests per milestone; `0` means no cap.
+    pub fn get_max_extension_requests_per_milestone(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt2::MaxExtensionRequestsPerMilestone)
+            .unwrap_or(0)
     }
 
     // ----------------------------------------------------------
