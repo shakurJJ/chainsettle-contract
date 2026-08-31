@@ -410,6 +410,87 @@ fn test_extension_denied_clears_without_changing_deadline() {
 }
 
 #[test]
+fn test_extension_request_count_includes_approved_requests() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let ship_id = sid(&t.env, "extapproved");
+
+    client.create_shipment(
+        &ship_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000,
+        &build_milestones(&t.env),
+        &default_options(&t.env),
+    );
+    client.set_max_extension_requests_per_milestone(&t.buyer, &2u32);
+
+    client.request_extension(&t.supplier, &ship_id, &0u32, &100u32);
+    client.approve_extension(&t.buyer, &ship_id, &0u32);
+    client.request_extension(&t.supplier, &ship_id, &0u32, &200u32);
+    client.approve_extension(&t.buyer, &ship_id, &0u32);
+
+    assert!(client.get_milestone_deadline(&ship_id, &0u32) > 0);
+}
+
+#[test]
+fn test_extension_request_count_includes_denied_requests() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let ship_id = sid(&t.env, "extdeniedcount");
+
+    client.create_shipment(
+        &ship_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000,
+        &build_milestones(&t.env),
+        &default_options(&t.env),
+    );
+    client.set_max_extension_requests_per_milestone(&t.buyer, &2u32);
+
+    client.request_extension(&t.supplier, &ship_id, &0u32, &100u32);
+    client.deny_extension(&t.buyer, &ship_id, &0u32);
+    client.request_extension(&t.supplier, &ship_id, &0u32, &200u32);
+    client.deny_extension(&t.buyer, &ship_id, &0u32);
+
+    assert_eq!(client.get_milestone_deadline(&ship_id, &0u32), 0);
+}
+
+#[test]
+#[should_panic(expected = "max extension requests reached")]
+fn test_extension_request_over_limit_rejected() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let ship_id = sid(&t.env, "extlimit");
+
+    client.create_shipment(
+        &ship_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000,
+        &build_milestones(&t.env),
+        &default_options(&t.env),
+    );
+    client.set_max_extension_requests_per_milestone(&t.buyer, &1u32);
+
+    client.request_extension(&t.supplier, &ship_id, &0u32, &100u32);
+    client.deny_extension(&t.buyer, &ship_id, &0u32);
+
+    // second request should be rejected because the milestone has already reached cap
+    client.request_extension(&t.supplier, &ship_id, &0u32, &200u32);
+}
+
+#[test]
 #[should_panic(expected = "extension request already pending")]
 fn test_double_extension_request_rejected() {
     let t = setup();
