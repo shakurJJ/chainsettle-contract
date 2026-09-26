@@ -813,6 +813,84 @@ pub struct AmendmentEntry {
 ```
 
 The log is capped at 20 entries per milestone; once full, the oldest entry is evicted (FIFO) to make room for the newest. Unlike the admin audit log, this is scoped per-milestone and only records completed amendments, not every proposal attempt.
+
+### Merging Adjacent Milestones
+
+Buyer and supplier can agree to merge two adjacent milestones into one. This
+is the reverse of splitting a milestone. It cuts down on proof submissions and
+confirmations when the milestones were set up too finely.
+
+**`propose_milestone_merge(caller, shipment_id, first_index)`**: buyer or
+supplier. Proposes merging milestone `first_index` with `first_index + 1`.
+Nothing changes yet. The proposal is stored per shipment, and a new proposal
+replaces the old one. Emits `milestone_merge_proposed` and writes a
+`merge_proposed` entry to the shipment audit log.
+
+**`approve_milestone_merge(counterparty, shipment_id, first_index)`**: the
+other party. If the supplier proposed, a buyer must approve. If a buyer
+proposed, the supplier must approve. `first_index` must match the pending
+proposal. The merge is applied in this call.
+
+**`get_milestone_merge_proposal(shipment_id) → Option<MilestoneMergeProposal>`**:
+read-only. Returns the pending proposal as `{ first_index, proposer }`.
+
+Both calls check these rules. The approval checks them again, because the
+milestones may have changed since the proposal:
+
+- The shipment is `Active`.
+- `first_index + 1` is a valid index. Proposing a merge at the last milestone,
+  or at any index past it, panics with `"invalid milestone index"`.
+- Both milestones are `Pending` and have no proof.
+- Neither milestone has an advance request or a dispute.
+
+How the merged milestone is built:
+
+- `payment_percent` is the sum of the two percentages, so the total stays at 100.
+- `deadline_ledger` is the later of the two deadlines. `0` means no deadline,
+  so if either milestone has none, the merged milestone has none. An
+  extension-adjusted deadline (`get_milestone_deadline`) follows the same rule.
+- The name, penalty rate and other per-milestone settings (payees, notes, proof
+  whitelist) come from the first milestone. The second milestone's settings are
+  discarded.
+- Every later milestone moves down one index. Its per-milestone data (proof,
+  payees, notes, deadlines, dispute records, active-dispute entries) moves with
+  it.
+- The merge is added to the merged milestone's amendment log
+  (`get_amendment_log(shipment_id, first_index)`). The entry records the
+  proposer, the first milestone's old percentage and the merged percentage.
+- Emits `milestones_merged` with `(first_index, merged_percent, merged_deadline,
+  approver)` and writes a `milestones_merged` entry to the shipment audit log.
+
+### Milestone-Linked Collateral Release
+
+By default, supplier collateral (`ShipmentOptions.supplier_collateral`) stays
+locked in full until the shipment completes, when it goes back to the
+supplier, or is cancelled or expires, when it goes to the buyer or treasury.
+A shipment can opt in to releasing collateral step by step as milestones are
+confirmed.
+
+Function | Who | Behaviour
+--- | --- | ---
+`set_incremental_collateral(buyer, shipment_id, enabled: bool)` | A buyer on the shipment | Turns incremental release on or off. Allowed only while the shipment is `Active`, has collateral, and has not confirmed, disputed or paid out any milestone. Emits `incremental_collateral_set` and writes an audit-log entry.
+`get_incremental_collateral(shipment_id) → bool` | Anyone (read-only) | `false` unless the shipment opted in.
+`get_locked_collateral(shipment_id) → i128` | Anyone (read-only) | Collateral still held for the shipment.
+
+Only a buyer can turn this on, because the buyer is the party giving up
+protection.
+
+When it is on, each milestone confirmed without a dispute releases
+`locked_collateral_at_opt_in × payment_percent / 100` to the supplier. This
+covers `confirm_milestone`, `batch_confirm_milestones`,
+`claim_auto_confirmation`, and `release_held_payment` for held payments. Each
+release emits `collateral_partial_release` with `(milestone_index, released,
+remaining)`.
+
+- **Disputed milestones release nothing early.** A disputed milestone ends as
+  `Resolved`, not `Confirmed`, so its share stays locked.
+- **The remaining collateral follows the existing rules.** It goes back to the
+  supplier at completion, or to the buyer (or treasury) on cancellation or
+  expiry, as before.
+- **Turned off (the default)**, nothing changes.
 Emergency pause (circuit breaker)
 Admin-only kill switch that halts state-changing calls across every
 shipment without touching any stored data. Locked funds stay in escrow
@@ -1049,6 +1127,34 @@ shipment all at once. Without a cap, one shipment could rack up an
 unbounded number of simultaneous disputes, tying up several payment
 releases at once and dumping all of that resolution work on one arbiter
 at the same time.
+
+### Per-Buyer Concurrent Dispute Cap
+
+`set_max_concurrent_disputes` limits open disputes *per shipment*. A buyer
+with many shipments could still keep disputes open on all of them at once. The
+per-buyer cap is a separate, optional limit on how many disputes one buyer can
+have open across **all** shipments.
+
+Function | Who | Behaviour
+--- | --- | ---
+`set_buyer_dispute_cap(admin, buyer, limit: u32)` | Admin only | Sets the buyer's cap. `limit` must be at least `1`. Emits `buyer_dispute_cap_set`.
+`clear_buyer_dispute_cap(admin, buyer)` | Admin only | Removes the cap. Emits `buyer_dispute_cap_cleared`.
+`get_buyer_dispute_cap(buyer) → Option<u32>` | Anyone (read-only) | `None` means no cap is set.
+`get_buyer_open_disputes(buyer) → u32` | Anyone (read-only) | Number of currently open disputes raised by this buyer.
+
+`raise_dispute` and `raise_partial_dispute` check both caps. The per-shipment
+cap is checked first (`"DisputeAlreadyOpen"`), then the buyer's cap
+(`"BuyerDisputeCapReached"`). Both must have room for the dispute to open.
+
+- A buyer with no cap set is limited only by the per-shipment cap, exactly as
+  before.
+- A buyer at their cap cannot raise a new dispute on any shipment, even when
+  that shipment's own cap still has room.
+- A dispute stops counting once it leaves the active-disputes list. That
+  happens when it is resolved, withdrawn, settled through mediation, or timed
+  out, so the buyer can raise a new dispute after that.
+- Only disputes raised by that buyer count. If a shipment has several
+  co-buyers, each buyer's disputes count against their own cap.
 
 ---
 
@@ -1325,6 +1431,89 @@ ChainSettle supports an active pool of trusted arbiters, allowing for automatic 
 `remove_arbiter_from_pool(admin, arbiter: Address)`: Admin-only. Removes an arbiter from the active pool.
 `get_arbiter_pool() → Vec<Address>` (read-only): Returns the current list of active arbiters in the pool.
 When creating a shipment, a buyer must specify an arbiter. By querying `get_arbiter_pool()`, a frontend or backend service can automatically select an arbiter using a round-robin assignment strategy. This ensures that disputes are evenly distributed among all trusted arbiters in the pool rather than overloading a single resolver.
+
+### Dispute Mediation (Non-Binding, Pre-Arbitration)
+
+Mediation lets a neutral mediator suggest an outcome for a disputed milestone
+before the arbiter rules. The suggestion is **non-binding**. It only takes
+effect if both the buyer and the supplier accept it. If either side declines,
+or nobody acts, the dispute continues through the normal arbiter flow
+(`resolve_dispute`, `resolve_dispute_timeout`, appeals) unchanged.
+
+**1. Configure mediators (admin)**
+
+Function | Who | Behaviour
+--- | --- | ---
+`set_mediator_pool(admin, mediators: Vec<Address>)` | Admin only | Replaces the global mediator pool. Emits `mediator_pool_set` with the pool size.
+`get_mediator_pool() → Vec<Address>` | Anyone (read-only) | Returns the pool (empty if not set).
+`assign_mediator(admin, shipment_id, mediator)` | Admin only | Assigns a mediator to one shipment. The shipment must exist. Emits `mediator_assigned`.
+`get_shipment_mediator(shipment_id) → Option<Address>` | Anyone (read-only) | Returns the mediator assigned to the shipment, if any.
+
+The shipment's assigned mediator and any address in the global pool can
+mediate that shipment's disputes.
+
+**2. Dispute is raised**
+
+Mediation applies only to milestones in `Disputed` status. The buyer puts a
+milestone there with `raise_dispute` or `raise_partial_dispute`. Mediation does
+not open or pause a dispute. The arbiter can still rule at any point.
+
+**3. Mediator proposes an outcome**
+
+`propose_mediation(mediator, shipment_id, milestone_index, suggested_outcome: Resolution)`:
+the mediator suggests `Resolution::Buyer` (refund) or `Resolution::Supplier`
+(release). The shipment must be `Active` and the milestone `Disputed`.
+Otherwise it panics with `"unauthorized mediator"`, `"invalid milestone index"`
+or `"milestone is not in disputed status"`. A new proposal replaces any
+pending one and resets both acceptances. Emits `mediation_proposed` with
+`(milestone_index, mediator, outcome)`.
+
+`get_mediation_proposal(shipment_id, milestone_index) → Option<MediationProposal>`
+returns the pending proposal:
+
+```rust
+pub struct MediationProposal {
+    pub mediator: Address,
+    pub suggested_outcome: Resolution,
+    pub buyer_accepted: bool,
+    pub supplier_accepted: bool,
+}
+```
+
+**4a. Both parties accept, and the dispute settles**
+
+`accept_mediation(caller, shipment_id, milestone_index)`: buyer or supplier.
+The first acceptance only records that side's flag. When the second side
+accepts, the outcome is applied in the same call:
+
+- `Supplier`: the disputed amount (or only the contested part of a partial
+  dispute) is paid to the supplier, after the protocol fee and split across
+  milestone payees. The dispute bond is returned to the buyer.
+- `Buyer`: the disputed amount is refunded to the primary buyer. The dispute
+  bond goes to the supplier.
+- **No arbiter fee is charged**, because no binding arbiter ruling was made.
+- The milestone becomes `Resolved`. The shipment's open-dispute count goes
+  down, the dispute is removed from the active-disputes list, and the shipment
+  becomes `Completed` if this was the last open milestone.
+- Emits `mediation_accepted` plus the standard `dispute_resolved` event, and
+  writes a `mediation_accepted` entry to the shipment audit log.
+
+**4b. Either party declines, and the dispute goes to the arbiter**
+
+`decline_mediation(caller, shipment_id, milestone_index)`: buyer or
+supplier. Deletes the pending proposal and emits `mediation_declined`. The
+milestone stays `Disputed`, and the arbiter resolves it with `resolve_dispute`
+as usual. A mediator may make a new proposal later.
+
+**How mediation relates to binding arbitration**
+
+| | Mediation | Arbiter resolution |
+|---|---|---|
+| Binding | No. Needs both parties to accept | Yes |
+| Who decides | Mediator suggests, parties agree | Shipment arbiter (or panel/appeal arbiter) |
+| Arbiter fee | Not charged | `arbiter_fee_bps` applies |
+| Effect of inaction | None. The dispute stays open | `resolve_dispute_timeout` applies `default_resolution` |
+| Can run in parallel | Yes. An arbiter ruling first makes a pending proposal unusable, since the milestone is no longer `Disputed` | — |
 
 Arbiter Rotation
 When both the buyer and supplier lose confidence in the assigned arbiter, they can agree to replace them using `propose_arbiter_rotation()`. Unlike `recuse_arbiter()` (which is an arbiter-initiated voluntary step-down), rotation is initiated and controlled entirely by the two trading parties.

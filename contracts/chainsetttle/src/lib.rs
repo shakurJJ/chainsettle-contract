@@ -2771,6 +2771,611 @@ impl ChainSettleContract {
         );
     }
 
+    // ----------------------------------------------------------
+    // #477 – PER-BUYER CONCURRENT DISPUTE CAP
+    // ----------------------------------------------------------
+
+    /// Admin caps how many disputes `buyer` may have open at once across all
+    /// shipments. Independent of (and checked in addition to) the per-shipment
+    /// `set_max_concurrent_disputes` cap. `limit` must be at least 1; use
+    /// `clear_buyer_dispute_cap` to remove the cap.
+    pub fn set_buyer_dispute_cap(env: Env, admin: Address, buyer: Address, limit: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        if limit == 0 {
+            panic!("buyer dispute cap must be at least 1");
+        }
+        let key = DataKeyExt3::BuyerMaxConcurrentDisputes(buyer.clone());
+        env.storage().persistent().set(&key, &limit);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        Self::append_admin_action(
+            &env,
+            Symbol::new(&env, "set_buyer_dispute_cap"),
+            Symbol::new(&env, "buyer_dispute_cap_set"),
+        );
+        env.events()
+            .publish((Symbol::new(&env, "buyer_dispute_cap_set"), buyer), limit);
+    }
+
+    /// Admin removes a buyer's concurrent-dispute cap; the buyer is then subject
+    /// only to the per-shipment cap again.
+    pub fn clear_buyer_dispute_cap(env: Env, admin: Address, buyer: Address) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .remove(&DataKeyExt3::BuyerMaxConcurrentDisputes(buyer.clone()));
+        Self::append_admin_action(
+            &env,
+            Symbol::new(&env, "clear_buyer_dispute_cap"),
+            Symbol::new(&env, "buyer_dispute_cap_cleared"),
+        );
+        env.events()
+            .publish((Symbol::new(&env, "buyer_dispute_cap_cleared"), buyer), ());
+    }
+
+    /// Returns the buyer's configured concurrent-dispute cap (None = uncapped).
+    pub fn get_buyer_dispute_cap(env: Env, buyer: Address) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt3::BuyerMaxConcurrentDisputes(buyer))
+    }
+
+    /// Returns how many disputes raised by `buyer` are currently open.
+    pub fn get_buyer_open_disputes(env: Env, buyer: Address) -> u32 {
+        Self::count_buyer_open_disputes(&env, &buyer)
+    }
+
+    fn count_buyer_open_disputes(env: &Env, buyer: &Address) -> u32 {
+        let disputes: Vec<DisputeEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveDisputes)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut count: u32 = 0;
+        for entry in disputes.iter() {
+            let raiser: Option<Address> =
+                env.storage()
+                    .persistent()
+                    .get(&DataKeyExt3::DisputeRaisedBy(
+                        entry.shipment_id.clone(),
+                        entry.milestone_index,
+                    ));
+            if raiser.as_ref() == Some(buyer) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn assert_buyer_dispute_cap_ok(env: &Env, buyer: &Address) {
+        let cap: Option<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::BuyerMaxConcurrentDisputes(buyer.clone()));
+        if let Some(cap) = cap {
+            if Self::count_buyer_open_disputes(env, buyer) >= cap {
+                panic!("BuyerDisputeCapReached");
+            }
+        }
+    }
+
+    fn record_dispute_raiser(
+        env: &Env,
+        shipment_id: &String,
+        milestone_index: u32,
+        buyer: &Address,
+    ) {
+        let key = DataKeyExt3::DisputeRaisedBy(shipment_id.clone(), milestone_index);
+        env.storage().persistent().set(&key, buyer);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
+    // ----------------------------------------------------------
+    // #475 – MILESTONE-LINKED PARTIAL COLLATERAL RELEASE
+    // ----------------------------------------------------------
+
+    /// Buyer opts a shipment in (or out) of incremental collateral release. When
+    /// enabled, each milestone that confirms without a dispute releases
+    /// `locked_collateral * payment_percent / 100` back to the supplier; the
+    /// remainder follows the existing completion/cancellation rules.
+    ///
+    /// The buyer is the party giving up protection, so only a buyer may toggle
+    /// it, and only before any milestone has been confirmed, disputed or paid.
+    pub fn set_incremental_collateral(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        enabled: bool,
+    ) {
+        Self::assert_not_paused(&env);
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::require_buyer_auth(&shipment, &buyer);
+
+        if shipment.released_amount != 0 {
+            panic!("collateral mode can only change before any payout");
+        }
+        for m in shipment.milestones.iter() {
+            if m.status != MilestoneStatus::Pending && m.status != MilestoneStatus::ProofSubmitted {
+                panic!("collateral mode can only change before any payout");
+            }
+        }
+
+        let flag_key = DataKeyExt3::IncrementalCollateral(shipment_id.clone());
+        let base_key = DataKeyExt3::IncrementalCollateralBase(shipment_id.clone());
+        if enabled {
+            let locked: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SupplierCollateral(shipment_id.clone()))
+                .unwrap_or(0);
+            if locked <= 0 {
+                panic!("shipment has no supplier collateral");
+            }
+            env.storage().persistent().set(&flag_key, &true);
+            env.storage().persistent().set(&base_key, &locked);
+            for key in [&flag_key, &base_key] {
+                env.storage().persistent().extend_ttl(
+                    key,
+                    constants::TTL_INITIAL_LEDGERS,
+                    constants::TTL_MAX_LEDGERS,
+                );
+            }
+        } else {
+            env.storage().persistent().remove(&flag_key);
+            env.storage().persistent().remove(&base_key);
+        }
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            buyer.clone(),
+            Symbol::new(&env, "incremental_collateral"),
+            if enabled {
+                Symbol::new(&env, "enabled")
+            } else {
+                Symbol::new(&env, "disabled")
+            },
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+        env.events().publish(
+            (Symbol::new(&env, "incremental_collateral_set"), shipment_id),
+            (buyer, enabled),
+        );
+    }
+
+    /// Whether incremental collateral release is enabled for a shipment.
+    pub fn get_incremental_collateral(env: Env, shipment_id: String) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt3::IncrementalCollateral(shipment_id))
+            .unwrap_or(false)
+    }
+
+    /// Supplier collateral still locked for a shipment.
+    pub fn get_locked_collateral(env: Env, shipment_id: String) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SupplierCollateral(shipment_id))
+            .unwrap_or(0)
+    }
+
+    /// Releases the proportional collateral share for a milestone that has just
+    /// moved to `Confirmed` through a non-dispute path. No-op unless the shipment
+    /// opted in. Disputed milestones end in `Resolved` and never reach here.
+    fn release_milestone_collateral_share(
+        env: &Env,
+        shipment: &Shipment,
+        shipment_id: &String,
+        milestone_index: u32,
+    ) {
+        let enabled: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::IncrementalCollateral(shipment_id.clone()))
+            .unwrap_or(false);
+        if !enabled {
+            return;
+        }
+        let base: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::IncrementalCollateralBase(shipment_id.clone()))
+            .unwrap_or(0);
+        let collateral_key = DataKey::SupplierCollateral(shipment_id.clone());
+        let remaining: i128 = env.storage().persistent().get(&collateral_key).unwrap_or(0);
+        let percent = shipment
+            .milestones
+            .get(milestone_index)
+            .unwrap()
+            .payment_percent;
+        let share = ((base * percent as i128) / 100).min(remaining);
+        if share <= 0 {
+            return;
+        }
+        token::Client::new(env, &shipment.token).transfer(
+            &env.current_contract_address(),
+            &shipment.supplier,
+            &share,
+        );
+        env.storage()
+            .persistent()
+            .set(&collateral_key, &(remaining - share));
+        env.events().publish(
+            (
+                Symbol::new(env, "collateral_partial_release"),
+                shipment_id.clone(),
+            ),
+            (milestone_index, share, remaining - share),
+        );
+    }
+
+    // ----------------------------------------------------------
+    // #517 – MERGE ADJACENT PENDING MILESTONES
+    // ----------------------------------------------------------
+
+    /// Buyer or supplier proposes merging milestones `first_index` and
+    /// `first_index + 1`. Applied only once the counterparty approves via
+    /// `approve_milestone_merge`. A new proposal replaces any pending one.
+    pub fn propose_milestone_merge(
+        env: Env,
+        caller: Address,
+        shipment_id: String,
+        first_index: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::assert_buyer_or_supplier(&shipment, &caller);
+        Self::assert_milestones_mergeable(&env, &shipment, &shipment_id, first_index);
+
+        let key = DataKeyExt3::MilestoneMergeProposal(shipment_id.clone());
+        env.storage().persistent().set(
+            &key,
+            &MilestoneMergeProposal {
+                first_index,
+                proposer: caller.clone(),
+            },
+        );
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            caller.clone(),
+            Symbol::new(&env, "merge_proposed"),
+            Symbol::new(&env, "propose_milestone_merge"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+        env.events().publish(
+            (Symbol::new(&env, "milestone_merge_proposed"), shipment_id),
+            (first_index, caller),
+        );
+    }
+
+    /// Counterparty approves the pending merge proposal. If the proposer was the
+    /// supplier, a buyer must approve, and vice versa. `first_index` must match
+    /// the pending proposal. Both milestones are re-validated before merging.
+    pub fn approve_milestone_merge(
+        env: Env,
+        counterparty: Address,
+        shipment_id: String,
+        first_index: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        counterparty.require_auth();
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::assert_buyer_or_supplier(&shipment, &counterparty);
+
+        let key = DataKeyExt3::MilestoneMergeProposal(shipment_id.clone());
+        let proposal: MilestoneMergeProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("no pending milestone merge proposal"));
+        if proposal.first_index != first_index {
+            panic!("merge index does not match proposal");
+        }
+        let proposer_is_supplier = proposal.proposer == shipment.supplier;
+        let approver_is_supplier = counterparty == shipment.supplier;
+        if proposer_is_supplier == approver_is_supplier {
+            panic!("merge must be approved by the counterparty");
+        }
+        Self::assert_milestones_mergeable(&env, &shipment, &shipment_id, first_index);
+        env.storage().persistent().remove(&key);
+
+        let second_index = first_index + 1;
+        let first = shipment.milestones.get(first_index).unwrap();
+        let second = shipment.milestones.get(second_index).unwrap();
+        let old_percent = first.payment_percent;
+
+        let mut merged = first.clone();
+        merged.payment_percent = first.payment_percent + second.payment_percent;
+        // 0 means "no deadline", so a merge with an undated milestone stays undated.
+        merged.deadline_ledger = if first.deadline_ledger == 0 || second.deadline_ledger == 0 {
+            0
+        } else {
+            first.deadline_ledger.max(second.deadline_ledger)
+        };
+
+        // Extension-adjusted deadlines (stored separately) follow the same rule.
+        let first_ext: Option<u32> =
+            env.storage()
+                .persistent()
+                .get(&DataKeyExt::MilestoneDeadline(
+                    shipment_id.clone(),
+                    first_index,
+                ));
+        let second_ext: Option<u32> =
+            env.storage()
+                .persistent()
+                .get(&DataKeyExt::MilestoneDeadline(
+                    shipment_id.clone(),
+                    second_index,
+                ));
+        let merged_ext = match (first_ext, second_ext) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+
+        // Rebuild the milestone list without the second milestone.
+        let mut milestones: Vec<Milestone> = Vec::new(&env);
+        for (i, m) in shipment.milestones.iter().enumerate() {
+            let i = i as u32;
+            if i == first_index {
+                milestones.push_back(merged.clone());
+            } else if i != second_index {
+                milestones.push_back(m);
+            }
+        }
+        let old_len = shipment.milestones.len();
+        shipment.milestones = milestones;
+
+        // Shift per-milestone storage for every later milestone down by one.
+        Self::shift_milestone_storage_down(&env, &shipment_id, second_index, old_len);
+        if let Some(d) = merged_ext {
+            env.storage().persistent().set(
+                &DataKeyExt::MilestoneDeadline(shipment_id.clone(), first_index),
+                &d,
+            );
+        }
+
+        if let Some(last) = shipment.last_confirmed_milestone_index {
+            if last > second_index {
+                shipment.last_confirmed_milestone_index = Some(last - 1);
+            }
+        }
+
+        // Later disputed milestones keep their ActiveDisputes entries in sync.
+        let disputes: Vec<DisputeEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveDisputes)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut shifted: Vec<DisputeEntry> = Vec::new(&env);
+        for mut entry in disputes.iter() {
+            if entry.shipment_id == shipment_id && entry.milestone_index > second_index {
+                entry.milestone_index -= 1;
+            }
+            shifted.push_back(entry);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveDisputes, &shifted);
+
+        // Record the merge in the merged milestone's amendment log (capped at 20).
+        let log_key = DataKeyExt::AmendmentLog(shipment_id.clone(), first_index);
+        let mut log: Vec<AmendmentEntry> = env
+            .storage()
+            .persistent()
+            .get(&log_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if log.len() >= 20 {
+            log.pop_front();
+        }
+        log.push_back(AmendmentEntry {
+            proposer: proposal.proposer.clone(),
+            old_payment_percent: old_percent,
+            new_payment_percent: merged.payment_percent,
+            ledger: env.ledger().sequence(),
+        });
+        env.storage().persistent().set(&log_key, &log);
+        env.storage().persistent().extend_ttl(
+            &log_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            counterparty.clone(),
+            Symbol::new(&env, "milestones_merged"),
+            Symbol::new(&env, "approve_milestone_merge"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+        env.events().publish(
+            (Symbol::new(&env, "milestones_merged"), shipment_id),
+            (
+                first_index,
+                merged.payment_percent,
+                merged.deadline_ledger,
+                counterparty,
+            ),
+        );
+    }
+
+    /// Returns the pending milestone merge proposal for a shipment, if any.
+    pub fn get_milestone_merge_proposal(
+        env: Env,
+        shipment_id: String,
+    ) -> Option<MilestoneMergeProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt3::MilestoneMergeProposal(shipment_id))
+    }
+
+    fn assert_milestones_mergeable(
+        env: &Env,
+        shipment: &Shipment,
+        shipment_id: &String,
+        first_index: u32,
+    ) {
+        if first_index
+            .checked_add(1)
+            .map_or(true, |s| s >= shipment.milestones.len())
+        {
+            panic!("invalid milestone index");
+        }
+        for idx in [first_index, first_index + 1] {
+            let m = shipment.milestones.get(idx).unwrap();
+            if m.status != MilestoneStatus::Pending || m.proof_hash.len() != 0 {
+                panic!("only pending milestones without proof can be merged");
+            }
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::AdvanceRequest(shipment_id.clone(), idx))
+            {
+                panic!("cannot merge a milestone with an advance");
+            }
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKeyExt::DisputeOpenedAt(shipment_id.clone(), idx))
+                || env
+                    .storage()
+                    .persistent()
+                    .has(&DataKey::DisputeContestedPercent(shipment_id.clone(), idx))
+            {
+                panic!("cannot merge a disputed milestone");
+            }
+        }
+    }
+
+    /// Per-milestone storage keys that must follow a milestone when its index
+    /// changes. Returned as raw `Val`s so one loop can move any value type.
+    fn per_milestone_keys(env: &Env, shipment_id: &String, idx: u32) -> Vec<Val> {
+        let s = shipment_id.clone();
+        let mut keys: Vec<Val> = Vec::new(env);
+        keys.push_back(DataKey::ProofSubmittedAt(s.clone(), idx).into_val(env));
+        keys.push_back(DataKey::Amendment(s.clone(), idx).into_val(env));
+        keys.push_back(DataKey::AdvanceRequest(s.clone(), idx).into_val(env));
+        keys.push_back(DataKey::MilestoneProofWhitelist(s.clone(), idx).into_val(env));
+        keys.push_back(DataKey::SubmittedProofType(s.clone(), idx).into_val(env));
+        keys.push_back(DataKey::DisputeContestedPercent(s.clone(), idx).into_val(env));
+        keys.push_back(DataKey::EvidenceCount(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt::MilestoneInvoiceHash(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt::AmendmentLog(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt::ExtensionRequest(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt::MilestoneDeadline(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt::DisputeOpenedAt(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt::EffectiveDisputeBond(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt::DisputeVotes(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt::MilestonePayees(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt::ProofSubmitter(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt::MilestoneNotes(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt::DisputeEvidence(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt2::DeadlineWarningFired(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt2::JointConfirmation(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt2::DisputeResolvedAtLedger(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt2::DisputeAppealed(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt2::MediationProposal(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt2::DisputeAppealOriginal(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt2::DisputeResolvedApprove(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt2::DisputeResolutionReason(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt2::ExtensionRequestCount(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt3::RefundClaimableAtLedger(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt3::DisputeRaisedBy(s, idx).into_val(env));
+        keys
+    }
+
+    /// Moves every per-milestone storage entry at index `i + 1` to `i` for
+    /// `i` in `[removed_index, old_len - 1)`, then clears the last index. The
+    /// entries previously at `removed_index` are overwritten (discarded).
+    fn shift_milestone_storage_down(
+        env: &Env,
+        shipment_id: &String,
+        removed_index: u32,
+        old_len: u32,
+    ) {
+        for i in removed_index..old_len {
+            let dst_keys = Self::per_milestone_keys(env, shipment_id, i);
+            let src_keys = if i + 1 < old_len {
+                Some(Self::per_milestone_keys(env, shipment_id, i + 1))
+            } else {
+                None
+            };
+            for k in 0..dst_keys.len() {
+                let dst = dst_keys.get(k).unwrap();
+                let src = src_keys.as_ref().map(|v| v.get(k).unwrap());
+                Self::move_storage_entry(env, src, dst);
+            }
+        }
+    }
+
+    /// Copies `src` over `dst` in whichever storage tier holds it (removing
+    /// `dst` when `src` is absent or `None`).
+    fn move_storage_entry(env: &Env, src: Option<Val>, dst: Val) {
+        let persistent = env.storage().persistent();
+        let temporary = env.storage().temporary();
+        let instance = env.storage().instance();
+        let src_p: Option<Val> = src.and_then(|k| persistent.get::<Val, Val>(&k));
+        let src_t: Option<Val> = src.and_then(|k| temporary.get::<Val, Val>(&k));
+        let src_i: Option<Val> = src.and_then(|k| instance.get::<Val, Val>(&k));
+        match src_p {
+            Some(v) => persistent.set(&dst, &v),
+            None => {
+                if persistent.has(&dst) {
+                    persistent.remove(&dst)
+                }
+            }
+        }
+        match src_t {
+            Some(v) => temporary.set(&dst, &v),
+            None => {
+                if temporary.has(&dst) {
+                    temporary.remove(&dst)
+                }
+            }
+        }
+        match src_i {
+            Some(v) => instance.set(&dst, &v),
+            None => {
+                if instance.has(&dst) {
+                    instance.remove(&dst)
+                }
+            }
+        }
+    }
+
     pub fn set_min_milestone_percent(env: Env, admin: Address, percent: u32) {
         admin.require_auth();
         Self::assert_admin(&env, &admin);
@@ -6192,6 +6797,8 @@ impl ChainSettleContract {
             shipment.released_amount += payment;
             // #162: Track last confirmed milestone for sequential enforcement queries.
             shipment.last_confirmed_milestone_index = Some(milestone_index);
+            // #475: Release this milestone's collateral share if opted in.
+            Self::release_milestone_collateral_share(&env, &shipment, &shipment_id, milestone_index);
 
             // #113: Accumulate lifetime volume for the primary buyer.
             {
@@ -6457,6 +7064,8 @@ impl ChainSettleContract {
         shipment.released_amount += gross;
         // #162: Track last confirmed milestone.
         shipment.last_confirmed_milestone_index = Some(milestone_index);
+        // #475: Release this milestone's collateral share if opted in.
+        Self::release_milestone_collateral_share(&env, &shipment, &shipment_id, milestone_index);
 
         let mut actual_transfer = net_payment - advance_deducted;
         let token_client = token::Client::new(&env, &shipment.token);
@@ -6659,6 +7268,8 @@ impl ChainSettleContract {
             shipment.milestones.set(idx, milestone.clone());
             // #162: Track last confirmed milestone.
             shipment.last_confirmed_milestone_index = Some(idx);
+            // #475: Release this milestone's collateral share if opted in.
+            Self::release_milestone_collateral_share(&env, &shipment, &shipment_id, idx);
 
             let payment = Self::milestone_gross_payment(&env, &shipment, idx);
 
@@ -6878,6 +7489,8 @@ impl ChainSettleContract {
         if shipment.open_dispute_count >= max_open {
             panic!("DisputeAlreadyOpen");
         }
+        // #477: Per-buyer cap across all shipments (only when configured).
+        Self::assert_buyer_dispute_cap_ok(&env, &buyer);
 
         // Pool-arbiter assignment: if this shipment was created with a pool-arbiter sentinel,
         // assign the next arbiter from the pool using round-robin (only on the first dispute).
@@ -6988,6 +7601,7 @@ impl ChainSettleContract {
             shipment_id: shipment_id.clone(),
             milestone_index,
         });
+        Self::record_dispute_raiser(&env, &shipment_id, milestone_index, &buyer);
         env.storage()
             .persistent()
             .set(&DataKey::ActiveDisputes, &disputes);
@@ -7111,6 +7725,8 @@ impl ChainSettleContract {
         if shipment.open_dispute_count >= max_open {
             panic!("DisputeAlreadyOpen");
         }
+        // #477: Per-buyer cap across all shipments (only when configured).
+        Self::assert_buyer_dispute_cap_ok(&env, &buyer);
 
         // Compute and immediately release the uncontested portion to the supplier.
         let full_milestone_payment =
@@ -7224,6 +7840,7 @@ impl ChainSettleContract {
             shipment_id: shipment_id.clone(),
             milestone_index,
         });
+        Self::record_dispute_raiser(&env, &shipment_id, milestone_index, &buyer);
         env.storage()
             .persistent()
             .set(&DataKey::ActiveDisputes, &disputes);
@@ -8811,6 +9428,8 @@ impl ChainSettleContract {
 
         milestone.proof_submitted_ledger = None;
         shipment.last_confirmed_milestone_index = Some(milestone_index);
+        // #475: Release this milestone's collateral share if opted in.
+        Self::release_milestone_collateral_share(&env, &shipment, &shipment_id, milestone_index);
         shipment.milestones.set(milestone_index, milestone);
         shipment.released_amount += payment;
 
