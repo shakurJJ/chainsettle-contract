@@ -204,3 +204,122 @@ fn test_pause_blocks_state_changes_but_not_views() {
     token::StellarAssetClient::new(&s.env, &s.debt_id).mint(&s.d1, &1_000);
     s.client().deposit(&s.d1, &100); // works again
 }
+
+// ============================================================
+// ADDITIONAL COVERAGE
+// ============================================================
+
+#[test]
+fn test_depositor_registry_is_deduplicated() {
+    let s = setup();
+    seed_liquidity(&s, &[&s.d1, &s.d1, &s.d2], &[1_000, 500, 2_000]);
+
+    let depositors = s.client().get_depositors();
+    assert_eq!(depositors.len(), 2);
+    assert_eq!(depositors.get(0).unwrap(), s.d1);
+    assert_eq!(depositors.get(1).unwrap(), s.d2);
+    assert_eq!(s.client().get_depositor_balance(&s.d1), 1_500);
+    assert_eq!(s.client().get_depositor_balance(&s.d2), 2_000);
+}
+
+#[test]
+fn test_full_withdraw_zeroes_depositor_balance() {
+    let s = setup();
+    seed_liquidity(&s, &[&s.d1], &[4_000]);
+
+    s.client().withdraw(&s.d1, &4_000);
+    assert_eq!(s.client().get_depositor_balance(&s.d1), 0);
+    assert_eq!(debt_balance(&s, &s.d1), 4_000);
+    assert_eq!(debt_balance(&s, &s.id), 0);
+
+    let (td, _, _) = s.client().get_pool_info();
+    assert_eq!(td, 0);
+}
+
+#[test]
+#[should_panic(expected = "invalid amount")]
+fn test_zero_withdraw_rejected() {
+    let s = setup();
+    seed_liquidity(&s, &[&s.d1], &[1_000]);
+    s.client().withdraw(&s.d1, &0i128);
+}
+
+#[test]
+#[should_panic(expected = "invalid amount")]
+fn test_negative_borrow_rejected() {
+    let s = setup();
+    seed_liquidity(&s, &[&s.d1], &[10_000]);
+    open_position(&s, &s.alice, 2_000, 0);
+    s.client().borrow(&s.alice, &-1i128);
+}
+
+#[test]
+fn test_borrow_exactly_at_threshold_succeeds() {
+    let s = setup();
+    seed_liquidity(&s, &[&s.d1], &[10_000]);
+    // HF = (1000*8000)/(800*10000) == 1 → exactly healthy.
+    open_position(&s, &s.alice, 1_000, 800);
+
+    let (num, den) = s.client().health_factor(&s.alice);
+    assert_eq!(num, den);
+    assert!(s.client().try_borrow(&s.alice, &1i128).is_err());
+}
+
+#[test]
+fn test_borrow_transfers_tokens_and_updates_pool() {
+    let s = setup();
+    seed_liquidity(&s, &[&s.d1], &[10_000]);
+    let before = debt_balance(&s, &s.alice);
+
+    open_position(&s, &s.alice, 5_000, 3_000);
+
+    assert_eq!(debt_balance(&s, &s.alice), before + 3_000);
+    assert_eq!(debt_balance(&s, &s.id), 7_000);
+    assert_eq!(coll_balance(&s, &s.id), 5_000);
+
+    let (td, tb, _) = s.client().get_pool_info();
+    assert_eq!(td, 10_000);
+    assert_eq!(tb, 3_000);
+}
+
+#[test]
+#[should_panic(expected = "nothing to repay")]
+fn test_repay_without_debt_panics() {
+    let s = setup();
+    seed_liquidity(&s, &[&s.d1], &[10_000]);
+    open_position(&s, &s.alice, 2_000, 0);
+    s.client().repay(&s.alice, &100);
+}
+
+#[test]
+fn test_health_factor_without_debt_is_max() {
+    let s = setup();
+    open_position(&s, &s.alice, 2_000, 0);
+
+    let (num, den) = s.client().health_factor(&s.alice);
+    assert_eq!(num, i128::MAX);
+    assert_eq!(den, 1);
+}
+
+#[test]
+fn test_withdraw_all_collateral_after_full_repay() {
+    let s = setup();
+    seed_liquidity(&s, &[&s.d1], &[10_000]);
+    open_position(&s, &s.alice, 2_000, 1_000);
+
+    s.client().repay(&s.alice, &1_000);
+    s.client().withdraw_collateral(&s.alice, &2_000);
+
+    let pos = s.client().get_position(&s.alice);
+    assert_eq!(pos.collateral, 0);
+    assert_eq!(pos.debt, 0);
+    assert_eq!(coll_balance(&s, &s.alice), 100_000_000_000);
+}
+
+#[test]
+#[should_panic(expected = "insufficient collateral")]
+fn test_withdraw_collateral_more_than_posted_panics() {
+    let s = setup();
+    open_position(&s, &s.alice, 1_000, 0);
+    s.client().withdraw_collateral(&s.alice, &1_001);
+}
