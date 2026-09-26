@@ -1359,6 +1359,62 @@ pub enum DataKeyExt3 {
     WarrantyEndsAt(String),
     /// Open warranty claim awaiting arbiter resolution.
     WarrantyClaim(String),
+
+    // ── #477 Per-buyer cap on concurrent open disputes ─────────────────────
+    /// Admin-configured cap on how many disputes a single buyer may have open
+    /// at once across all shipments (absent = only the per-shipment cap applies).
+    BuyerMaxConcurrentDisputes(Address),
+    /// Buyer who raised the dispute currently/last open on (shipment_id,
+    /// milestone_index); combined with `ActiveDisputes` to count a buyer's
+    /// open disputes.
+    DisputeRaisedBy(String, u32),
+
+    // ── #475 Milestone-linked partial collateral release ──────────────────
+    /// Opt-in flag: when true, a proportional share of the supplier collateral
+    /// is released each time a milestone confirms (absent/false = release only
+    /// at completion/cancellation, the historic behaviour).
+    IncrementalCollateral(String),
+    /// Collateral locked when incremental release was enabled; the basis for
+    /// each milestone's proportional share.
+    IncrementalCollateralBase(String),
+
+    // ── #517 Merge adjacent pending milestones ─────────────────────────────
+    /// Pending proposal to merge `first_index` and `first_index + 1`.
+    MilestoneMergeProposal(String),
+
+    // ── #478 Supplier tier change events ──────────────────────────────────
+    /// Last tier observed for a supplier (absent = Bronze); compared on each
+    /// evaluation so `supplier_tier_changed` fires only on an actual change.
+    SupplierLastTier(Address),
+
+    // ── #472 Shipment creation rate limit + exemption list ────────────────
+    /// Admin-configured per-supplier shipment creation rate limit:
+    /// (max_shipments, window_ledgers). Absent = no rate limit.
+    ShipmentCreationRateLimit,
+    /// Rolling-window creation usage for a supplier: (window_start, count).
+    ShipmentCreationUsage(Address),
+    /// Supplier exempted by the admin from the shipment creation rate limit.
+    RateLimitExempt(Address),
+
+    // ── #470 Arbiter repetition guard ─────────────────────────────────────
+    /// Number of recent pool-assigned arbiters remembered per supplier
+    /// (absent/0 = guard disabled).
+    ArbiterRepetitionHistorySize,
+    /// Most recent pool-assigned arbiters for a supplier's disputes, oldest first.
+    SupplierRecentArbiters(Address),
+
+    // ── #469 Minimum notice before a shipment pause request ───────────────
+    /// Minimum ledgers required between now and the next milestone deadline
+    /// for `request_shipment_pause` to be accepted (absent/0 = no minimum).
+    PauseMinNoticeLedgers,
+}
+
+/// #517 – Pending proposal to merge two adjacent Pending milestones.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct MilestoneMergeProposal {
+    pub first_index: u32,
+    pub proposer: Address,
 }
 
 /// Partial joint-confirmation progress for a high-value shipment's milestone (#367).
@@ -2461,13 +2517,41 @@ impl ChainSettleContract {
         let Some(config) = config else {
             return base_collateral;
         };
-        let tier = Self::get_supplier_tier_internal(env, supplier);
+        let tier = Self::evaluate_supplier_tier_change(env, supplier);
         let multiplier_bps = match tier {
             SupplierTier::Bronze => 10_000,
             SupplierTier::Silver => config.silver_multiplier_bps,
             SupplierTier::Gold => config.gold_multiplier_bps,
         };
         (base_collateral * multiplier_bps as i128) / 10_000
+    }
+
+    /// #478: Computes the supplier's current tier and, when it differs from the
+    /// last tier observed for them (absent = Bronze), records it and emits
+    /// `supplier_tier_changed` with (supplier, old_tier, new_tier). Only called
+    /// where the tier is already evaluated (shipment creation collateral
+    /// discount, reputation updates); a no-change evaluation emits nothing.
+    fn evaluate_supplier_tier_change(env: &Env, supplier: &Address) -> SupplierTier {
+        let new_tier = Self::get_supplier_tier_internal(env, supplier);
+        let key = DataKeyExt3::SupplierLastTier(supplier.clone());
+        let old_tier: SupplierTier = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(SupplierTier::Bronze);
+        if new_tier != old_tier {
+            env.storage().persistent().set(&key, &new_tier);
+            env.storage().persistent().extend_ttl(
+                &key,
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+            env.events().publish(
+                (Symbol::new(env, "supplier_tier_changed"), supplier.clone()),
+                (supplier.clone(), old_tier, new_tier),
+            );
+        }
+        new_tier
     }
 
     // ----------------------------------------------------------
@@ -4571,6 +4655,203 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
+    // #470: ARBITER REPETITION GUARD
+    // ----------------------------------------------------------
+
+    /// Admin sets how many recent pool-assigned arbiters are remembered per
+    /// supplier. Pool assignments for that supplier's disputes skip those
+    /// arbiters when the pool has alternatives. 0 (the default) disables the guard.
+    pub fn set_arbiter_history_size(env: Env, admin: Address, size: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKeyExt3::ArbiterRepetitionHistorySize, &size);
+        env.events().publish(
+            (Symbol::new(&env, "arbiter_repetition_size_set"),),
+            size,
+        );
+    }
+
+    /// Returns the configured per-supplier arbiter history size (0 = disabled).
+    pub fn get_arbiter_history_size(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt3::ArbiterRepetitionHistorySize)
+            .unwrap_or(0)
+    }
+
+    /// Recent pool-assigned arbiters for `supplier`'s disputes, oldest first.
+    pub fn get_supplier_recent_arbiters(env: Env, supplier: Address) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt3::SupplierRecentArbiters(supplier))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Admin assigns an N-member arbiter panel, drawn from the pool, to a
+    /// shipment with an open dispute on `milestone_index`. Arbiters in the
+    /// supplier's recent history are skipped when the pool allows it; otherwise
+    /// the least-recently-used ones are reused. The shipment's buyers and
+    /// supplier are never selected. Panel members then vote via
+    /// `cast_dispute_vote`.
+    pub fn assign_dispute_panel(
+        env: Env,
+        admin: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        panel_size: u32,
+    ) -> Vec<Address> {
+        Self::assert_not_paused(&env);
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if milestone_index >= shipment.milestones.len() {
+            panic!("invalid milestone index");
+        }
+        if shipment.milestones.get(milestone_index).unwrap().status != MilestoneStatus::Disputed {
+            panic!("milestone is not disputed");
+        }
+        if panel_size < 3 {
+            panic!("arbiter panel must have at least 3 members");
+        }
+        let votes: Vec<DisputeVote> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt::DisputeVotes(shipment_id.clone(), milestone_index))
+            .unwrap_or_else(|| Vec::new(&env));
+        if !votes.is_empty() {
+            panic!("panel voting has already started");
+        }
+
+        let mut exclude = shipment.buyers.clone();
+        exclude.push_back(shipment.supplier.clone());
+        let pool = Self::get_arbiter_pool(env.clone());
+        let picked = Self::select_pool_arbiters(
+            &env,
+            &shipment.supplier,
+            &pool,
+            0,
+            panel_size,
+            &exclude,
+        );
+        if picked.len() < panel_size {
+            panic!("not enough arbiters in pool for panel");
+        }
+        let mut panel: Vec<Address> = Vec::new(&env);
+        for i in 0..picked.len() {
+            panel.push_back(pool.get(picked.get(i).unwrap()).unwrap());
+        }
+
+        let panel_key = DataKeyExt::ArbiterPanel(shipment_id.clone());
+        env.storage().persistent().set(&panel_key, &panel);
+        env.storage().persistent().extend_ttl(
+            &panel_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        Self::record_supplier_arbiters(&env, &shipment.supplier, &panel);
+
+        env.events().publish(
+            (Symbol::new(&env, "dispute_panel_assigned"), shipment_id),
+            (milestone_index, panel.clone()),
+        );
+        panel
+    }
+
+    /// Picks up to `count` arbiters from `pool` (returned as pool indices),
+    /// walking the pool round-robin from `start` and never choosing anyone in
+    /// `exclude`. First pass skips arbiters in the supplier's recent history;
+    /// if that cannot fill `count`, the remaining slots fall back to recent
+    /// arbiters, least-recently-assigned first. With the guard disabled the
+    /// result is simply the first eligible arbiters in round-robin order.
+    fn select_pool_arbiters(
+        env: &Env,
+        supplier: &Address,
+        pool: &Vec<Address>,
+        start: u32,
+        count: u32,
+        exclude: &Vec<Address>,
+    ) -> Vec<u32> {
+        let mut picked: Vec<u32> = Vec::new(env);
+        let len = pool.len();
+        if len == 0 || count == 0 {
+            return picked;
+        }
+        let recent = if Self::get_arbiter_history_size(env.clone()) > 0 {
+            Self::get_supplier_recent_arbiters(env.clone(), supplier.clone())
+        } else {
+            Vec::new(env)
+        };
+
+        // Pass 1: eligible arbiters not in the supplier's recent history.
+        for step in 0..len {
+            if picked.len() >= count {
+                break;
+            }
+            let idx = (start + step) % len;
+            let candidate = pool.get(idx).unwrap();
+            if exclude.contains(&candidate) || recent.contains(&candidate) {
+                continue;
+            }
+            picked.push_back(idx);
+        }
+
+        // Pass 2 (fallback): pool too small — reuse recent arbiters, oldest first.
+        for r in 0..recent.len() {
+            if picked.len() >= count {
+                break;
+            }
+            let candidate = recent.get(r).unwrap();
+            if exclude.contains(&candidate) {
+                continue;
+            }
+            if let Some(idx) = pool.first_index_of(&candidate) {
+                if !picked.contains(&idx) {
+                    picked.push_back(idx);
+                }
+            }
+        }
+        picked
+    }
+
+    /// Appends newly assigned arbiters to the supplier's recent history (moving
+    /// any repeat to the most-recent end) and trims it to the configured size.
+    /// No-op while the guard is disabled.
+    fn record_supplier_arbiters(env: &Env, supplier: &Address, arbiters: &Vec<Address>) {
+        let size = Self::get_arbiter_history_size(env.clone());
+        if size == 0 {
+            return;
+        }
+        let key = DataKeyExt3::SupplierRecentArbiters(supplier.clone());
+        let mut recent: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        for i in 0..arbiters.len() {
+            let a = arbiters.get(i).unwrap();
+            if let Some(pos) = recent.first_index_of(&a) {
+                recent.remove(pos);
+            }
+            recent.push_back(a);
+        }
+        while recent.len() > size {
+            recent.pop_front();
+        }
+        env.storage().persistent().set(&key, &recent);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
+    // ----------------------------------------------------------
     // #372: ARBITER REPUTATION SLASHING
     // ----------------------------------------------------------
 
@@ -4975,6 +5256,10 @@ impl ChainSettleContract {
 
         // #398: Enforce the buyer's rolling-window spending limit, if configured.
         Self::check_and_record_buyer_spending(&env, &primary_buyer, total_amount);
+
+        // #472: Enforce the per-supplier creation rate limit (exempt suppliers skip
+        // only this check; all validation above still applies to them).
+        Self::check_and_record_shipment_creation(&env, &supplier);
 
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(
@@ -5473,6 +5758,130 @@ impl ChainSettleContract {
         env.storage()
             .persistent()
             .set(&usage_key, &(effective_start, used));
+        env.storage().persistent().extend_ttl(
+            &usage_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
+    // ----------------------------------------------------------
+    // #472 — SHIPMENT CREATION RATE LIMIT + EXEMPTION LIST
+    // ----------------------------------------------------------
+
+    /// Admin caps how many shipments may be created per supplier within a
+    /// rolling window of `window_ledgers`. `max_shipments == 0` clears the
+    /// limit (the default: no rate limit).
+    pub fn set_shipment_creation_rate_limit(
+        env: Env,
+        admin: Address,
+        max_shipments: u32,
+        window_ledgers: u32,
+    ) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        if max_shipments == 0 {
+            env.storage()
+                .instance()
+                .remove(&DataKeyExt3::ShipmentCreationRateLimit);
+        } else {
+            if window_ledgers == 0 {
+                panic!("window_ledgers must be greater than zero");
+            }
+            env.storage().instance().set(
+                &DataKeyExt3::ShipmentCreationRateLimit,
+                &(max_shipments, window_ledgers),
+            );
+        }
+        env.events().publish(
+            (Symbol::new(&env, "shipment_rate_limit_set"),),
+            (max_shipments, window_ledgers),
+        );
+    }
+
+    /// Returns the configured (max_shipments, window_ledgers), if any.
+    pub fn get_shipment_creation_rate_limit(env: Env) -> Option<(u32, u32)> {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt3::ShipmentCreationRateLimit)
+    }
+
+    /// Admin exempts `supplier` from the shipment creation rate limit. The
+    /// supplier remains subject to every other creation check.
+    pub fn add_rate_limit_exemption(env: Env, admin: Address, supplier: Address) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        let key = DataKeyExt3::RateLimitExempt(supplier.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "rate_limit_exemption_added"), supplier),
+            (),
+        );
+    }
+
+    /// Admin removes `supplier` from the rate-limit exemption list.
+    pub fn remove_rate_limit_exemption(env: Env, admin: Address, supplier: Address) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .remove(&DataKeyExt3::RateLimitExempt(supplier.clone()));
+        env.events().publish(
+            (Symbol::new(&env, "rate_limit_exemption_removed"), supplier),
+            (),
+        );
+    }
+
+    /// Whether `supplier` is on the rate-limit exemption list.
+    pub fn is_rate_limit_exempt(env: Env, supplier: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt3::RateLimitExempt(supplier))
+            .unwrap_or(false)
+    }
+
+    /// Checks the configured per-supplier creation rate limit and, if within
+    /// bounds, records this creation against the rolling window. No-op when no
+    /// limit is configured or the supplier is exempt.
+    fn check_and_record_shipment_creation(env: &Env, supplier: &Address) {
+        let cfg: Option<(u32, u32)> = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt3::ShipmentCreationRateLimit);
+        let Some((max_shipments, window)) = cfg else {
+            return;
+        };
+        if Self::is_rate_limit_exempt(env.clone(), supplier.clone()) {
+            return;
+        }
+
+        let usage_key = DataKeyExt3::ShipmentCreationUsage(supplier.clone());
+        let (window_start, mut count): (u32, u32) = env
+            .storage()
+            .persistent()
+            .get(&usage_key)
+            .unwrap_or((0, 0));
+        let current_ledger = env.ledger().sequence();
+
+        let mut effective_start = window_start;
+        if count == 0 || current_ledger >= window_start.saturating_add(window) {
+            count = 0;
+            effective_start = current_ledger;
+        }
+
+        if count >= max_shipments {
+            panic!("shipment creation rate limit exceeded");
+        }
+
+        count += 1;
+        env.storage()
+            .persistent()
+            .set(&usage_key, &(effective_start, count));
         env.storage().persistent().extend_ttl(
             &usage_key,
             constants::TTL_INITIAL_LEDGERS,
@@ -7516,10 +7925,28 @@ impl ChainSettleContract {
                 .storage()
                 .instance()
                 .get::<Symbol, u32>(&pool_idx_key)
-                .unwrap_or(0u32);
-            let next_idx = (idx + 1) % pool.len() as u32;
-            shipment.arbiter = pool.get(idx).unwrap();
+                .unwrap_or(0u32)
+                % pool.len();
+            // #470: Starting from the round-robin position, skip arbiters recently
+            // assigned to this supplier's disputes when the pool allows it.
+            let chosen_idx = Self::select_pool_arbiters(
+                &env,
+                &shipment.supplier,
+                &pool,
+                idx,
+                1,
+                &Vec::new(&env),
+            )
+            .get(0)
+            .unwrap_or(idx);
+            let next_idx = (chosen_idx + 1) % pool.len() as u32;
+            shipment.arbiter = pool.get(chosen_idx).unwrap();
             env.storage().instance().set(&pool_idx_key, &next_idx);
+            Self::record_supplier_arbiters(
+                &env,
+                &shipment.supplier,
+                &Vec::from_array(&env, [shipment.arbiter.clone()]),
+            );
             // Clear the per-shipment flag so subsequent disputes use the assigned arbiter.
             env.storage().persistent().remove(&pool_flag_key);
         }
@@ -8526,17 +8953,24 @@ impl ChainSettleContract {
 
         // Draw a distinct arbiter (not the one who issued the original resolution) from
         // the admin-managed pool.
+        // #470: Prefer an arbiter not recently assigned to this supplier's disputes.
         let pool = Self::get_arbiter_pool(env.clone());
-        let mut new_arbiter: Option<Address> = None;
-        for i in 0..pool.len() {
-            let candidate = pool.get(i).unwrap();
-            if candidate != shipment.arbiter {
-                new_arbiter = Some(candidate);
-                break;
-            }
-        }
-        let new_arbiter =
-            new_arbiter.unwrap_or_else(|| panic!("no distinct arbiter available for appeal"));
+        let new_arbiter = Self::select_pool_arbiters(
+            &env,
+            &shipment.supplier,
+            &pool,
+            0,
+            1,
+            &Vec::from_array(&env, [shipment.arbiter.clone()]),
+        )
+        .get(0)
+        .map(|idx| pool.get(idx).unwrap())
+        .unwrap_or_else(|| panic!("no distinct arbiter available for appeal"));
+        Self::record_supplier_arbiters(
+            &env,
+            &shipment.supplier,
+            &Vec::from_array(&env, [new_arbiter.clone()]),
+        );
 
         // #372: Record the original arbiter + outcome so the appeal's
         // resolve_dispute call can detect whether it overturns this decision.
@@ -11910,6 +12344,27 @@ impl ChainSettleContract {
     // PER-SHIPMENT MUTUAL-CONSENT PAUSE
     // ----------------------------------------------------------
 
+    /// #469: Admin sets the minimum notice (in ledgers) that must remain before
+    /// a shipment's next upcoming milestone deadline for `request_shipment_pause`
+    /// to be accepted. 0 (the default) disables the check.
+    pub fn set_pause_min_notice_ledgers(env: Env, admin: Address, ledgers: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKeyExt3::PauseMinNoticeLedgers, &ledgers);
+        env.events()
+            .publish((Symbol::new(&env, "pause_min_notice_set"),), ledgers);
+    }
+
+    /// Returns the configured minimum pause notice in ledgers (0 = no minimum).
+    pub fn get_pause_min_notice_ledgers(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt3::PauseMinNoticeLedgers)
+            .unwrap_or(0)
+    }
+
     /// Buyer or supplier requests a pause. No effect until the other party approves.
     pub fn request_shipment_pause(env: Env, caller: Address, shipment_id: String) {
         Self::assert_not_paused(&env);
@@ -11921,6 +12376,35 @@ impl ChainSettleContract {
         Self::assert_buyer_or_supplier(&shipment, &caller);
         if Self::is_shipment_paused_internal(&env, &shipment_id) {
             panic!("shipment is already paused");
+        }
+        // #469: Reject requests made too close to the next upcoming milestone
+        // deadline (a Pending milestone whose deadline has not yet passed).
+        let min_notice = Self::get_pause_min_notice_ledgers(env.clone());
+        if min_notice > 0 {
+            let now = env.ledger().sequence();
+            let mut next_deadline: Option<u32> = None;
+            for (i, m) in shipment.milestones.iter().enumerate() {
+                if m.status != MilestoneStatus::Pending {
+                    continue;
+                }
+                // Prefer the extension-adjusted deadline when one exists.
+                let deadline: u32 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKeyExt::MilestoneDeadline(shipment_id.clone(), i as u32))
+                    .unwrap_or(m.deadline_ledger);
+                if deadline > 0
+                    && deadline >= now
+                    && next_deadline.map_or(true, |d| deadline < d)
+                {
+                    next_deadline = Some(deadline);
+                }
+            }
+            if let Some(deadline) = next_deadline {
+                if deadline - now < min_notice {
+                    panic!("pause request within minimum notice period of next milestone deadline");
+                }
+            }
         }
         let req = ShipmentPauseRequest {
             requester: caller.clone(),
@@ -13030,6 +13514,8 @@ impl ChainSettleContract {
             constants::TTL_INITIAL_LEDGERS,
             constants::TTL_MAX_LEDGERS,
         );
+        // #478: A reputation update may move the supplier across a tier boundary.
+        Self::evaluate_supplier_tier_change(env, supplier);
     }
 
     fn increment_reputation_internal(
@@ -15709,6 +16195,11 @@ mod test_quality_grades;
 mod test_partial_quantity;
 mod test_retainage;
 mod test_warranty;
+mod test_supplier_tier_events;
+mod test_rate_limit_exemption;
+mod test_arbiter_repetition_guard;
+mod test_pause_notice;
+mod test_buyer_cap_collateral_merge;
 // Disabled: exercises milestone insurance holdback / oracle price-condition
 // APIs (see NEW_MILESTONE_FEATURES.md) that have not been implemented yet.
 // mod test_milestone_insurance_and_oracle;
