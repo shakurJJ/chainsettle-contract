@@ -253,6 +253,31 @@ Parameters:
 Returns: shipment_id (same as input, for confirmation)
 ```
 
+### Contract-Generated Unique Shipment IDs (#564)
+`create_shipment_auto_id(buyer, supplier, logistics, arbiter, token, total_amount, milestones, options) → String`
+Creates a shipment with an auto-incrementing contract counter instead of requiring a manual `shipment_id`. Returns the generated unique ID formatted as `"AUTO-1"`, `"AUTO-2"`, etc.
+
+### Alternate Collateral Token (#557)
+- `set_collateral_token(buyer, shipment_id, collateral_token)`
+- `get_collateral_token(shipment_id) → Address`
+
+Allows designating a distinct Stellar Asset Contract address for supplier collateral. When set, collateral locking, slashes, and refunds route through this token instead of defaulting to the escrow token.
+
+### Escrow Token Depeg Guard (#558)
+- `set_depeg_guard(admin, config)`
+- `remove_depeg_guard(admin)`
+- `get_depeg_guard() → Option<DepegGuardConfig>`
+- `is_token_depegged(oracle_address, feed_id, threshold_bps, base_price) → bool`
+
+Configures price oracle monitoring (e.g., Band/SEP-40 price feeds) for escrow tokens. `confirm_milestone` asserts the token is not depegged beyond `threshold_bps` from its base price. If depegged, releases are paused.
+
+### Global Cap on Total Escrowed Value (TVL Cap) (#559)
+- `set_tvl_cap(admin, token, cap)`
+- `get_tvl_cap(token) → i128`
+- `get_tvl(token) → i128`
+
+Enforces an admin-configured global TVL cap per token. `create_shipment` and `top_up_escrow` reject deposits exceeding the cap with `TvlCapExceeded`.
+
 Allowed token list
 The `token` parameter on `create_shipment` is checked against an admin-managed allowlist (`DataKey::AllowedTokens`). By default the list is empty, which means **open mode**: any Stellar Asset Contract (SAC) address is accepted. Once the admin adds at least one token, `create_shipment` only accepts tokens on that list — a non-listed token panics with `"token is not in the approved whitelist"`.
 Function Who Effect

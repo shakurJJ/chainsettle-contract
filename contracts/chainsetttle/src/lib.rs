@@ -499,6 +499,25 @@ pub struct InspectionRecord {
     pub signed_ledger: u32,
 }
 
+// ── #558 Price Oracle Client & Depeg Guard Config ────────────────────────────
+mod price_oracle {
+    use soroban_sdk::{contractclient, Address, Env};
+    #[contractclient(name = "PriceOracleClient")]
+    pub trait PriceOracle {
+        fn get_price(env: Env, asset: Address) -> i128;
+    }
+}
+pub use price_oracle::PriceOracleClient;
+
+/// #558 Escrow token depeg guard configuration.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct DepegGuardConfig {
+    pub oracle: Address,
+    pub min_price: i128,
+    pub max_price: i128,
+}
+
 /// #521 – Open warranty claim filed by the buyer after shipment completion.
 #[contracttype]
 #[derive(Clone, PartialEq, Debug)]
@@ -1580,6 +1599,54 @@ pub enum DataKeyExt4 {
     /// Total ledgers a shipment's expiry has already been extended by, so the
     /// admin ceiling applies cumulatively rather than per extension.
     TotalExpiryExtended(String),
+
+    // ── Restored missing variants ──────────────────────────────────────────
+    AppealFee,
+    AppealFeeDeposit(String, u32),
+    TotalVaulted(Address),
+    VaultBalance(Address, Address),
+    StandingOrder(u64),
+    NextStandingOrderId,
+    RefundRecipient(String),
+    IsConsortium(String),
+    CollateralSlashBpsPerMiss(String),
+    CollateralSlashedForMiss(String, u32),
+    ArbiterUnavailable(Address),
+    SkipBuyerAuth,
+    PendingAllowance,
+    FundFromVault(String),
+    MaxSummaryBatch,
+    SupplierEarned(Address, Address),
+    BuyerSpent(Address, Address),
+    DisputeHistory(Address),
+    RatingWindowLedgers,
+    ShipmentRated(String, Address),
+    CompletedAtLedger(String),
+    RatingAgg(Address),
+    PayoutAssignment(String),
+    LoserPaysArbiterFee(String),
+
+    // ── #557 Alternate collateral token ──────────────────────────────────────
+    CollateralToken(String),
+
+    // ── #558 Escrow token depeg guard ─────────────────────────────────────
+    DepegGuard(Address),
+
+    // ── #559 Global cap on total escrowed value ───────────────────────────
+    TvlCap(Address),
+
+    // ── #564 Contract-generated unique shipment IDs ───────────────────────
+    AutoIdCounter,
+}
+
+/// Invoice factoring: a supplier's receivable on a shipment assigned to a financier.
+/// While active, every supplier payout on the shipment is routed to `financier`.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct PayoutAssignment {
+    pub supplier: Address,
+    pub financier: Address,
+    pub assigned_at_ledger: u32,
 }
 
 /// #549 – Pending proposal to move a shipment's `expires_at_ledger` later.
@@ -1759,6 +1826,10 @@ pub enum ChainSettleError {
     AddressOutflowLimitExceeded = 17,
     /// No pending payout to claim (#284).
     NoPendingPayout = 18,
+    /// Escrow token is depegged (#558).
+    TokenDepegged = 19,
+    /// TVL cap for escrow token exceeded (#559).
+    TvlCapExceeded = 20,
 }
 
 // ============================================================
@@ -3264,9 +3335,15 @@ impl ChainSettleContract {
         env.storage().persistent().set(&total_key, &(total + amount));
     }
 
-    /// Refund escrow to the primary buyer — into the vault when the shipment
+    /// Refund specified token to the primary buyer — into the vault when the shipment
     /// was vault-funded, otherwise via a normal token transfer.
-    fn refund_to_buyer(env: &Env, shipment_id: &String, shipment: &Shipment, amount: i128) {
+    fn refund_token_to_buyer(
+        env: &Env,
+        shipment_id: &String,
+        shipment: &Shipment,
+        token: &Address,
+        amount: i128,
+    ) {
         if amount <= 0 {
             return;
         }
@@ -3283,11 +3360,17 @@ impl ChainSettleContract {
             .get(&DataKeyExt4::FundFromVault(shipment_id.clone()))
             .unwrap_or(false);
         if from_vault {
-            Self::credit_vault(env, &recipient, &shipment.token, amount);
+            Self::credit_vault(env, &recipient, token, amount);
         } else {
-            let token_client = token::Client::new(env, &shipment.token);
+            let token_client = token::Client::new(env, token);
             token_client.transfer(&env.current_contract_address(), &recipient, &amount);
         }
+    }
+
+    /// Refund escrow to the primary buyer — into the vault when the shipment
+    /// was vault-funded, otherwise via a normal token transfer.
+    fn refund_to_buyer(env: &Env, shipment_id: &String, shipment: &Shipment, amount: i128) {
+        Self::refund_token_to_buyer(env, shipment_id, shipment, &shipment.token, amount);
     }
 
     // ----------------------------------------------------------
@@ -4108,6 +4191,19 @@ impl ChainSettleContract {
             .persistent()
             .get(&DataKeyExt4::CollateralSlashBpsPerMiss(shipment_id))
             .unwrap_or(0)
+    }
+
+    /// Set the collateral slash bps for a shipment (buyer only).
+    pub fn set_collateral_slash_bps(env: Env, buyer: Address, shipment_id: String, bps: u32) {
+        buyer.require_auth();
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        Self::assert_is_buyer(&shipment, &buyer);
+        if bps > 10_000 {
+            panic!("bps cannot exceed 10000");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKeyExt4::CollateralSlashBpsPerMiss(shipment_id), &bps);
     }
 
     /// Whether (shipment_id, milestone_index) has already been slashed for a
@@ -6872,6 +6968,15 @@ impl ChainSettleContract {
             }
         }
 
+        // #559: Enforce TVL Cap
+        let tvl_cap = Self::get_tvl_cap(env.clone(), token.clone());
+        if tvl_cap > 0 {
+            let current_tvl = Self::get_tvl(env.clone(), token.clone());
+            if current_tvl + total_amount > tvl_cap {
+                panic!("tvl cap exceeded");
+            }
+        }
+
         // #410: Buyer-specific token allowlist, when configured, is an additional
         // restriction on top of the global allowlist. If a buyer has no configured
         // override, their behavior remains unchanged.
@@ -7141,10 +7246,16 @@ impl ChainSettleContract {
         // #397: Scale the requirement down per the supplier's reputation-derived tier.
         // New suppliers (no history) or Bronze suppliers pay the unmodified base amount.
         if supplier_collateral > 0 {
+            let col_token = env
+                .storage()
+                .persistent()
+                .get::<DataKeyExt4, Address>(&DataKeyExt4::CollateralToken(shipment_id.clone()))
+                .unwrap_or_else(|| token.clone());
             let effective_collateral =
                 Self::apply_tier_collateral_discount(&env, &supplier, supplier_collateral);
             if effective_collateral > 0 {
-                token_client.transfer(
+                let col_token_client = token::Client::new(&env, &col_token);
+                col_token_client.transfer(
                     &supplier,
                     &env.current_contract_address(),
                     &effective_collateral,
@@ -7582,6 +7693,15 @@ impl ChainSettleContract {
             }
         }
 
+        // #559: Enforce TVL Cap
+        let tvl_cap = Self::get_tvl_cap(env.clone(), shipment.token.clone());
+        if tvl_cap > 0 {
+            let current_tvl = Self::get_tvl(env.clone(), shipment.token.clone());
+            if current_tvl + additional_amount > tvl_cap {
+                panic!("tvl cap exceeded");
+            }
+        }
+
         // #398: Enforce the buyer's rolling-window spending limit, if configured.
         Self::check_and_record_buyer_spending(&env, &buyer, additional_amount);
 
@@ -7590,6 +7710,8 @@ impl ChainSettleContract {
 
         let new_total = shipment.total_amount + additional_amount;
         shipment.total_amount = new_total;
+
+        Self::increase_total_escrowed(&env, &shipment.token, additional_amount);
 
         env.storage()
             .persistent()
@@ -8958,6 +9080,7 @@ impl ChainSettleContract {
         // Batch read shipment and contract stats in a single context fetch.
         let ctx = Self::fetch_confirm_milestone_ctx(&env, &shipment_id);
         let mut shipment = ctx.shipment;
+        Self::assert_token_not_depegged(&env, &shipment.token);
 
         if shipment.status != ShipmentStatus::Active {
             panic!("shipment is not active");
@@ -14658,6 +14781,207 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
+    // #557 ALTERNATE COLLATERAL TOKEN
+    // ----------------------------------------------------------
+
+    /// Set a custom collateral token for a shipment.
+    pub fn set_collateral_token(
+        env: Env,
+        caller: Address,
+        shipment_id: String,
+        collateral_token: Address,
+    ) {
+        caller.require_auth();
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        Self::assert_is_buyer(&shipment, &caller);
+        env.storage()
+            .persistent()
+            .set(&DataKeyExt4::CollateralToken(shipment_id.clone()), &collateral_token);
+        env.events().publish(
+            (Symbol::new(&env, "collateral_token_set"), shipment_id),
+            collateral_token,
+        );
+    }
+
+    /// Read the collateral token address for a shipment (or shipment token if unset).
+    pub fn get_collateral_token(env: Env, shipment_id: String) -> Address {
+        if let Some(tok) = env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt4, Address>(&DataKeyExt4::CollateralToken(shipment_id.clone()))
+        {
+            return tok;
+        }
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        shipment.token
+    }
+
+    // ----------------------------------------------------------
+    // #558 ESCROW TOKEN DEPEG GUARD
+    // ----------------------------------------------------------
+
+    /// Configure an oracle price depeg guard for a given token.
+    pub fn set_depeg_guard(
+        env: Env,
+        admin: Address,
+        token: Address,
+        oracle: Address,
+        min_price: i128,
+        max_price: i128,
+    ) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        if min_price <= 0 || max_price < min_price {
+            panic!("invalid price bounds");
+        }
+        let config = DepegGuardConfig {
+            oracle,
+            min_price,
+            max_price,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKeyExt4::DepegGuard(token.clone()), &config);
+        env.events().publish(
+            (Symbol::new(&env, "depeg_guard_set"), token),
+            (min_price, max_price),
+        );
+    }
+
+    /// Remove the depeg guard for a token.
+    pub fn remove_depeg_guard(env: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .remove(&DataKeyExt4::DepegGuard(token.clone()));
+        env.events()
+            .publish((Symbol::new(&env, "depeg_guard_removed"), token), ());
+    }
+
+    /// Read the depeg guard config for a token.
+    pub fn get_depeg_guard(env: Env, token: Address) -> Option<DepegGuardConfig> {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt4::DepegGuard(token))
+    }
+
+    /// Check whether a token is depegged based on its configured oracle guard.
+    pub fn is_token_depegged(env: Env, token: Address) -> bool {
+        if let Some(config) = env
+            .storage()
+            .instance()
+            .get::<DataKeyExt4, DepegGuardConfig>(&DataKeyExt4::DepegGuard(token.clone()))
+        {
+            let oracle_client = PriceOracleClient::new(&env, &config.oracle);
+            let price = oracle_client.get_price(&token);
+            if price < config.min_price || price > config.max_price {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn assert_token_not_depegged(env: &Env, token: &Address) {
+        if Self::is_token_depegged(env.clone(), token.clone()) {
+            panic!("token is depegged");
+        }
+    }
+
+    // ----------------------------------------------------------
+    // #559 GLOBAL CAP ON TOTAL ESCROWED VALUE (TVL CAP)
+    // ----------------------------------------------------------
+
+    /// Admin sets total-value-locked cap for a token (0 = uncapped).
+    pub fn set_tvl_cap(env: Env, admin: Address, token: Address, cap: i128) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        if cap < 0 {
+            panic!("cap cannot be negative");
+        }
+        if cap == 0 {
+            env.storage()
+                .instance()
+                .remove(&DataKeyExt4::TvlCap(token.clone()));
+        } else {
+            env.storage()
+                .instance()
+                .set(&DataKeyExt4::TvlCap(token.clone()), &cap);
+        }
+        env.events()
+            .publish((Symbol::new(&env, "tvl_cap_set"), token), cap);
+    }
+
+    /// Read the TVL cap for a token (0 = uncapped).
+    pub fn get_tvl_cap(env: Env, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt4::TvlCap(token))
+            .unwrap_or(0)
+    }
+
+    /// Read the current total escrowed value (TVL) for a token.
+    pub fn get_tvl(env: Env, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalEscrowed(token))
+            .unwrap_or(0)
+    }
+
+    // ----------------------------------------------------------
+    // #564 CONTRACT-GENERATED UNIQUE SHIPMENT IDS
+    // ----------------------------------------------------------
+
+    /// Create a shipment with an auto-generated unique ID of the form "SHIP-1", "SHIP-2", etc.
+    pub fn create_shipment_auto_id(
+        env: Env,
+        buyers: Vec<Address>,
+        supplier: Address,
+        logistics: Address,
+        arbiter: Address,
+        token: Address,
+        total_amount: i128,
+        milestones: Vec<Milestone>,
+        options: ShipmentOptions,
+    ) -> String {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt4::AutoIdCounter)
+            .unwrap_or(0);
+        let next_count = count + 1;
+        env.storage()
+            .instance()
+            .set(&DataKeyExt4::AutoIdCounter, &next_count);
+
+        let auto_id = Self::format_auto_id(&env, next_count);
+        Self::create_shipment(
+            env,
+            auto_id.clone(),
+            buyers,
+            supplier,
+            logistics,
+            arbiter,
+            token,
+            total_amount,
+            milestones,
+            options,
+        );
+        auto_id
+    }
+
+    fn format_auto_id(env: &Env, num: u64) -> String {
+        let mut buf = [0u8; 32];
+        buf[0] = b'S';
+        buf[1] = b'H';
+        buf[2] = b'I';
+        buf[3] = b'P';
+        buf[4] = b'-';
+        let len = Self::append_u64_to_buf(&mut buf, 5, num);
+        String::from_bytes(env, &buf[..len])
+    }
+
+    // ----------------------------------------------------------
     // #580 BATCH CANCEL SHIPMENTS
     // ----------------------------------------------------------
 
@@ -15038,7 +15362,16 @@ impl ChainSettleContract {
                 votes,
                 (payment * fee_bps as i128) / 10_000,
             );
-            let buyer_refund = (payment - arbiter_fee_total).max(0);
+            // Loser-pays: the bond forfeited to the losing supplier covers the fee first.
+            let bond_forfeit = shipment.dispute_bond_amount.max(0);
+            let loser_cover = Self::loser_pays_cover(
+                env,
+                &shipment_id,
+                milestone_index,
+                arbiter_fee_total,
+                bond_forfeit,
+            );
+            let buyer_refund = (payment - (arbiter_fee_total - loser_cover)).max(0);
             if buyer_refund > 0 {
                 let primary_buyer = shipment.buyers.get(0).unwrap();
                 token_client.transfer(
@@ -20862,6 +21195,10 @@ mod test_feat_issues;
 mod test_feat_issues_551_553_554_556;
 mod test_feat_earnings;
 mod test_slash_collateral;
+mod test_collateral_token;
+mod test_depeg_guard;
+mod test_tvl_cap;
+mod test_auto_shipment_id;
 // Disabled: exercises milestone insurance holdback / oracle price-condition
 // APIs (see NEW_MILESTONE_FEATURES.md) that have not been implemented yet.
 // mod test_milestone_insurance_and_oracle;
