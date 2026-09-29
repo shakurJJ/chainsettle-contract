@@ -2585,3 +2585,51 @@ Function | Who | Behaviour
 `get_supplier_tier(supplier) → SupplierTier` | Anyone (read-only) | The supplier's tier, computed from their current reputation.
 
 **Tier-change events (#478).** Whenever a supplier's reputation is updated, or their tier collateral discount is calculated at shipment creation, the tier is recomputed and compared with the last recorded tier (Bronze if none was recorded). If it has changed, the new tier is stored and `supplier_tier_changed` `(supplier, old_tier, new_tier)` is emitted. Calling `get_supplier_tier` never emits events and never updates the stored tier.
+
+### Co-Buyer Joint Confirmation (#486)
+
+High-value shipments can require both the primary buyer and a designated co-buyer to confirm a milestone before funds are released. This dual-control flow prevents unilateral releases on large transactions.
+
+`set_co_buyer(caller, shipment_id, co_buyer)` — The shipment's primary buyer designates a co-buyer for the given shipment. The co-buyer address is stored against the shipment and must also call `confirm_milestone` for any milestone to be eligible for release. Panics if the caller is not the shipment's primary buyer, or if the shipment does not exist.
+
+`get_co_buyer(shipment_id) → Option<Address>` — Returns the co-buyer address if one has been set, or `None` if no co-buyer is configured for that shipment.
+
+`get_joint_confirmation_status(shipment_id, milestone_index) → (bool, bool)` — Returns a tuple `(buyer_confirmed, co_buyer_confirmed)` indicating whether each party has confirmed the given milestone. Both must be `true` before funds release proceeds.
+
+`set_joint_confirmation_threshold(admin, threshold_amount)` — Admin-only. Shipments with a `total_amount` at or above this threshold automatically require joint confirmation for every milestone, even if no co-buyer was explicitly set via `set_co_buyer`. Set to `0` to disable automatic threshold enforcement.
+
+`get_joint_confirmation_threshold() → u128` — Returns the current joint-confirmation threshold. `0` means the threshold is disabled.
+
+### Compliance Hold (#487)
+
+Admins can freeze a single shipment pending an off-chain legal or compliance review. A shipment on hold cannot have milestones confirmed, funds released, or disputes opened until the hold is cleared.
+
+`set_compliance_hold(admin, shipment_id, reason_hash)` — Places the shipment on compliance hold. `reason_hash` is a 32-byte hash of the off-chain reason document, stored on-chain for auditability. Panics if the caller is not an admin or the shipment does not exist. Emits `compliance_hold_set` `(admin, shipment_id, reason_hash)`.
+
+`clear_compliance_hold(admin, shipment_id)` — Lifts the compliance hold, allowing the shipment to resume normal operation. Panics if the caller is not an admin or no hold exists for the shipment. Emits `compliance_hold_cleared` `(admin, shipment_id)`.
+
+`is_on_compliance_hold(shipment_id) → bool` — Returns `true` if the shipment is currently on compliance hold, `false` otherwise.
+
+### Dispute Appeals (#488)
+
+Either party can appeal a resolved dispute to a second arbiter within an admin-configured ledger window. The appeal mechanism provides a check against erroneous or biased arbiter decisions.
+
+`appeal_dispute(caller, shipment_id, milestone_index)` — Opens an appeal for a previously resolved dispute on the given milestone. The caller must be either the buyer or the supplier of the shipment. Panics if no resolved dispute exists for that milestone, if the appeal window has closed, or if an appeal is already pending. Emits `dispute_appealed` `(caller, shipment_id, milestone_index)`.
+
+`set_appeal_window_ledgers(admin, ledgers)` — Admin-only. Sets the number of ledger sequences after a dispute resolution during which an appeal may be filed. Panics if `ledgers` is zero. Emits `appeal_window_set` `(ledgers)`.
+
+`get_appeal_window_ledgers() → u32` — Returns the current appeal window in ledger sequences.
+
+`get_dispute_resolution_reason(shipment_id, milestone_index) → Option<String>` — Returns the arbiter's recorded resolution reason for the most recent dispute on the milestone, or `None` if no reason was provided or no dispute exists.
+
+### Arbiter Slashing and Reinstatement (#489)
+
+Arbiters whose resolutions are repeatedly overturned on appeal are automatically slashed — removed from the active arbiter pool. Admins can reinstate a slashed arbiter once the underlying issue is resolved.
+
+`set_max_overturned_before_slash(admin, threshold)` — Admin-only. Sets the maximum number of appeal overturn events an arbiter may accumulate before being slashed. Panics if `threshold` is zero. Emits `max_overturned_set` `(threshold)`.
+
+`get_max_overturned_before_slash() → u32` — Returns the current slash threshold.
+
+`is_arbiter_slashed(arbiter) → bool` — Returns `true` if the arbiter has been slashed and is no longer eligible to be assigned to new shipments.
+
+`reinstate_arbiter(admin, arbiter)` — Admin-only. Clears the slashed flag for the arbiter and resets their overturn counter to zero, allowing them to be assigned to shipments again. Panics if the caller is not an admin or the arbiter is not currently slashed. Emits `arbiter_reinstated` `(admin, arbiter)`.
