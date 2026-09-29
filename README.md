@@ -21,12 +21,16 @@ Invoice hash
 rebalance_milestones
 Milestone Payee Splits
 Partial Disputes & Escalation Checks
+Blacklist Appeal Process
+Supplier Cancel Cooldown
 
 Milestone Completion Percentage
 
+Resolution Finality Delay
 Dispute Evidence Submission
 
 Advance Payment Lifecycle
+Milestone Notes
 Milestone Amendment History Tracking
 Supplier Payout Batching
 Admin Succession & Emergency Recovery
@@ -256,6 +260,39 @@ Function Who Effect
 `remove_allowed_token(token)` Admin only Revokes approval; existing shipments that already use the token are unaffected
 `get_allowed_tokens() → Vec<Address>` Anyone (read-only) Returns the current allowlist (empty = open mode)
 The allowlist gates shipment creation only. After a shipment is created, all payouts (`confirm_milestone`, dispute resolution, cancellation refunds, etc.) always use the token address stored on that shipment — they never re-check the allowlist.
+
+### Allowed-Token List Cap and Buyer Token Allowlist (#387, #388)
+
+Two complementary features let admins further tighten which tokens buyers can use.
+
+**Allowed-token list cap** — an admin can set an upper bound on how many entries the global allowlist may grow to. This guards against accidental unbounded growth when tokens are added programmatically.
+
+| Function | Who | Behaviour |
+| --- | --- | --- |
+| `set_max_allowed_tokens(admin, max_allowed)` | Admin | Stores `max_allowed` (a `u32`) in instance storage and emits `max_allowed_tokens_set`. Pass `0` to remove the cap (no limit, the default). |
+| `get_max_allowed_tokens() → u32` | Anyone (read-only) | Returns the current cap, or `0` when no cap is set. |
+
+Important: **lowering the cap does not invalidate the existing list**. The cap is only enforced at the point where `add_allowed_token` is called. If the list already has more entries than a newly lowered cap, existing entries remain valid.
+
+**Buyer-specific token allowlist** — an admin can restrict an individual buyer to a subset of the global allowlist. When a buyer-specific list is set, `create_shipment` rejects any token that is not in that list, even if the token is in the global allowlist.
+
+| Function | Who | Behaviour |
+| --- | --- | --- |
+| `set_buyer_allowed_tokens(admin, buyer, tokens)` | Admin | Stores the buyer's permitted token list in persistent storage and emits `buyer_allowed_tokens_set`. Every address in `tokens` must already be in the global allowlist (if the global list is non-empty) — a non-listed token panics with `"token is not in the approved whitelist"`. Pass an empty `Vec` to clear the restriction. |
+| `get_buyer_allowed_tokens(buyer) → Vec<Address>` | Anyone (read-only) | Returns the buyer's restricted list, or an empty list when no override is set. |
+
+**Fallback rule:** an empty buyer list means _no restriction beyond the global allowlist_ — the buyer may use any globally-allowed token. A non-empty buyer list is a strict subset: the buyer may only use tokens that appear in both the global list and their own list.
+
+Example — restrict buyer `GBUYER…` to USDC only:
+
+```bash
+stellar contract invoke --id $CONTRACT_ID -- \
+  set_buyer_allowed_tokens \
+  --admin $ADMIN_ADDRESS \
+  --buyer GBUYER_ADDRESS \
+  --tokens '["USDC_SAC_ADDRESS"]'
+```
+
 `submit_proof(caller, shipment_id, milestone_index, proof_hash, proof_type)`
 Supplier or logistics submits proof for a milestone (`proof_hash` is the payload reference, e.g. an IPFS CID; `proof_type` is a short symbol naming the content scheme, e.g. `ipfs`, `sha256`, or `url`).
 Milestone must be in `Pending` status. Moves status to `ProofSubmitted`.
@@ -841,6 +878,24 @@ milestone, or `0` when no deadline has been set.
 Extension request, approval, and denial calls are paused by the emergency
 circuit breaker; `get_milestone_deadline` remains available while paused.
 
+Mutual Shipment Expiry Extension
+Buyer and supplier can jointly extend a shipment's `expires_at_ledger` when legitimate delays occur. The flow requires mutual consent: one party proposes a new expiry ledger, and the other party must approve it before the change takes effect.
+`set_max_expiry_extension_ledgers(admin, ledgers)` — admin only. Sets the maximum total number of ledgers a shipment's expiry may be extended by across all approved extensions. `0` (the default) means unlimited. Emits `max_expiry_ext_set`.
+`get_max_expiry_extension_ledgers() → u32` (read-only) — returns the configured ceiling.
+`propose_expiry_extension(caller, shipment_id, new_expiry_ledger)` — buyer or supplier. Proposes moving the shipment's expiry to `new_expiry_ledger`. The shipment must be `Active`, have an existing expiry, not be expired yet, and the new expiry must be later than the current one. The proposal is stored and emits `expiry_extension_proposed`.
+`approve_expiry_extension(counterparty, shipment_id)` — the other party. Approves the pending proposal, moves `expires_at_ledger` to the requested ledger, records the cumulative extension against the admin ceiling, clears the proposal, and emits `expiry_extended` with the old and new expiry ledgers. Re-validates all preconditions (shipment still active, not expired, cumulative extension within ceiling, proposal not stale).
+`get_pending_expiry_extension(shipment_id) → Option<ExpiryExtensionProposal>` (read-only) — returns the pending proposal with proposer, requested expiry, and base expiry.
+`get_total_expiry_extended(shipment_id) → u32` (read-only) — returns the cumulative ledgers the shipment's expiry has been extended by so far.
+Rules:
+- Only the buyer or supplier may propose; the counterparty must approve (a party cannot approve its own proposal).
+- The shipment must have an `expires_at_ledger` set at creation; shipments without expiry cannot use this feature.
+- An expired shipment cannot be extended (checked against current ledger at both propose and approve time).
+- Extensions are cumulative: the admin ceiling applies to the sum of all deltas across the shipment's lifetime.
+- A cancelled or completed shipment cannot be extended.
+- A paused contract or paused shipment blocks proposal and approval calls.
+- Events: `expiry_extension_proposed(proposer, current_expiry, new_expiry)` and `expiry_extended(old_expiry, new_expiry, approver)`.
+- Audit log: `expiry_ext_proposed` on proposal, `expiry_extended` on approval.
+
 Milestone Amendment History Tracking
 Buyer and supplier can mutually agree to change a **Pending** milestone's payment percentage and/or name after a shipment is created — for example, to fix a typo in the milestone name or rebalance value between milestones before any proof is submitted. Changes only take effect once **both parties agree on the exact same terms**.
 
@@ -957,6 +1012,10 @@ remaining)`.
   supplier at completion, or to the buyer (or treasury) on cancellation or
   expiry, as before.
 - **Turned off (the default)**, nothing changes.
+- **Missing a deadline costs the supplier.** See
+  [Collateral Slashing on a Missed Milestone Deadline](#collateral-slashing-on-a-missed-milestone-deadline)
+  for forfeiting a configured share of the remaining collateral to the buyer.
+
 Emergency pause (circuit breaker)
 Admin-only kill switch that halts state-changing calls across every
 shipment without touching any stored data. Locked funds stay in escrow
@@ -1224,6 +1283,42 @@ cap is checked first (`"DisputeAlreadyOpen"`), then the buyer's cap
 
 ---
 
+### Resolution Finality Delay
+
+When a dispute is resolved in the supplier's favour (e.g. by an arbiter approving the evidence), the funds can be delayed before they are transferred. This finality delay provides a grace period for the buyer to catch and act on an arbiter error before the funds leave escrow.
+
+Function | Who | Behaviour
+--- | --- | ---
+`set_finality_delay_ledgers(admin, ledgers)` | Admin only | Sets the global delay in ledgers that must pass before a dispute resolved in favour of the supplier actually releases funds. Setting this to `0` (the default) disables the delay, meaning funds are released immediately upon resolution.
+`get_finality_delay_ledgers() → u32` | Anyone (read-only) | Returns the configured delay in ledgers.
+`finalize_dispute_resolution(shipment_id, milestone_index)` | Anyone (permissionless) | Actually pays out a dispute that was ruled in the supplier's favour. Can only be called once the finality delay has elapsed.
+
+**What the buyer should do during the delay:**
+If the buyer spots an arbiter error or disagreement during the delay window, they should call `appeal_dispute` to reopen the milestone before the delay expires. Once a milestone is reopened as `Disputed` through an appeal, `finalize_dispute_resolution` will fail. 
+
+**Usage Example:**
+
+```bash
+# Admin configures a delay of 500 ledgers
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source admin-account \
+  --network testnet \
+  -- set_finality_delay_ledgers \
+  --admin <ADMIN_ADDRESS> \
+  --ledgers 500
+
+# Anyone finalizes the payout once the delay has elapsed
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- finalize_dispute_resolution \
+  --shipment_id "SHIP-2026-001" \
+  --milestone_index 0
+```
+
+---
+
 Dispute Evidence Submission
 Once a milestone is `Disputed`, the parties involved can attach supporting
 evidence on-chain, and — for shipments created with an arbiter panel — panel
@@ -1416,6 +1511,51 @@ address from the blacklist only removes that denial; the supplier must still
 be on a non-empty whitelist to be eligible. Neither control changes an
 already-created shipment.
 
+### Blacklist Appeal Process
+
+When an address is blacklisted, they can file an appeal for admin review to be removed from the blacklist. This provides a transparent resolution mechanism if a party believes they were mistakenly blocked.
+
+Only a currently blacklisted address may file an appeal, and only one open appeal is allowed per address at any given time.
+
+Function | Who | Behaviour
+--- | --- | ---
+`appeal_blacklist(address, evidence_hash)` | Blacklisted Address | Files an appeal against an active blacklist status. The `evidence_hash` should be an IPFS CID or similar off-chain link supporting the appeal.
+`get_blacklist_appeal(address) → Option<BlacklistAppeal>` | Anyone (read-only) | Returns the current appeal for the address, if one exists.
+`review_blacklist_appeal(admin, address, approve: bool)` | Admin only | Admin reviews the pending appeal. If `approve` is `true`, the address is removed from the blacklist and the appeal status becomes `Approved`. If `false`, the address remains blacklisted and the appeal status becomes `Rejected`. Either way, the appeal is permanently decided.
+
+**BlacklistAppeal Struct**
+
+```rust
+pub struct BlacklistAppeal {
+    pub evidence_hash: String,            // IPFS CID or other off-chain evidence pointer
+    pub status: BlacklistAppealStatus,    // Pending | Approved | Rejected
+    pub filed_ledger: u32,                // Ledger sequence at which the appeal was filed
+}
+```
+
+**Usage Example:**
+
+```bash
+# File an appeal providing evidence
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source blacklisted-account \
+  --network testnet \
+  -- appeal_blacklist \
+  --address <BLACKLISTED_ADDRESS> \
+  --evidence_hash "ipfs://bafybeihd..."
+
+# Admin reviews and approves the appeal
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source admin-account \
+  --network testnet \
+  -- review_blacklist_appeal \
+  --admin <ADMIN_ADDRESS> \
+  --address <BLACKLISTED_ADDRESS> \
+  --approve true
+```
+
 ### Reputation-Triggered Auto-Blacklisting
 
 In addition to manual blacklisting (`blacklist_address()`), the contract supports automatic blacklisting based on a supplier's reputation counters. 
@@ -1488,6 +1628,50 @@ stellar contract invoke \
   --id <CONTRACT_ID> \
   --network testnet \
   -- get_supplier_exposure \
+  --supplier <SUPPLIER_ADDRESS>
+```
+
+### Supplier Cancel Cooldown
+
+Admins can rate-limit how often a specific supplier can cancel shipments. This prevents abuse or spamming of the `supplier_cancel` function by setting a cap on cancellations within a rolling time window.
+
+Function | Who | Behaviour
+--- | --- | ---
+`set_supplier_cancel_cooldown(admin, supplier, max_cancellations, window_ledgers, cooldown_ledgers)` | Admin only | Sets the cancel limit for a specific supplier.
+`get_supplier_cancel_cooldown(supplier) → Option<(u32, u32, u32)>` | Anyone (read-only) | Returns the configured limit for the supplier as `(max_cancellations, window_ledgers, cooldown_ledgers)`. Returns `None` if no limit is configured.
+
+**Configuration Parameters:**
+- `max_cancellations`: The maximum number of times the supplier can cancel shipments before triggering the cooldown. Setting this to `0` clears and disables the limit for the supplier. By default, suppliers have no limit configured.
+- `window_ledgers`: The rolling time window (in ledgers) over which cancellations are counted.
+- `cooldown_ledgers`: The duration (in ledgers) the supplier is blocked from cancelling further shipments once they hit the cap.
+
+**Timeline Example:**
+Assume an admin configures a supplier with `max_cancellations` = 2, `window_ledgers` = 1000, `cooldown_ledgers` = 5000.
+1. **Ledger 100**: Supplier cancels shipment A. (Count: 1)
+2. **Ledger 500**: Supplier cancels shipment B. (Count: 2 - Cap hit!)
+3. **Ledger 600**: Supplier attempts to cancel shipment C. **Blocked!** (cooldown is active until Ledger 5500, which is `500 + 5000`).
+4. **Ledger 5501**: Cooldown expires. The supplier can cancel shipments again.
+
+**Usage Example:**
+
+```bash
+# Configure cooldown for a supplier (max 3 cancels per 10,000 ledgers, 50,000 ledger cooldown)
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source admin-account \
+  --network testnet \
+  -- set_supplier_cancel_cooldown \
+  --admin <ADMIN_ADDRESS> \
+  --supplier <SUPPLIER_ADDRESS> \
+  --max_cancellations 3 \
+  --window_ledgers 10000 \
+  --cooldown_ledgers 50000
+
+# Query the supplier's configuration
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_supplier_cancel_cooldown \
   --supplier <SUPPLIER_ADDRESS>
 ```
 
@@ -2324,6 +2508,46 @@ The contract allows updating the active buyer or supplier on a shipment using `t
   - `BuyerTransferred(shipment_id, old_buyer, new_buyer)`
   - `SupplierTransferred(shipment_id, old_supplier, new_supplier)`
 
+### Shipment Custom Metadata Key-Value Store (#394)
+
+Buyers and suppliers can attach small, structured key/value pairs to a shipment — such as a PO number, cost centre, or internal reference code — beyond the single IPFS `metadata_hash` captured at creation time.
+
+**Who may write:** the shipment's buyer or supplier (either may set or overwrite any key). Admins, logistics providers, and strangers are not permitted.
+
+**Key/value constraints:** keys are Soroban `Symbol` values (up to 32 alphanumeric/underscore characters, case-sensitive). Values are plain `String`s. There is no hard limit on the number of distinct keys per shipment, but each key/value pair consumes persistent storage that is subject to the contract's TTL policy (`TTL_INITIAL_LEDGERS` / `TTL_MAX_LEDGERS`). The TTL is refreshed on every write.
+
+**Difference from `metadata_hash`:** the IPFS `metadata_hash` is set once at creation and is immutable. The custom metadata store allows arbitrary key/value pairs that either party can add or update at any time while the shipment is active.
+
+| Function | Who | Behaviour |
+| --- | --- | --- |
+| `set_shipment_metadata(caller, shipment_id, key, value)` | Buyer or Supplier | Stores (or overwrites) `value` under `key` for the shipment. Emits `shipment_metadata_set` with `(caller, key, value)`. If `key` is new, it is also appended to an internal keys index. |
+| `get_shipment_metadata(shipment_id, key) → Option<String>` | Anyone (read-only) | Returns the value for `key`, or `None` if that key was never set. |
+| `get_shipment_metadata_keys(shipment_id) → Vec<Symbol>` | Anyone (read-only) | Returns all keys that have ever been set on the shipment (keys are never removed from the index, even if a value is overwritten). |
+
+Example — buyer attaches a PO number and a cost centre:
+
+```bash
+stellar contract invoke --id $CONTRACT_ID -- \
+  set_shipment_metadata \
+  --caller $BUYER_ADDRESS \
+  --shipment_id "SHP-001" \
+  --key po_number \
+  --value "PO-2024-7890"
+
+stellar contract invoke --id $CONTRACT_ID -- \
+  set_shipment_metadata \
+  --caller $BUYER_ADDRESS \
+  --shipment_id "SHP-001" \
+  --key cost_centre \
+  --value "CC-APAC-42"
+
+# Read back all keys
+stellar contract invoke --id $CONTRACT_ID -- \
+  get_shipment_metadata_keys \
+  --shipment_id "SHP-001"
+# → ["po_number", "cost_centre"]
+```
+
 ### Settlement Options: Quality Grades, Partial Quantities, Retainage & Warranty
 
 Four optional `ShipmentOptions` fields change how milestone money is settled. Each defaults to off (empty `Vec` or `0`), so existing shipments behave exactly as before. The values are validated in `create_shipment` and stored under their own storage keys.
@@ -2378,6 +2602,46 @@ Function | Who | Behaviour
 `get_warranty_balance` / `get_warranty_end_ledger` / `get_warranty_claim` | Anyone (read-only) | Holdback in escrow, the ledger the period ends (`0` = not started), and the open claim.
 
 Events: `warranty_started`, `warranty_claim_filed`, `warranty_claim_resolved`, `warranty_released`. Each has a matching audit-log entry. A shipment cannot be archived while a warranty holdback is still in escrow. Cancelling before completion refunds any withheld warranty to the buyer.
+
+### Per-Token Minimum and Maximum Shipment Value (#362)
+
+Admins can override the global `min_shipment_value` / `max_shipment_value` bounds on a per-token basis. This allows different value floors and ceilings for high-value tokens (e.g. BTC-backed assets) and low-denomination stablecoins without changing the contract-wide defaults.
+
+**Fallback order:** when `create_shipment` validates a shipment's `total_amount`, it checks for a per-token override first. If no override is set for that token (`get_*` returns `None`), the global bound applies.
+
+| Function | Who | Behaviour |
+| --- | --- | --- |
+| `set_token_min_shipment_value(admin, token, min_amount)` | Admin | Stores a per-token minimum in instance storage and emits `token_min_shipment_value_set`. `min_amount` must be ≥ 0; negative values panic with `InvalidAmount`. |
+| `get_token_min_shipment_value(token) → Option<i128>` | Anyone (read-only) | Returns the per-token minimum override, or `None` when no override is set (token falls back to the global minimum). |
+| `clear_token_min_shipment_value(admin, token)` | Admin | Removes the per-token override so the token reverts to the global minimum. Emits `token_min_shipment_value_cleared`. |
+| `set_token_max_shipment_value(admin, token, max_value)` | Admin | Stores a per-token maximum in instance storage and emits `token_max_shipment_value_set`. `max_value` must be ≥ 0. |
+| `get_token_max_shipment_value(token) → Option<i128>` | Anyone (read-only) | Returns the per-token maximum override, or `None` when no override is set (token falls back to the global maximum). |
+| `clear_token_max_shipment_value(admin, token)` | Admin | Removes the per-token override so the token reverts to the global maximum. Emits `token_max_shipment_value_cleared`. |
+
+**Comparison — global vs. per-token settings:**
+
+| Setting | Scope | Default when unset |
+| --- | --- | --- |
+| `set_min_shipment_value` / `get_min_shipment_value` | All tokens | `0` (no minimum) |
+| `set_max_shipment_value` / `get_max_shipment_value` | All tokens | `0` (no maximum) |
+| `set_token_min_shipment_value` / `get_token_min_shipment_value` | One specific token | Falls back to global minimum |
+| `set_token_max_shipment_value` / `get_token_max_shipment_value` | One specific token | Falls back to global maximum |
+
+Example — set a minimum of 1 000 000 stroops for the EURC token and no maximum:
+
+```bash
+stellar contract invoke --id $CONTRACT_ID -- \
+  set_token_min_shipment_value \
+  --admin $ADMIN_ADDRESS \
+  --token $EURC_SAC_ADDRESS \
+  --min_amount 1000000
+
+# Remove the override later to fall back to the global minimum
+stellar contract invoke --id $CONTRACT_ID -- \
+  clear_token_min_shipment_value \
+  --admin $ADMIN_ADDRESS \
+  --token $EURC_SAC_ADDRESS
+```
 
 ### Tier-based Maximum Shipment Value (#560)
 
@@ -2515,121 +2779,239 @@ Function | Who | Behaviour
 `rate_counterparty(caller, shipment_id, stars, comment_hash)` | Buyer or supplier | One rating per party per shipment. Emits `counterparty_rated` and writes an audit entry.
 `get_rating_summary(address)` | Anyone (read-only) | `(count, average_x100)`. `(0, 0)` if never rated.
 
+### Collateral Slashing on a Missed Milestone Deadline
 
-### Emergency Freeze / Unfreeze Governance (#402)
+Supplier collateral normally only protects against abandonment — it all goes to
+the supplier on completion, or to the buyer on cancellation. A shipment can
+also give it teeth for timeliness: when a milestone's deadline passes with no
+proof submitted, a configured share of the supplier's *remaining* collateral is
+forfeited to the buyer.
 
-The emergency freeze is a stricter kill switch than `pause()`/`unpause()`, and it is stored separately. While it is active, every call guarded by the pause check panics with `contract is under emergency freeze`. Calling `unpause()` does **not** lift it.
+Set the rate at creation with `ShipmentOptions.collateral_slash_bps_per_miss`
+(basis points). `0` is the default and leaves behaviour completely unchanged.
+Because the slash is funded entirely by the collateral, a non-zero rate
+requires `ShipmentOptions.supplier_collateral > 0`, and a rate above `10_000`
+is rejected.
 
-How a freeze is activated or lifted depends on whether multisig admin governance (`initialize_multisig_admin`, #166) is configured:
-
-- **No multisig configured:** a single admin's `propose_emergency_freeze` / `propose_emergency_unfreeze` takes effect immediately and returns `0`.
-- **Multisig configured:** a registered admin opens a proposal and the proposer's approval counts as the first vote. The action executes automatically when the number of distinct approvals reaches the **supermajority** of registered admins. This bar is higher than the routine `MultiAdminConfig.threshold`. Required approvals = `ceil(admins × bps / 10000)`, with a minimum of 1. With the default 8000 bps (80%) and 5 admins, 4 approvals are needed.
-
-Function | Who | Behaviour
---- | --- | ---
-`set_freeze_supermajority_bps(admin, bps)` | Admin | Sets the supermajority. `bps` must be in `(0, 10000]`. Emits `freeze_supermajority_bps_set`.
-`get_freeze_supermajority_bps()` | Anyone (read-only) | Configured value, default `8000`.
-`is_emergency_frozen()` | Anyone (read-only) | `true` while the freeze is active.
-`propose_emergency_freeze(admin) → u64` | Admin / multisig admin | Opens a freeze proposal and returns its id. If one approval already meets the supermajority, the freeze activates immediately. Emits `emergency_freeze_proposed`.
-`approve_emergency_freeze(admin, proposal_id)` | Multisig admin | Adds an approval. Panics on a duplicate approval or an unknown or already-executed proposal. Emits `emergency_freeze_approved` `(admin, approvals_count)`.
-`propose_emergency_unfreeze(admin) → u64` | Admin / multisig admin | Same flow as freezing, for lifting the freeze. Emits `emergency_unfreeze_proposed`.
-`approve_emergency_unfreeze(admin, proposal_id)` | Multisig admin | Same rules as `approve_emergency_freeze`. Emits `emergency_unfreeze_approved`.
-`get_emergency_freeze_proposal(id)` / `get_emergency_unfreeze_proposal(id)` | Anyone (read-only) | The pending `EmergencyFreezeProposal { approvals }`, or `None` once it has executed or if it never existed.
-
-When the threshold is met, the proposal is deleted and `emergency_freeze_activated` or `emergency_freeze_lifted` is emitted. Freeze and unfreeze proposals share one id counter, so ids are unique across both kinds.
-
-```bash
-# 5 registered multisig admins, default 80% → 4 approvals required
-stellar contract invoke --id $CONTRACT_ID --source admin1 --network testnet \
-  -- propose_emergency_freeze --admin $ADMIN1          # → 1 (1/4 approvals)
-
-stellar contract invoke --id $CONTRACT_ID --source admin2 --network testnet \
-  -- approve_emergency_freeze --admin $ADMIN2 --proposal_id 1   # 2/4
-# ... admin3 and admin4 approve → freeze activates
-
-stellar contract invoke --id $CONTRACT_ID --network testnet -- is_emergency_frozen   # → true
-```
-
-### Milestone Templates (#365)
-
-Buyers can save a named milestone set once and reuse it for new shipments. Templates are namespaced by creator address, so two creators can use the same name without colliding.
+| Option | Type | Validation / default |
+| --- | --- | --- |
+| `collateral_slash_bps_per_miss` | `u32` | `0` = disabled. `≤ 10000`, and non-zero requires `supplier_collateral > 0` |
 
 Function | Who | Behaviour
 --- | --- | ---
-`save_milestone_template(creator, name, milestones)` | Creator | Validates the milestones the same way `create_shipment` does: not empty (`EmptyMilestoneTemplate`), no more than the max milestone count (`TooManyMilestones`), every `payment_percent` at least the minimum milestone percent (`InvalidPercentages`), and percentages summing to 100. Runtime state is reset: status becomes `Pending`, and the proof hash, release ledger and proof/dispute ledgers are cleared. Saving under an existing name overwrites that template. Blocked while the contract is paused or frozen. Emits `milestone_template_saved` `(creator, name)`.
-`list_milestone_templates(creator) → Vec<String>` | Anyone (read-only) | Names saved by `creator`, in the order they were first saved.
-`get_milestone_template(creator, name) → Vec<Milestone>` | Anyone (read-only) | The saved milestones. Panics with `TemplateNotFound` if none exists.
-`create_shipment_from_template(shipment_id, buyers, supplier, logistics, arbiter, token, total_amount, template_name, options)` | Primary buyer | Looks up `template_name` under `buyers[0]` and calls `create_shipment` with those milestones. All the usual `create_shipment` auth and validation still apply. Panics with `TemplateNotFound` if the primary buyer has no template with that name.
+`slash_collateral_for_miss(caller, shipment_id, milestone_index) → i128` | Anyone (permissionless, `require_auth` on `caller`) | Forfeits `remaining_collateral × bps / 10_000` to the primary buyer, debits `SupplierCollateral`, marks the milestone, emits `collateral_slashed` with `(milestone_index, slashed, remaining, buyer, caller)`, writes a `collateral_slashed` audit entry, and returns the amount slashed.
+`get_collateral_slash_bps(shipment_id) → u32` | Anyone (read-only) | Configured rate, `0` when unset.
+`is_collateral_slashed(shipment_id, milestone_index) → bool` | Anyone (read-only) | Whether that milestone was already charged.
 
-Templates are copied into a shipment when it is created. Changing a template later does not affect shipments that already exist. There is currently no function to delete a template.
+A call succeeds only when **all** of the following hold:
 
-### Supplier Tiering (#397, #478)
+- The shipment is `Active` and not individually paused.
+- The rate is non-zero (`collateral slashing is not enabled`).
+- The milestone is still `Pending` (`milestone is not pending`) — once proof is
+  in, the deadline no longer penalises anyone, however late it arrived.
+- The milestone has a deadline (`milestone has no deadline`) and the current
+  ledger is strictly **past** it (`milestone deadline has not passed` on the
+  deadline ledger itself). The deadline read is the extension-adjusted one when
+  a `request_extension`/`approve_extension` cycle has run, so an approved
+  extension always buys the supplier more time.
+- The milestone has not been slashed before (`milestone already slashed`).
+- Collateral is still held (`no supplier collateral remaining`) and the
+  computed amount is at least one base unit (`slash amount rounds to zero`).
 
-Suppliers are ranked **Bronze**, **Silver** or **Gold** based on their reputation score (`completed` and `disputed` counts). A higher tier lowers the supplier's required collateral and, if #560 is configured, raises their maximum shipment value (see [Tier-based Maximum Shipment Value](#tier-based-maximum-shipment-value-560)).
+Other behaviour worth knowing:
 
-`SupplierTierConfig`:
+- **At most one slash per milestone.** The flag is written to persistent
+  storage, so repeated calls are rejected rather than silently draining the
+  supplier. It is registered in `per_milestone_keys`, so it moves with its
+  milestone when adjacent milestones are merged.
+- **Never more than what is held.** The amount is capped at the remaining
+  collateral and debited immediately, so a second milestone missing its
+  deadline slashes only what is left, and a later completion or cancellation
+  returns only the un-slashed remainder to the supplier.
+- **Buyer vault shipments work too.** A vault-funded shipment credits the slash
+  back into the buyer's vault rather than their wallet, matching how refunds
+  already behave.
+- **The forfeiture is auditable.** `collateral_slashed` is emitted and a
+  `collateral_slashed` entry is written to the shipment audit log, alongside the
+  `milestone_index`, the amount, and who triggered it.
 
-| Field | Meaning |
-| --- | --- |
-| `silver_min_completed` / `gold_min_completed` | Minimum completed shipments needed for the tier |
-| `silver_max_disputed_ratio_bps` / `gold_max_disputed_ratio_bps` | Maximum `disputed × 10000 / completed` allowed for the tier |
-| `silver_multiplier_bps` / `gold_multiplier_bps` | Collateral multiplier for the tier, `≤ 10000`. Tiers can only reduce collateral (e.g. `7500` = 25% off) |
-| `bronze_max_value` / `silver_max_value` / `gold_max_value` | Per-tier shipment value cap (#560). `0` = unlimited and must not be negative |
+Storage lives under `DataKeyExt4` (`DataKeyExt3` was at its 50-variant limit).
 
-**Tier derivation.** Gold is checked first, then Silver. A supplier gets a tier only if they meet both its completed-count minimum and its dispute-ratio maximum. A supplier with no completed shipments is Bronze, and so is every supplier while no config is set. Bronze always pays the full base collateral.
 
-Function | Who | Behaviour
---- | --- | ---
-`set_supplier_tier_config(admin, config)` | Admin | Stores the config. Panics if a multiplier is above `10000` or a max value is negative. Emits `supplier_tier_config_set`.
-`get_supplier_tier_config() → Option<SupplierTierConfig>` | Anyone (read-only) | `None` until configured.
-`get_supplier_tier(supplier) → SupplierTier` | Anyone (read-only) | The supplier's tier, computed from their current reputation.
 
 **Tier-change events (#478).** Whenever a supplier's reputation is updated, or their tier collateral discount is calculated at shipment creation, the tier is recomputed and compared with the last recorded tier (Bronze if none was recorded). If it has changed, the new tier is stored and `supplier_tier_changed` `(supplier, old_tier, new_tier)` is emitted. Calling `get_supplier_tier` never emits events and never updates the stored tier.
 
-### Co-Buyer Joint Confirmation (#486)
+### VIP Fee Waiver Governance (#490)
 
-High-value shipments can require both the primary buyer and a designated co-buyer to confirm a milestone before funds are released. This dual-control flow prevents unilateral releases on large transactions.
+Partners (buyers or suppliers) can be granted a VIP fee waiver that reduces their effective platform fee. Because a fee waiver is a standing financial concession, it requires **multisig admin governance** (`initialize_multisig_admin`, see [multisig admin](#multisig-admin)) — unlike pause/unpause there is no single-admin fallback. Any registered multisig admin can propose a waiver; it executes automatically once the routine `MultiAdminConfig.threshold` of distinct admins have approved it.
 
-`set_co_buyer(caller, shipment_id, co_buyer)` — The shipment's primary buyer designates a co-buyer for the given shipment. The co-buyer address is stored against the shipment and must also call `confirm_milestone` for any milestone to be eligible for release. Panics if the caller is not the shipment's primary buyer, or if the shipment does not exist.
+**Key parameters**
 
-`get_co_buyer(shipment_id) → Option<Address>` — Returns the co-buyer address if one has been set, or `None` if no co-buyer is configured for that shipment.
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `waiver_bps` | `u32` | Basis points of the platform fee to waive. `10_000` = fully waived (0% effective fee). `5_000` = 50% waiver. |
+| `expires_at` | `u64` | Unix timestamp after which the waiver no longer applies. `0` = never expires. |
 
-`get_joint_confirmation_status(shipment_id, milestone_index) → (bool, bool)` — Returns a tuple `(buyer_confirmed, co_buyer_confirmed)` indicating whether each party has confirmed the given milestone. Both must be `true` before funds release proceeds.
+Function | Who | Behaviour
+--- | --- | ---
+`propose_fee_waiver(admin, partner, waiver_bps, expires_at) → u64` | Any registered multisig admin | Opens a fee-waiver proposal for `partner`. Panics if `waiver_bps > 10_000` or if multisig governance is not configured. The proposer's own approval is recorded immediately. Returns the new `proposal_id`. If the configured threshold is 1, the waiver is granted immediately. Emits `fee_waiver_proposed`.
+`approve_fee_waiver(admin, proposal_id)` | Any registered multisig admin | Records the caller's approval for the pending proposal. Once the total number of distinct approvals reaches `MultiAdminConfig.threshold`, the waiver is granted automatically. Panics if the proposal doesn't exist or the caller has already approved. Emits `fee_waiver_approved`, then `fee_waiver_granted` on execution.
+`get_fee_waiver(partner) → Option<(u32, u64)>` | Anyone (read-only) | Returns `(waiver_bps, expires_at)` for the active grant, or `None` if no waiver was granted or the waiver has expired (timestamp check against the current ledger time).
+`get_fee_waiver_proposal(proposal_id) → Option<FeeWaiverProposal>` | Anyone (read-only) | Returns the pending proposal, or `None` if it never existed or has already executed.
 
-`set_joint_confirmation_threshold(admin, threshold_amount)` — Admin-only. Shipments with a `total_amount` at or above this threshold automatically require joint confirmation for every milestone, even if no co-buyer was explicitly set via `set_co_buyer`. Set to `0` to disable automatic threshold enforcement.
+**Fee precedence.** The effective waiver bps is resolved after all other fee steps. When a milestone payment is due, the contract checks whether the partner (buyer or supplier, depending on context) has an active non-expired fee waiver and reduces the platform fee proportionally.
 
-`get_joint_confirmation_threshold() → u128` — Returns the current joint-confirmation threshold. `0` means the threshold is disabled.
+**Worked example** — 50% waiver, 1% base fee, 1 000 000 unit payout
 
-### Compliance Hold (#487)
+| Step | Value |
+| --- | --- |
+| Base platform fee (`fee_bps = 100`, i.e. 1%) | `10_000` |
+| Waiver (`waiver_bps = 5_000`, i.e. 50%) | `−5_000` |
+| Net platform fee | `5_000` (0.5%) |
+| Supplier receives | `995_000` |
 
-Admins can freeze a single shipment pending an off-chain legal or compliance review. A shipment on hold cannot have milestones confirmed, funds released, or disputes opened until the hold is cleared.
+**Usage example** — propose and approve a 50% perpetual waiver in a 2-of-3 multisig
 
-`set_compliance_hold(admin, shipment_id, reason_hash)` — Places the shipment on compliance hold. `reason_hash` is a 32-byte hash of the off-chain reason document, stored on-chain for auditability. Panics if the caller is not an admin or the shipment does not exist. Emits `compliance_hold_set` `(admin, shipment_id, reason_hash)`.
+```bash
+# Admin A proposes
+stellar contract invoke --id <CONTRACT_ID> --source admin-a \
+  --network testnet -- propose_fee_waiver \
+  --admin <ADMIN_A_ADDRESS> \
+  --partner <PARTNER_ADDRESS> \
+  --waiver_bps 5000 \
+  --expires_at 0
 
-`clear_compliance_hold(admin, shipment_id)` — Lifts the compliance hold, allowing the shipment to resume normal operation. Panics if the caller is not an admin or no hold exists for the shipment. Emits `compliance_hold_cleared` `(admin, shipment_id)`.
+# Admin B approves (threshold = 2, so this executes the waiver)
+stellar contract invoke --id <CONTRACT_ID> --source admin-b \
+  --network testnet -- approve_fee_waiver \
+  --admin <ADMIN_B_ADDRESS> \
+  --proposal_id 1
 
-`is_on_compliance_hold(shipment_id) → bool` — Returns `true` if the shipment is currently on compliance hold, `false` otherwise.
+# Check the active waiver
+stellar contract invoke --id <CONTRACT_ID> \
+  --network testnet -- get_fee_waiver \
+  --partner <PARTNER_ADDRESS>
+```
 
-### Dispute Appeals (#488)
+> **Note:** `initialize_multisig_admin` must be called before any fee waiver can be proposed.
 
-Either party can appeal a resolved dispute to a second arbiter within an admin-configured ledger window. The appeal mechanism provides a check against erroneous or biased arbiter decisions.
+---
 
-`appeal_dispute(caller, shipment_id, milestone_index)` — Opens an appeal for a previously resolved dispute on the given milestone. The caller must be either the buyer or the supplier of the shipment. Panics if no resolved dispute exists for that milestone, if the appeal window has closed, or if an appeal is already pending. Emits `dispute_appealed` `(caller, shipment_id, milestone_index)`.
+### Fee Holidays (#491)
 
-`set_appeal_window_ledgers(admin, ledgers)` — Admin-only. Sets the number of ledger sequences after a dispute resolution during which an appeal may be filed. Panics if `ledgers` is zero. Emits `appeal_window_set` `(ledgers)`.
+Admins can schedule a contract-wide **zero-fee window** measured in Stellar ledger sequence numbers. While a fee holiday is active, `deduct_fee*` returns the full gross amount for all shipments — no platform fee is charged to any party. A fee holiday is orthogonal to per-partner fee waivers and volume-based fee tiers: the holiday takes precedence while active regardless of other fee settings.
 
-`get_appeal_window_ledgers() → u32` — Returns the current appeal window in ledger sequences.
+Function | Who | Behaviour
+--- | --- | ---
+`schedule_fee_holiday(admin, start_ledger, end_ledger)` | Admin | Stores the fee holiday window. `start_ledger` and `end_ledger` are inclusive Stellar ledger sequence numbers. Panics if `end_ledger < start_ledger`. Replaces any previously scheduled holiday. Emits `fee_holiday_scheduled (start_ledger, end_ledger)`.
+`cancel_fee_holiday(admin)` | Admin | Removes any scheduled or active fee holiday immediately. Emits `fee_holiday_cancelled`.
+`is_fee_holiday_active() → bool` | Anyone (read-only) | Returns `true` when the current ledger sequence is within `[start_ledger, end_ledger]` (both endpoints inclusive).
 
-`get_dispute_resolution_reason(shipment_id, milestone_index) → Option<String>` — Returns the arbiter's recorded resolution reason for the most recent dispute on the milestone, or `None` if no reason was provided or no dispute exists.
+**Ledger numbers, not timestamps.** The window is expressed in Stellar ledger sequence numbers. On Stellar mainnet a ledger closes roughly every 5 seconds, so ~17 280 ledgers ≈ 1 day, but exact timing depends on network conditions and should not be assumed for precise scheduling.
 
-### Arbiter Slashing and Reinstatement (#489)
+**Interaction with other fee settings.** A fee holiday supersedes per-partner fee waivers, per-shipment fee overrides, volume-tier discounts, and the long-hold rebate for the duration of the window. Once the holiday ends (ledger sequence > `end_ledger`), all previously configured settings resume automatically.
 
-Arbiters whose resolutions are repeatedly overturned on appeal are automatically slashed — removed from the active arbiter pool. Admins can reinstate a slashed arbiter once the underlying issue is resolved.
+**Usage example** — schedule a 24-hour holiday starting 100 ledgers from now
 
-`set_max_overturned_before_slash(admin, threshold)` — Admin-only. Sets the maximum number of appeal overturn events an arbiter may accumulate before being slashed. Panics if `threshold` is zero. Emits `max_overturned_set` `(threshold)`.
+```bash
+# Assume current ledger is 5_000_000; ~24 h ≈ 17 280 ledgers
+stellar contract invoke --id <CONTRACT_ID> --source admin-account \
+  --network testnet -- schedule_fee_holiday \
+  --admin <ADMIN_ADDRESS> \
+  --start_ledger 5000100 \
+  --end_ledger 5017380
 
-`get_max_overturned_before_slash() → u32` — Returns the current slash threshold.
+# Check if a holiday is currently active
+stellar contract invoke --id <CONTRACT_ID> \
+  --network testnet -- is_fee_holiday_active
 
-`is_arbiter_slashed(arbiter) → bool` — Returns `true` if the arbiter has been slashed and is no longer eligible to be assigned to new shipments.
+# Cancel the holiday early if needed
+stellar contract invoke --id <CONTRACT_ID> --source admin-account \
+  --network testnet -- cancel_fee_holiday \
+  --admin <ADMIN_ADDRESS>
+```
 
-`reinstate_arbiter(admin, arbiter)` — Admin-only. Clears the slashed flag for the arbiter and resets their overturn counter to zero, allowing them to be assigned to shipments again. Panics if the caller is not an admin or the arbiter is not currently slashed. Emits `arbiter_reinstated` `(admin, arbiter)`.
+---
+
+### Supplier Payout Currency Preference & Conversion Rates (#492)
+
+Suppliers can nominate a preferred settlement token. When a supplier calls `claim_payout`, the contract attempts to deliver funds in the preferred token if an admin has registered a conversion route and the contract holds enough of the target token. Rates are fixed (no live oracle is queried) and conversion is always best-effort — if the route is missing or the contract balance is insufficient, the payout is delivered in the original token unchanged.
+
+**Key parameter**
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `rate_bps` | `u32` | Basis points of `to_token` per unit of `from_token`. `10_000` = 1:1 parity. E.g. `8_000` means 1 unit of `from_token` → 0.8 units of `to_token`. |
+
+Function | Who | Behaviour
+--- | --- | ---
+`set_payout_currency_preference(supplier, preferred_token)` | Supplier | Stores the supplier's preferred output token for `claim_payout`. Auth required from `supplier`. Emits `payout_currency_preference_set`.
+`get_payout_currency_preference(supplier) → Option<Address>` | Anyone (read-only) | Returns the configured preferred token address, or `None` if none is set.
+`set_conversion_rate(admin, from_token, to_token, rate_bps)` | Admin | Registers a fixed conversion route used by `claim_payout`. Panics if `rate_bps = 0`. Emits `conversion_rate_set`. Overwrites any existing route for the same pair.
+`clear_conversion_rate(admin, from_token, to_token)` | Admin | Removes a previously registered route. Emits `conversion_rate_cleared`.
+`get_conversion_rate(from_token, to_token) → Option<u32>` | Anyone (read-only) | Returns the registered rate in basis points, or `None` if no route exists.
+`claim_payout(supplier, token)` | Supplier | Transfers the supplier's full accumulated pending balance. If a preference is set, it differs from `token`, a conversion route exists, and the contract holds enough of the preferred token, the payout is converted and paid in the preferred token; otherwise it is paid in `token` unchanged. The balance is zeroed before transfer (checks-effects-interactions). Panics with `"no pending payout"` if balance is zero. Blocked while paused. Emits `payout_claimed (amount, payout_token, rate_bps)`.
+
+**Conversion only happens when both conditions hold:**
+1. The supplier has called `set_payout_currency_preference` with a token different from `token`.
+2. An admin has called `set_conversion_rate` for `(token → preferred_token)` and the contract holds at least the converted amount of `preferred_token`.
+
+If either condition is missing, `claim_payout` falls back to `token` with no error.
+
+**Worked example** — supplier earns USDC, wants payout in EURC at 0.92:1
+
+```bash
+# Admin registers the USDC → EURC route at 9200 bps (0.92 EURC per USDC)
+stellar contract invoke --id <CONTRACT_ID> --source admin-account \
+  --network testnet -- set_conversion_rate \
+  --admin <ADMIN_ADDRESS> \
+  --from_token <USDC_ADDRESS> \
+  --to_token <EURC_ADDRESS> \
+  --rate_bps 9200
+
+# Supplier sets preference
+stellar contract invoke --id <CONTRACT_ID> --source supplier-account \
+  --network testnet -- set_payout_currency_preference \
+  --supplier <SUPPLIER_ADDRESS> \
+  --preferred_token <EURC_ADDRESS>
+
+# Claim: 100 000 USDC pending → supplier receives 92 000 EURC
+stellar contract invoke --id <CONTRACT_ID> --source supplier-account \
+  --network testnet -- claim_payout \
+  --supplier <SUPPLIER_ADDRESS> \
+  --token <USDC_ADDRESS>
+
+# Without a conversion route (or if EURC balance is insufficient), the same
+# call would pay out 100 000 USDC instead — no error, no partial conversion.
+```
+
+---
+
+### Jurisdiction Tagging (#493)
+
+Every shipment can carry an immutable jurisdiction/compliance tag — a `Symbol` set via `ShipmentOptions.jurisdiction` at creation time and never changeable afterwards. The tag is designed for off-chain compliance tooling: regulatory pipelines, audit exporters, and reporting dashboards can query by jurisdiction to filter or enumerate the shipments they need to process.
+
+Function | Who | Behaviour
+--- | --- | ---
+`get_shipment_jurisdiction(shipment_id) → Option<Symbol>` | Anyone (read-only) | Returns the jurisdiction tag for the shipment, or `None` if no tag was set at creation.
+`get_shipments_by_jurisdiction(jurisdiction) → Vec<String>` | Anyone (read-only) | Returns all shipment IDs that carry the given tag, in insertion order. Returns an empty list if no shipments have been tagged with that jurisdiction.
+
+**Setting the tag.** The tag is set once via the `jurisdiction` field on `ShipmentOptions` when `create_shipment` (or `create_shipment_from_template`) is called. It cannot be updated or removed after the shipment is created.
+
+**Example tag values:** `US`, `EU_MIFID`, `SG_MAS`, `UK_FCA`, `OFAC_SDN`.
+
+**Intended use case.** The jurisdiction tag has no effect on contract logic — it does not gate any function, block payouts, or interact with dispute resolution. It exists purely as an on-chain label for off-chain tooling to consume. For example, a compliance reporter can call `get_shipments_by_jurisdiction("EU_MIFID")` to retrieve all EU MiFID-tagged trades and export them for regulatory filing without scanning every shipment.
+
+**Usage example**
+
+```bash
+# Read the tag for a specific shipment
+stellar contract invoke --id <CONTRACT_ID> \
+  --network testnet -- get_shipment_jurisdiction \
+  --shipment_id "shipment-001"
+
+# List all shipments under US jurisdiction
+stellar contract invoke --id <CONTRACT_ID> \
+  --network testnet -- get_shipments_by_jurisdiction \
+  --jurisdiction US
+```

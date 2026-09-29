@@ -105,6 +105,8 @@ fn make_shipment(
             proof_submitters: vec![env],
             require_dual_attestation: false,
             fund_from_vault: false,
+            milestone_suppliers: vec![env],
+            refund_recipient: None,
         },
     );
 }

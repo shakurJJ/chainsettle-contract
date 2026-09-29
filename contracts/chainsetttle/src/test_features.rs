@@ -123,6 +123,8 @@ fn default_opts(env: &Env) -> ShipmentOptions {
         proof_submitters: Vec::new(env),
         require_dual_attestation: false,
         fund_from_vault: false,
+        milestone_suppliers: Vec::new(env),
+        refund_recipient: None,
     }
 }
 

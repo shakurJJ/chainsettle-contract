@@ -103,6 +103,7 @@ pub enum CancellationReason {
     SupplierCancelled,
     DeadlineRefund,
     AdminEmergencyRecovery,
+    BlacklistedSupplier,
 }
 
 /// Default resolution applied when a dispute auto-resolves after timeout (#165).
@@ -467,6 +468,17 @@ pub struct ShipmentOptions {
     /// When true, `create_shipment` debits the primary buyer's vault balance
     /// instead of transferring tokens. Refunds return to the vault.
     pub fund_from_vault: bool,
+
+    // ── #551 Multi-supplier consortium ───────────────────────────────────────
+    /// Per-milestone supplier addresses (one per milestone). When non-empty and
+    /// length matches milestones, each milestone pays its own supplier and only
+    /// that supplier may submit proof for it. Empty = single-supplier (default).
+    pub milestone_suppliers: Vec<Address>,
+
+    // ── #553 Configurable refund recipient ───────────────────────────────────
+    /// Alternative address to receive refunds in place of the buyer.
+    /// None = refunds go to the buyer (default unchanged behaviour).
+    pub refund_recipient: Option<Address>,
 }
 
 /// #545 – Pending dual-attestation proof awaiting the second party.
@@ -1517,52 +1529,69 @@ pub enum DataKeyExt3 {
     ConditionBreachReports(String, u32),
 }
 
-/// Storage keys extension 4 (Ext3 is at the 50-variant XDR limit).
+/// `DataKeyExt3` is at the 50-variant XDR ceiling, so keys added from here on
+/// live in this enum. It also re-homes the ten `DataKeyExt3` variants that a
+/// bad merge on `main` dropped from the enum while leaving their call sites
+/// intact (which broke `cargo build`); the key *values* were never released, so
+/// repointing them here restores the storage layout those features expect.
 #[contracttype]
 pub enum DataKeyExt4 {
-    // ── #561 Buyer escrow vault ───────────────────────────────────────────
-    /// Per-(buyer, token) vault balance held by the contract.
-    VaultBalance(Address, Address),
-    /// Aggregate vault principal per token (excluded from treasury dust).
-    TotalVaulted(Address),
-    /// True when the shipment was funded from the buyer vault (refunds return there).
-    FundFromVault(String),
-
-    // ── #562 Standing orders ──────────────────────────────────────────────
-    /// Recurring shipment template keyed by order id.
-    StandingOrder(u64),
-    /// Monotonic counter for the next standing-order id.
-    NextStandingOrderId,
-    /// Internal one-shot flag: skip buyer require_auth in create_shipment
-    /// (set by allowance / standing-order entry points that already authorised).
-    SkipBuyerAuth,
-    /// Internal one-shot: (spender, from) for allowance-funded create_shipment.
-    PendingAllowance,
-
-    // ── Keys referenced by upstream main that outgrew DataKeyExt3 ─────────
+    // ── #571 Contract / storage schema versioning ─────────────────────────
+    /// Instance-stored schema version set by `migrate` after upgrades.
     StorageSchemaVersion,
+
+    // ── #572 Arbiter → shipments index ────────────────────────────────────
+    /// Shipment IDs currently assigned to a given arbiter.
     ArbiterShipments(Address),
+
+    // ── #573 Logistics → shipments index ──────────────────────────────────
+    /// Shipment IDs involving a given logistics provider.
     LogisticsShipments(Address),
+
+    // ── #528 Clean-completion fee rebate ──────────────────────────────────
+    /// Admin-configured share (bps) of platform fees refunded to the supplier
+    /// when a shipment completes with zero disputes (0/absent = disabled).
     CleanCompletionRebateBps,
+    /// Cumulative platform fees collected for a shipment (token units).
     ShipmentFeesPaid(String),
-    ArbiterSlashBps,
-    ArbiterStake(Address),
-    SubstituteProposal(String, u32),
-    MilestoneSupplier(String, u32),
+    /// Set once any dispute is raised on the shipment (absent = never disputed).
     ShipmentHadDispute(String),
 
-    // ── Appeal fee ────────────────────────────────────────────────────────
-    /// Admin-configured flat fee (in the shipment token) charged on `appeal_dispute`
-    /// (0 = no fee).
-    AppealFee,
-    /// Fee escrowed for an appeal on (shipment_id, milestone_index): (appellant, amount).
-    /// Refunded to the appellant if the appeal succeeds, else paid to the appeal arbiter.
-    AppealFeeDeposit(String, u32),
+    // ── #531 Arbiter stake slashing on overturn ───────────────────────────
+    /// Admin-configured share (bps) of an arbiter's stake forfeited to the
+    /// wronged party when an appeal overturns their resolution (0 = disabled).
+    ArbiterSlashBps,
+    /// Locked arbiter stake: (token, amount).
+    ArbiterStake(Address),
 
-    // ── Arbiter availability ──────────────────────────────────────────────
-    /// True when an arbiter has marked themselves unavailable; they are then
-    /// skipped by pool selection (absent = available).
-    ArbiterUnavailable(Address),
+    // ── #552 Substitute supplier for a defaulted milestone ────────────────
+    /// Pending substitute-supplier proposal for (shipment_id, milestone_index).
+    SubstituteProposal(String, u32),
+    /// Approved substitute supplier for (shipment_id, milestone_index).
+    MilestoneSupplier(String, u32),
+
+    // ── #549 Mutual extension of shipment expiry ──────────────────────────
+    /// Admin-configured ceiling on the total number of ledgers a shipment's
+    /// expiry may be extended by across all approved extensions
+    /// (0/unset = no ceiling enforced).
+    MaxExpiryExtensionLedgers,
+    /// Pending mutually-agreed expiry extension for a shipment.
+    PendingExpiryExtension(String),
+    /// Total ledgers a shipment's expiry has already been extended by, so the
+    /// admin ceiling applies cumulatively rather than per extension.
+    TotalExpiryExtended(String),
+}
+
+/// #549 – Pending proposal to move a shipment's `expires_at_ledger` later.
+#[contracttype]
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ExpiryExtensionProposal {
+    pub proposer: Address,
+    /// Expiry ledger requested by `proposer`.
+    pub new_expiry_ledger: u32,
+    /// Expiry ledger in force when the proposal was made; re-checked on
+    /// approval so a proposal can never be applied on top of a stale base.
+    pub base_expiry_ledger: u32,
 }
 
 /// #517 – Pending proposal to merge two adjacent Pending milestones.
@@ -3242,16 +3271,22 @@ impl ChainSettleContract {
             return;
         }
         let primary_buyer = shipment.buyers.get(0).unwrap();
+        // #553: Use the buyer-configured refund recipient when set.
+        let recipient: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt4::RefundRecipient(shipment_id.clone()))
+            .unwrap_or_else(|| primary_buyer.clone());
         let from_vault: bool = env
             .storage()
             .persistent()
             .get(&DataKeyExt4::FundFromVault(shipment_id.clone()))
             .unwrap_or(false);
         if from_vault {
-            Self::credit_vault(env, &primary_buyer, &shipment.token, amount);
+            Self::credit_vault(env, &recipient, &shipment.token, amount);
         } else {
             let token_client = token::Client::new(env, &shipment.token);
-            token_client.transfer(&env.current_contract_address(), &primary_buyer, &amount);
+            token_client.transfer(&env.current_contract_address(), &recipient, &amount);
         }
     }
 
@@ -3559,6 +3594,8 @@ impl ChainSettleContract {
             proof_submitters: Vec::new(env),
             require_dual_attestation: false,
             fund_from_vault: false,
+            milestone_suppliers: Vec::new(env),
+            refund_recipient: None,
         }
     }
 
@@ -3786,6 +3823,230 @@ impl ChainSettleContract {
             .unwrap_or(0)
     }
 
+    // ----------------------------------------------------------
+    // #556 SUPPLIER COLLATERAL TOP-UP
+    // ----------------------------------------------------------
+
+    /// Let the supplier add collateral to an active shipment.
+    /// Transfers `amount` tokens from the supplier and adds them to the stored collateral.
+    pub fn top_up_collateral(env: Env, supplier: Address, shipment_id: String, amount: i128) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        supplier.require_auth();
+
+        if amount <= 0 {
+            panic!("amount must be greater than zero");
+        }
+
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+
+        if shipment.supplier != supplier {
+            panic!("unauthorized: only the supplier can top up collateral");
+        }
+        if shipment.status != ShipmentStatus::Active {
+            panic!("top-up only allowed on active shipments");
+        }
+
+        let token_client = token::Client::new(&env, &shipment.token);
+        token_client.transfer(&supplier, &env.current_contract_address(), &amount);
+
+        let collateral_key = DataKey::SupplierCollateral(shipment_id.clone());
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&collateral_key)
+            .unwrap_or(0);
+        let new_balance = current + amount;
+        env.storage()
+            .persistent()
+            .set(&collateral_key, &new_balance);
+        env.storage().persistent().extend_ttl(
+            &collateral_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "collateral_topped_up"), shipment_id),
+            (supplier, amount, new_balance),
+        );
+    }
+
+    // ----------------------------------------------------------
+    // #553 CONFIGURABLE REFUND RECIPIENT
+    // ----------------------------------------------------------
+
+    /// Let the buyer set an alternative address to receive refunds for a shipment.
+    /// Pass `None` to revert to the default (refunds go to the buyer).
+    pub fn set_refund_recipient(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        recipient: Option<Address>,
+    ) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        buyer.require_auth();
+
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        Self::assert_is_buyer(&shipment, &buyer);
+
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+
+        let key = DataKeyExt4::RefundRecipient(shipment_id.clone());
+        match recipient {
+            Some(ref addr) => {
+                let blacklisted = env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, soroban_sdk::BytesN<32>>(&DataKey::Blacklisted(addr.clone()))
+                    .is_some();
+                if blacklisted {
+                    panic!("recipient is blacklisted");
+                }
+                env.storage().persistent().set(&key, addr);
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    constants::TTL_INITIAL_LEDGERS,
+                    constants::TTL_MAX_LEDGERS,
+                );
+            }
+            None => {
+                env.storage().persistent().remove(&key);
+            }
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "refund_recipient_set"), shipment_id),
+            (buyer, recipient),
+        );
+    }
+
+    /// Return the configured refund recipient for a shipment, or None if not set.
+    pub fn get_refund_recipient(env: Env, shipment_id: String) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::RefundRecipient(shipment_id))
+    }
+
+    // ----------------------------------------------------------
+    // #554 CANCEL FOR BLACKLISTED SUPPLIER
+    // ----------------------------------------------------------
+
+    /// Cancel a shipment and get a full refund when the supplier is currently blacklisted.
+    /// No cancellation fee is charged; all supplier collateral is forfeited to the buyer.
+    pub fn cancel_for_blacklisted_supplier(env: Env, buyer: Address, shipment_id: String) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        buyer.require_auth();
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::assert_is_buyer(&shipment, &buyer);
+        Self::assert_shipment_not_on_hold(&env, &shipment_id);
+
+        let is_blacklisted = env
+            .storage()
+            .instance()
+            .get::<DataKey, soroban_sdk::BytesN<32>>(&DataKey::Blacklisted(
+                shipment.supplier.clone(),
+            ))
+            .is_some();
+        if !is_blacklisted {
+            panic!("supplier is not blacklisted");
+        }
+
+        let unreleased =
+            shipment.total_amount - shipment.released_amount - shipment.total_advanced_amount;
+
+        // No cancellation fee — refund all unreleased escrow.
+        if unreleased > 0 {
+            Self::refund_to_buyer(&env, &shipment_id, &shipment, unreleased);
+        }
+
+        // Forfeit collateral to buyer.
+        let collateral: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SupplierCollateral(shipment_id.clone()))
+            .unwrap_or(0);
+        if collateral > 0 {
+            Self::refund_to_buyer(&env, &shipment_id, &shipment, collateral);
+        }
+
+        Self::refund_holdbacks_on_cancel(&env, &shipment_id, &mut shipment, buyer.clone());
+
+        shipment.status = ShipmentStatus::Cancelled;
+        shipment.cancellation_reason =
+            Vec::from_array(&env, [CancellationReason::BlacklistedSupplier]);
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            buyer.clone(),
+            Symbol::new(&env, "shipment_cancelled"),
+            Symbol::new(&env, "cancel_blacklisted"),
+        );
+
+        Self::move_shipment_status_index(
+            &env,
+            ShipmentStatus::Active,
+            ShipmentStatus::Cancelled,
+            &shipment_id,
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        let current_escrowed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalEscrowed(shipment.token.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::TotalEscrowed(shipment.token.clone()),
+            &(current_escrowed - unreleased).max(0),
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "shipment_cancelled"),
+                shipment_id.clone(),
+            ),
+            (unreleased, 0i128, buyer.clone(), env.ledger().sequence()),
+        );
+        Self::emit_shipment_cancelled(
+            &env,
+            &shipment_id,
+            unreleased,
+            CancellationReason::BlacklistedSupplier,
+        );
+    }
+
+    // ----------------------------------------------------------
+    // #551 CONSORTIUM QUERY
+    // ----------------------------------------------------------
+
+    /// Returns true when this shipment was created with per-milestone consortium suppliers.
+    pub fn is_consortium_shipment(env: Env, shipment_id: String) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::IsConsortium(shipment_id))
+            .unwrap_or(false)
+    }
+
     /// Releases the proportional collateral share for a milestone that has just
     /// moved to `Confirmed` through a non-dispute path. No-op unless the shipment
     /// opted in. Disputed milestones end in `Resolved` and never reach here.
@@ -3834,6 +4095,154 @@ impl ChainSettleContract {
             ),
             (milestone_index, share, remaining - share),
         );
+    }
+
+    // ----------------------------------------------------------
+    // COLLATERAL SLASHING ON A MISSED MILESTONE DEADLINE
+    // ----------------------------------------------------------
+
+    /// Basis points of the shipment's remaining supplier collateral forfeited to
+    /// the buyer for each missed milestone deadline (`0` / absent = disabled).
+    pub fn get_collateral_slash_bps(env: Env, shipment_id: String) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::CollateralSlashBpsPerMiss(shipment_id))
+            .unwrap_or(0)
+    }
+
+    /// Whether (shipment_id, milestone_index) has already been slashed for a
+    /// missed deadline. Read-only; no authorization required.
+    pub fn is_collateral_slashed(env: Env, shipment_id: String, milestone_index: u32) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::CollateralSlashedForMiss(
+                shipment_id,
+                milestone_index,
+            ))
+            .unwrap_or(false)
+    }
+
+    /// Permissionless: forfeit a configured share of the supplier's remaining
+    /// collateral to the primary buyer because `milestone_index` passed its
+    /// deadline without proof being submitted. Returns the amount slashed.
+    ///
+    /// Eligibility, all enforced before any funds move:
+    ///  - the shipment is `Active` and not paused;
+    ///  - `collateral_slash_bps_per_miss > 0` (otherwise slashing is disabled);
+    ///  - the milestone still has a deadline and it is in the past;
+    ///  - the milestone is still `Pending` (no proof submitted);
+    ///  - this milestone has not been slashed before;
+    ///  - collateral remains locked and the computed slash is non-zero.
+    ///
+    /// The slash is `remaining_collateral * bps / 10_000`, capped at the
+    /// remaining collateral, and is debited from `SupplierCollateral` so later
+    /// slashes and the eventual return on completion/cancellation only ever see
+    /// what is still held.
+    pub fn slash_collateral_for_miss(
+        env: Env,
+        caller: Address,
+        shipment_id: String,
+        milestone_index: u32,
+    ) -> i128 {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::assert_shipment_not_paused(&env, &shipment_id);
+        if milestone_index as usize >= shipment.milestones.len() as usize {
+            panic!("invalid milestone index");
+        }
+
+        let bps = Self::get_collateral_slash_bps(env.clone(), shipment_id.clone());
+        if bps == 0 {
+            panic!("collateral slashing is not enabled");
+        }
+
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        // Only a still-pending milestone counts as "missed": once proof is in
+        // (or the milestone is settled) the deadline no longer penalises anyone.
+        if milestone.status != MilestoneStatus::Pending {
+            panic!("milestone is not pending");
+        }
+
+        // Prefer the extension-adjusted deadline, mirroring the other
+        // deadline-aware paths (e.g. pause notice, upcoming deadlines).
+        let deadline: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt::MilestoneDeadline(
+                shipment_id.clone(),
+                milestone_index,
+            ))
+            .unwrap_or(milestone.deadline_ledger);
+        if deadline == 0 {
+            panic!("milestone has no deadline");
+        }
+        if env.ledger().sequence() <= deadline {
+            panic!("milestone deadline has not passed");
+        }
+
+        let slashed_key = DataKeyExt4::CollateralSlashedForMiss(
+            shipment_id.clone(),
+            milestone_index,
+        );
+        if env.storage().persistent().has(&slashed_key) {
+            panic!("milestone already slashed");
+        }
+
+        let collateral_key = DataKey::SupplierCollateral(shipment_id.clone());
+        let remaining: i128 = env.storage().persistent().get(&collateral_key).unwrap_or(0);
+        if remaining <= 0 {
+            panic!("no supplier collateral remaining");
+        }
+        let slash = ((remaining * bps as i128) / 10_000).min(remaining);
+        if slash <= 0 {
+            panic!("slash amount rounds to zero");
+        }
+
+        Self::refund_to_buyer(&env, &shipment_id, &shipment, slash);
+        env.storage()
+            .persistent()
+            .set(&collateral_key, &(remaining - slash));
+        env.storage().persistent().extend_ttl(
+            &collateral_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        env.storage().persistent().set(&slashed_key, &true);
+        env.storage().persistent().extend_ttl(
+            &slashed_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            caller.clone(),
+            Symbol::new(&env, "collateral_slashed"),
+            Symbol::new(&env, "slash_collateral"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        env.events().publish(
+            (Symbol::new(&env, "collateral_slashed"), shipment_id.clone()),
+            (
+                milestone_index,
+                slash,
+                remaining - slash,
+                shipment.buyers.get(0).unwrap(),
+                caller,
+            ),
+        );
+
+        slash
     }
 
     // ----------------------------------------------------------
@@ -4693,6 +5102,7 @@ impl ChainSettleContract {
         keys.push_back(DataKeyExt3::ConditionBreachReports(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt4::SubstituteProposal(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt4::MilestoneSupplier(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt4::CollateralSlashedForMiss(s.clone(), idx).into_val(env));
         if let Some(purpose) = env
             .storage()
             .persistent()
@@ -6348,6 +6758,8 @@ impl ChainSettleContract {
         let inspected_milestones = options.inspected_milestones.clone();
         let proof_submitters = options.proof_submitters.clone();
         let require_dual_attestation = options.require_dual_attestation;
+        let milestone_suppliers = options.milestone_suppliers.clone();
+        let refund_recipient = options.refund_recipient.clone();
 
         if buyer_cancel_fee_bps > constants::MAX_FEE_BPS {
             panic!("buyer_cancel_fee_bps cannot exceed 1000 (10%)");
@@ -6863,6 +7275,76 @@ impl ChainSettleContract {
             &proof_submitters,
             require_dual_attestation,
         );
+
+        // #551: Store per-milestone consortium suppliers when provided.
+        if milestone_suppliers.len() > 0 {
+            if milestone_suppliers.len() != milestones.len() {
+                panic!("milestone_suppliers length must match milestone count");
+            }
+            for i in 0..milestone_suppliers.len() {
+                let ms = milestone_suppliers.get(i).unwrap();
+                let key = DataKeyExt4::MilestoneSupplier(shipment_id.clone(), i);
+                env.storage().persistent().set(&key, &ms);
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    constants::TTL_INITIAL_LEDGERS,
+                    constants::TTL_MAX_LEDGERS,
+                );
+                // Index the consortium shipment under each milestone supplier.
+                let mut ms_shipments: Vec<String> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::SupplierShipments(ms.clone()))
+                    .unwrap_or_else(|| Vec::new(&env));
+                let mut already_indexed = false;
+                for j in 0..ms_shipments.len() {
+                    if ms_shipments.get(j).unwrap() == shipment_id {
+                        already_indexed = true;
+                        break;
+                    }
+                }
+                if !already_indexed {
+                    ms_shipments.push_back(shipment_id.clone());
+                    env.storage().persistent().set(
+                        &DataKey::SupplierShipments(ms.clone()),
+                        &ms_shipments,
+                    );
+                    env.storage().persistent().extend_ttl(
+                        &DataKey::SupplierShipments(ms.clone()),
+                        constants::TTL_INITIAL_LEDGERS,
+                        constants::TTL_MAX_LEDGERS,
+                    );
+                }
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKeyExt4::IsConsortium(shipment_id.clone()), &true);
+            env.storage().persistent().extend_ttl(
+                &DataKeyExt4::IsConsortium(shipment_id.clone()),
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+        }
+
+        // #553: Store the refund recipient when provided.
+        if let Some(ref recipient) = refund_recipient {
+            let blacklisted = env
+                .storage()
+                .instance()
+                .get::<DataKey, soroban_sdk::BytesN<32>>(&DataKey::Blacklisted(recipient.clone()))
+                .is_some();
+            if blacklisted {
+                panic!("refund_recipient is blacklisted");
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKeyExt4::RefundRecipient(shipment_id.clone()), recipient);
+            env.storage().persistent().extend_ttl(
+                &DataKeyExt4::RefundRecipient(shipment_id.clone()),
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+        }
 
         // #164: Store per-milestone Unix timestamp deadlines when provided.
         if deadlines.len() > 0 {
@@ -7648,7 +8130,11 @@ impl ChainSettleContract {
             .get(&DataKeyExt::PayoutMode(shipment.supplier.clone()))
             .unwrap_or(PayoutMode::Immediate);
 
-        if payout_mode == PayoutMode::Batched {
+        if let Some(financier) = Self::payout_assignee(&env, &shipment_id) {
+            // Invoice factoring: the advance belongs to the receivable's holder.
+            let token_client = token::Client::new(&env, &shipment.token);
+            token_client.transfer(&env.current_contract_address(), &financier, &advance_amount);
+        } else if payout_mode == PayoutMode::Batched {
             let pending: i128 = env
                 .storage()
                 .persistent()
@@ -10004,7 +10490,23 @@ impl ChainSettleContract {
 
             shipment.released_amount += payment;
 
-            let actual_transfer = (net_payment - advance_deducted - arbiter_fee).max(0);
+            // Loser-pays: the buyer lost, so the bond they get back covers the fee first.
+            // Not for a supplier grade dispute — the buyer did not post a bond for it.
+            let bond_return = if grade_dispute.is_none() {
+                shipment.dispute_bond_amount.max(0)
+            } else {
+                0
+            };
+            let loser_cover = Self::loser_pays_cover(
+                &env,
+                &shipment_id,
+                milestone_index,
+                arbiter_fee,
+                bond_return,
+            );
+
+            let actual_transfer =
+                (net_payment - advance_deducted - (arbiter_fee - loser_cover)).max(0);
             if actual_transfer > 0 {
                 // Feature C: split payment across milestone payees if configured.
                 Self::pay_milestone_to_payees(
@@ -10018,13 +10520,13 @@ impl ChainSettleContract {
             }
 
             // Return the dispute bond to the buyer (they raised a valid dispute).
-            // Not for a supplier grade dispute — the buyer did not raise it.
-            if shipment.dispute_bond_amount > 0 && grade_dispute.is_none() {
+            let bond_refund = bond_return - loser_cover;
+            if bond_refund > 0 {
                 let primary_buyer = shipment.buyers.get(0).unwrap();
                 token_client.transfer(
                     &env.current_contract_address(),
                     &primary_buyer,
-                    &shipment.dispute_bond_amount,
+                    &bond_refund,
                 );
             }
 
@@ -10047,6 +10549,15 @@ impl ChainSettleContract {
                     &arbiter_fee,
                 );
             }
+            // Loser-pays: the supplier's failed challenge is paid from their graded share.
+            let graded_share = (payment * grade_bps as i128) / 10_000;
+            let loser_cover = Self::loser_pays_cover(
+                &env,
+                &shipment_id,
+                milestone_index,
+                arbiter_fee,
+                graded_share,
+            );
             let (_, buyer_refund, _) = Self::pay_graded_split(
                 &env,
                 &shipment,
@@ -10054,7 +10565,8 @@ impl ChainSettleContract {
                 milestone_index,
                 payment,
                 grade_bps,
-                arbiter_fee,
+                arbiter_fee - loser_cover,
+                loser_cover,
             );
             shipment.released_amount += payment;
             Self::decrease_total_escrowed(&env, &shipment.token, payment);
@@ -10077,7 +10589,18 @@ impl ChainSettleContract {
                 );
             }
 
-            let buyer_refund = (payment - arbiter_fee).max(0);
+            // Loser-pays: the supplier lost the contested portion, so the bond
+            // forfeited to them covers the fee first.
+            let bond_forfeit = shipment.dispute_bond_amount.max(0);
+            let loser_cover = Self::loser_pays_cover(
+                &env,
+                &shipment_id,
+                milestone_index,
+                arbiter_fee,
+                bond_forfeit,
+            );
+
+            let buyer_refund = (payment - (arbiter_fee - loser_cover)).max(0);
             if buyer_refund > 0 {
                 let primary_buyer = shipment.buyers.get(0).unwrap();
                 token_client.transfer(
@@ -10091,11 +10614,12 @@ impl ChainSettleContract {
             shipment.released_amount += payment;
 
             // Forfeit the dispute bond to the supplier (buyer's challenge failed).
-            if shipment.dispute_bond_amount > 0 {
+            let bond_to_supplier = bond_forfeit - loser_cover;
+            if bond_to_supplier > 0 {
                 token_client.transfer(
                     &env.current_contract_address(),
                     &shipment.supplier,
-                    &shipment.dispute_bond_amount,
+                    &bond_to_supplier,
                 );
             }
 
@@ -10448,7 +10972,18 @@ impl ChainSettleContract {
 
         shipment.released_amount += payment;
 
-        let actual_transfer = (net_payment - advance_deducted - arbiter_fee).max(0);
+        // Loser-pays: the buyer lost, so the bond they get back covers the fee first.
+        let bond_return = shipment.dispute_bond_amount.max(0);
+        let loser_cover = Self::loser_pays_cover(
+            &env,
+            &shipment_id,
+            milestone_index,
+            arbiter_fee,
+            bond_return,
+        );
+
+        let actual_transfer =
+            (net_payment - advance_deducted - (arbiter_fee - loser_cover)).max(0);
         if actual_transfer > 0 {
             Self::pay_milestone_to_payees(
                 &env,
@@ -10473,12 +11008,13 @@ impl ChainSettleContract {
             );
         }
 
-        if shipment.dispute_bond_amount > 0 {
+        let bond_refund = bond_return - loser_cover;
+        if bond_refund > 0 {
             let primary_buyer = shipment.buyers.get(0).unwrap();
             token_client.transfer(
                 &env.current_contract_address(),
                 &primary_buyer,
-                &shipment.dispute_bond_amount,
+                &bond_refund,
             );
         }
 
@@ -13045,6 +13581,169 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
+    // #549 — MUTUAL EXPIRY EXTENSION
+    // ----------------------------------------------------------
+
+    /// #549: Admin sets the maximum total number of ledgers a shipment's
+    /// `expires_at_ledger` may be extended by, counted cumulatively across all
+    /// approved extensions. 0 (the default) means extensions are unlimited.
+    pub fn set_max_expiry_extension_ledgers(env: Env, admin: Address, ledgers: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKeyExt4::MaxExpiryExtensionLedgers, &ledgers);
+        env.events()
+            .publish((Symbol::new(&env, "max_expiry_ext_set"),), ledgers);
+    }
+
+    /// Returns the configured maximum total expiry extension in ledgers
+    /// (0 = unlimited).
+    pub fn get_max_expiry_extension_ledgers(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt4::MaxExpiryExtensionLedgers)
+            .unwrap_or(0)
+    }
+
+    /// Buyer or supplier proposes moving the shipment's expiry later. Nothing
+    /// changes on-chain except the pending proposal; the counterparty must call
+    /// `approve_expiry_extension` for the new expiry to take effect.
+    pub fn propose_expiry_extension(
+        env: Env,
+        caller: Address,
+        shipment_id: String,
+        new_expiry_ledger: u32,
+    ) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::assert_shipment_not_paused(&env, &shipment_id);
+        Self::assert_buyer_or_supplier(&shipment, &caller);
+
+        let current = Self::assert_extendable_expiry(&env, &shipment, &new_expiry_ledger);
+
+        let key = DataKeyExt4::PendingExpiryExtension(shipment_id.clone());
+        let proposal = ExpiryExtensionProposal {
+            proposer: caller.clone(),
+            new_expiry_ledger,
+            base_expiry_ledger: current,
+        };
+        Self::set_persistent4(&env, &key, &proposal);
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            caller.clone(),
+            Symbol::new(&env, "expiry_ext_proposed"),
+            Symbol::new(&env, "propose_expiry_extension"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "expiry_extension_proposed"),
+                shipment_id,
+            ),
+            (caller, current, new_expiry_ledger),
+        );
+    }
+
+    /// The counterparty approves the pending expiry extension, which moves
+    /// `expires_at_ledger` to the requested ledger. Re-validates every
+    /// precondition, so a proposal cannot be applied once the shipment has
+    /// expired or the admin ceiling has been lowered in the meantime.
+    pub fn approve_expiry_extension(env: Env, counterparty: Address, shipment_id: String) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        counterparty.require_auth();
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::assert_shipment_not_paused(&env, &shipment_id);
+        Self::assert_buyer_or_supplier(&shipment, &counterparty);
+
+        let key = DataKeyExt4::PendingExpiryExtension(shipment_id.clone());
+        let proposal: ExpiryExtensionProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("no pending expiry extension"));
+        if proposal.proposer == counterparty {
+            panic!("cannot approve own expiry extension");
+        }
+        // The proposer was a party when the proposal was made; require the
+        // approver to be the *other* side so both buyer and supplier consent.
+        if proposal.proposer == shipment.supplier {
+            if !Self::is_buyer(&shipment, &counterparty) {
+                panic!("expiry extension must be approved by a buyer");
+            }
+        } else if counterparty != shipment.supplier {
+            panic!("expiry extension must be approved by the supplier");
+        }
+
+        let old_expiry =
+            Self::assert_extendable_expiry(&env, &shipment, &proposal.new_expiry_ledger);
+        if old_expiry != proposal.base_expiry_ledger {
+            panic!("pending expiry extension is stale");
+        }
+        // `assert_extendable_expiry` guarantees new > old, so the delta is safe.
+        let delta = proposal.new_expiry_ledger - old_expiry;
+
+        let total_key = DataKeyExt4::TotalExpiryExtended(shipment_id.clone());
+        let already: u32 = env.storage().persistent().get(&total_key).unwrap_or(0);
+        Self::assert_within_max_expiry_extension(&env, already.saturating_add(delta));
+
+        env.storage().persistent().remove(&key);
+        Self::set_persistent4(&env, &total_key, &already.saturating_add(delta));
+
+        shipment.expires_at_ledger = Some(proposal.new_expiry_ledger);
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            counterparty.clone(),
+            Symbol::new(&env, "expiry_extended"),
+            Symbol::new(&env, "approve_expiry_extension"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        env.events().publish(
+            (Symbol::new(&env, "expiry_extended"), shipment_id),
+            (old_expiry, proposal.new_expiry_ledger, counterparty),
+        );
+    }
+
+    /// Returns the pending expiry extension for a shipment, if any.
+    pub fn get_pending_expiry_extension(env: Env, shipment_id: String) -> Option<ExpiryExtensionProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::PendingExpiryExtension(shipment_id))
+    }
+
+    /// Returns the total ledgers a shipment's expiry has been extended by.
+    pub fn get_total_expiry_extended(env: Env, shipment_id: String) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::TotalExpiryExtended(shipment_id))
+            .unwrap_or(0)
+    }
+
+    // ----------------------------------------------------------
     // #546 — ORACLE CONDITION BREACH → AUTO DISPUTE
     // ----------------------------------------------------------
 
@@ -14279,7 +14978,18 @@ impl ChainSettleContract {
             );
 
             shipment.released_amount += payment;
-            let actual_transfer = (net_payment - advance_deducted - arbiter_fee_total).max(0);
+
+            // Loser-pays: the buyer lost, so the bond they get back covers the fee first.
+            let bond_return = shipment.dispute_bond_amount.max(0);
+            let loser_cover = Self::loser_pays_cover(
+                env,
+                &shipment_id,
+                milestone_index,
+                arbiter_fee_total,
+                bond_return,
+            );
+            let actual_transfer =
+                (net_payment - advance_deducted - (arbiter_fee_total - loser_cover)).max(0);
 
             // Feature C: split payment across milestone payees if configured.
             Self::pay_milestone_to_payees(
@@ -14304,12 +15014,13 @@ impl ChainSettleContract {
                 );
             }
 
-            if shipment.dispute_bond_amount > 0 {
+            let bond_refund = bond_return - loser_cover;
+            if bond_refund > 0 {
                 let primary_buyer = shipment.buyers.get(0).unwrap();
                 token_client.transfer(
                     &env.current_contract_address(),
                     &primary_buyer,
-                    &shipment.dispute_bond_amount,
+                    &bond_refund,
                 );
             }
 
@@ -14337,11 +15048,12 @@ impl ChainSettleContract {
                 );
             }
             shipment.released_amount += payment;
-            if shipment.dispute_bond_amount > 0 {
+            let bond_to_supplier = bond_forfeit - loser_cover;
+            if bond_to_supplier > 0 {
                 token_client.transfer(
                     &env.current_contract_address(),
                     &shipment.supplier,
-                    &shipment.dispute_bond_amount,
+                    &bond_to_supplier,
                 );
             }
             let mut m = shipment.milestones.get(milestone_index).unwrap();
@@ -16268,6 +16980,50 @@ impl ChainSettleContract {
         }
     }
 
+    /// #549: Shared precondition for proposing/approving an expiry extension.
+    /// Returns the shipment's current expiry ledger after checking that a
+    /// shipment exists, that it is still extendable, that the requested expiry
+    /// is genuinely later, and that the request fits the admin ceiling.
+    fn assert_extendable_expiry(
+        env: &Env,
+        shipment: &Shipment,
+        new_expiry_ledger: &u32,
+    ) -> u32 {
+        let current = shipment
+            .expires_at_ledger
+            .unwrap_or_else(|| panic!("shipment has no expiry"));
+        let now = env.ledger().sequence();
+        if now >= current {
+            panic!("shipment has already expired");
+        }
+        if *new_expiry_ledger <= current {
+            panic!("new expiry must be later than current expiry");
+        }
+        let already: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt4::TotalExpiryExtended(shipment.id.clone()))
+            .unwrap_or(0);
+        Self::assert_within_max_expiry_extension(
+            env,
+            already.saturating_add(new_expiry_ledger - current),
+        );
+        current
+    }
+
+    /// #549: Rejects a cumulative extension larger than the admin-configured
+    /// maximum. A maximum of 0 disables the ceiling.
+    fn assert_within_max_expiry_extension(env: &Env, total_extension: u32) {
+        let max: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt4::MaxExpiryExtensionLedgers)
+            .unwrap_or(0);
+        if max > 0 && total_extension > max {
+            panic!("expiry extension exceeds maximum allowed");
+        }
+    }
+
     fn assert_shipment_participant(shipment: &Shipment, caller: &Address) {
         if !Self::is_buyer(shipment, caller)
             && *caller != shipment.supplier
@@ -16606,6 +17362,16 @@ impl ChainSettleContract {
             token_client,
         );
         if net_amount <= 0 {
+            return;
+        }
+        // Invoice factoring: an assigned receivable pays the financier directly,
+        // overriding payee splits and supplier batching.
+        if let Some(financier) = Self::payout_assignee(env, shipment_id) {
+            token_client.transfer(&env.current_contract_address(), &financier, &net_amount);
+            env.events().publish(
+                (Symbol::new(env, "assigned_payout"), shipment_id.clone()),
+                (milestone_index, financier, net_amount),
+            );
             return;
         }
         let payees: Vec<MilestonePayee> = env
@@ -18245,6 +19011,7 @@ impl ChainSettleContract {
             CancellationReason::AdminEmergencyRecovery => {
                 Symbol::new(env, "AdminEmergencyRecovery")
             }
+            CancellationReason::BlacklistedSupplier => Symbol::new(env, "BlacklistedSupplier"),
         };
         let mut data: Map<Symbol, Val> = Map::new(env);
         data.set(Symbol::new(env, "shipment_id"), shipment_id.into_val(env));
@@ -18543,6 +19310,225 @@ impl ChainSettleContract {
             milestones,
             options,
         )
+    }
+}
+
+// ============================================================
+// INVOICE FACTORING & LOSER-PAYS ARBITER FEE
+// ============================================================
+
+#[contractimpl]
+impl ChainSettleContract {
+    // ----------------------------------------------------------
+    // INVOICE FACTORING: PAYOUT ASSIGNMENT
+    // ----------------------------------------------------------
+
+    /// Assign all future supplier payouts on `shipment_id` to `financier`.
+    ///
+    /// Both the supplier and the financier must authorise. While the assignment
+    /// is active, milestone payments and approved advances are sent straight to
+    /// the financier (payee splits and batched payout mode are bypassed). The
+    /// supplier cannot revoke it; only the financier can release or transfer it.
+    pub fn assign_payout(env: Env, supplier: Address, shipment_id: String, financier: Address) {
+        Self::assert_not_paused(&env);
+        supplier.require_auth();
+        financier.require_auth();
+
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if shipment.supplier != supplier {
+            panic!("only supplier can assign payout");
+        }
+        if financier == supplier {
+            panic!("financier must differ from supplier");
+        }
+        if Self::is_blacklisted(env.clone(), financier.clone()) {
+            panic!("financier is blacklisted");
+        }
+        if shipment.open_dispute_count > 0 {
+            panic!("cannot assign payout during open dispute");
+        }
+        let key = DataKeyExt4::PayoutAssignment(shipment_id.clone());
+        if env.storage().persistent().has(&key) {
+            panic!("payout already assigned");
+        }
+
+        let assignment = PayoutAssignment {
+            supplier: supplier.clone(),
+            financier: financier.clone(),
+            assigned_at_ledger: env.ledger().sequence(),
+        };
+        env.storage().persistent().set(&key, &assignment);
+
+        env.events().publish(
+            (Symbol::new(&env, "payout_assigned"), shipment_id),
+            (supplier, financier),
+        );
+    }
+
+    /// Current financier sells the receivable on to `new_financier`.
+    /// Both financiers must authorise.
+    pub fn transfer_payout_assignment(
+        env: Env,
+        financier: Address,
+        shipment_id: String,
+        new_financier: Address,
+    ) {
+        Self::assert_not_paused(&env);
+        financier.require_auth();
+        new_financier.require_auth();
+
+        let key = DataKeyExt4::PayoutAssignment(shipment_id.clone());
+        let mut assignment: PayoutAssignment = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("payout not assigned"));
+        if assignment.financier != financier {
+            panic!("only current financier can transfer assignment");
+        }
+        if new_financier == financier || new_financier == assignment.supplier {
+            panic!("invalid new financier");
+        }
+        if Self::is_blacklisted(env.clone(), new_financier.clone()) {
+            panic!("financier is blacklisted");
+        }
+
+        assignment.financier = new_financier.clone();
+        assignment.assigned_at_ledger = env.ledger().sequence();
+        env.storage().persistent().set(&key, &assignment);
+
+        env.events().publish(
+            (Symbol::new(&env, "payout_assignment_transferred"), shipment_id),
+            (financier, new_financier),
+        );
+    }
+
+    /// Financier releases the assignment (e.g. once repaid off-chain); future
+    /// payouts go back to the supplier.
+    pub fn release_payout_assignment(env: Env, financier: Address, shipment_id: String) {
+        financier.require_auth();
+
+        let key = DataKeyExt4::PayoutAssignment(shipment_id.clone());
+        let assignment: PayoutAssignment = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("payout not assigned"));
+        if assignment.financier != financier {
+            panic!("only current financier can release assignment");
+        }
+        env.storage().persistent().remove(&key);
+
+        env.events().publish(
+            (Symbol::new(&env, "payout_assignment_released"), shipment_id),
+            (assignment.supplier, financier),
+        );
+    }
+
+    /// Active payout assignment for a shipment, if any.
+    pub fn get_payout_assignment(env: Env, shipment_id: String) -> Option<PayoutAssignment> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::PayoutAssignment(shipment_id))
+    }
+
+    // ----------------------------------------------------------
+    // LOSER-PAYS ARBITER FEE ALLOCATION
+    // ----------------------------------------------------------
+
+    /// Opt a shipment in (or out) of loser-pays arbiter fee allocation.
+    ///
+    /// A buyer and the supplier must both authorise, and no dispute may be open.
+    /// When enabled, the arbiter fee on a resolution is charged first against
+    /// funds the losing party would otherwise receive from the resolution (the
+    /// buyer's returned dispute bond, the bond forfeited to the supplier, or the
+    /// supplier's graded share). Any shortfall falls back to the winner's award.
+    pub fn set_loser_pays_arbiter_fee(
+        env: Env,
+        buyer: Address,
+        supplier: Address,
+        shipment_id: String,
+        enabled: bool,
+    ) {
+        Self::assert_not_paused(&env);
+        buyer.require_auth();
+        supplier.require_auth();
+
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if !shipment.buyers.contains(&buyer) {
+            panic!("only buyer can set fee allocation");
+        }
+        if shipment.supplier != supplier {
+            panic!("only supplier can set fee allocation");
+        }
+        if shipment.open_dispute_count > 0 {
+            panic!("cannot change fee allocation during open dispute");
+        }
+
+        let key = DataKeyExt4::LoserPaysArbiterFee(shipment_id.clone());
+        if enabled {
+            env.storage().persistent().set(&key, &true);
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "loser_pays_arbiter_fee_set"), shipment_id),
+            enabled,
+        );
+    }
+
+    /// Whether loser-pays arbiter fee allocation is enabled for a shipment.
+    pub fn get_loser_pays_arbiter_fee(env: Env, shipment_id: String) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::LoserPaysArbiterFee(shipment_id))
+            .unwrap_or(false)
+    }
+}
+
+impl ChainSettleContract {
+    /// Invoice factoring: financier currently entitled to supplier payouts, if any.
+    fn payout_assignee(env: &Env, shipment_id: &String) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get::<DataKeyExt4, PayoutAssignment>(&DataKeyExt4::PayoutAssignment(
+                shipment_id.clone(),
+            ))
+            .map(|a| a.financier)
+    }
+
+    /// Loser-pays: portion of `arbiter_fee` covered by `loser_funds` (money the
+    /// losing party would otherwise receive from this resolution). The caller
+    /// reduces the loser's funds by the returned amount and deducts only the
+    /// remainder from the winner's award. Returns 0 when loser-pays is disabled.
+    fn loser_pays_cover(
+        env: &Env,
+        shipment_id: &String,
+        milestone_index: u32,
+        arbiter_fee: i128,
+        loser_funds: i128,
+    ) -> i128 {
+        let enabled: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt4::LoserPaysArbiterFee(shipment_id.clone()))
+            .unwrap_or(false);
+        if !enabled || arbiter_fee <= 0 {
+            return 0;
+        }
+        let cover = arbiter_fee.min(loser_funds.max(0));
+        env.events().publish(
+            (Symbol::new(env, "arbiter_fee_allocated"), shipment_id.clone()),
+            (milestone_index, arbiter_fee, cover, arbiter_fee - cover),
+        );
+        cover
     }
 }
 
@@ -19267,6 +20253,22 @@ impl ChainSettleContract {
             .get(&DataKeyExt3::ProofSubmitters(shipment_id.clone()))
             .unwrap_or_else(|| Vec::new(env));
         if submitters.is_empty() {
+            // #551: consortium shipments — the milestone's assigned supplier submits proof.
+            let is_consortium: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKeyExt4::IsConsortium(shipment_id.clone()))
+                .unwrap_or(false);
+            if is_consortium {
+                return env
+                    .storage()
+                    .persistent()
+                    .get(&DataKeyExt4::MilestoneSupplier(
+                        shipment_id.clone(),
+                        milestone_index,
+                    ))
+                    .unwrap_or_else(|| shipment.supplier.clone());
+            }
             return shipment.supplier.clone();
         }
         submitters
@@ -19425,6 +20427,15 @@ impl ChainSettleContract {
         );
     }
 
+    fn set_persistent4<V: IntoVal<Env, Val>>(env: &Env, key: &DataKeyExt4, value: &V) {
+        env.storage().persistent().set(key, value);
+        env.storage().persistent().extend_ttl(
+            key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
     fn decrease_total_escrowed(env: &Env, token: &Address, amount: i128) {
         let key = DataKey::TotalEscrowed(token.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -19544,8 +20555,10 @@ impl ChainSettleContract {
 
     /// #519: Pays a graded milestone: `payout` (the graded share of `gross`) to the
     /// supplier after platform fees, and `gross - payout` back to the primary buyer
-    /// (less `refund_fee`, e.g. an arbiter fee already paid out of it).
+    /// (less `refund_fee`, e.g. an arbiter fee already paid out of it). `payout_fee`
+    /// is likewise withheld from the supplier's net share (loser-pays arbiter fee).
     /// Returns (supplier net transfer, buyer refund, platform fee).
+    #[allow(clippy::too_many_arguments)]
     fn pay_graded_split(
         env: &Env,
         shipment: &Shipment,
@@ -19554,6 +20567,7 @@ impl ChainSettleContract {
         gross: i128,
         grade_bps: u32,
         refund_fee: i128,
+        payout_fee: i128,
     ) -> (i128, i128, i128) {
         let payout = (gross * grade_bps as i128) / 10_000;
         let refund = (gross - payout - refund_fee).max(0);
@@ -19562,7 +20576,8 @@ impl ChainSettleContract {
         let mut fee_amount: i128 = 0;
         let mut net = 0;
         if payout > 0 {
-            net = Self::deduct_fee(env, payout, &shipment.token, &mut fee_amount);
+            net = (Self::deduct_fee(env, payout, &shipment.token, &mut fee_amount) - payout_fee)
+                .max(0);
             Self::check_circuit_breaker(env, payout);
             Self::check_address_outflow(env, &shipment.supplier, payout);
             Self::pay_milestone_to_payees(
@@ -19837,13 +20852,16 @@ mod test_rate_limit_exemption;
 mod test_arbiter_repetition_guard;
 mod test_trade_proof;
 mod test_pause_notice;
+mod test_expiry_extension;
 mod test_buyer_cap_collateral_merge;
 mod test_tier_max_value;
 mod test_buyer_vault;
 mod test_standing_orders;
 mod test_allowance_funding;
 mod test_feat_issues;
+mod test_feat_issues_551_553_554_556;
 mod test_feat_earnings;
+mod test_slash_collateral;
 // Disabled: exercises milestone insurance holdback / oracle price-condition
 // APIs (see NEW_MILESTONE_FEATURES.md) that have not been implemented yet.
 // mod test_milestone_insurance_and_oracle;

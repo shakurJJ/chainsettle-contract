@@ -5,3 +5,8 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc fc78978c16f71727f2fd191e1b10dc9d2fdf502c060544e04d4ba0723e777e98 # shrinks to _seed = 0
+cc 9e3bc1d50777f6bb7ace91fd8f2f5d843c679afaf36e8f7ef63287bebc10f5cc # shrinks to first = 35, second = 34
+cc 91aca3ad29ea4f72c24d340e64dd702c19152b919cf3164e6ad82dbcf91d5e9f # shrinks to _seed = 6
+cc 7cbdcfc72fca8b97b610119e82ab3fc45c1784d2efcc803a1fab3d4745324cd5 # shrinks to _seed = 53
+cc a7cf3530304a65ec47fa22fe3a54d1b3699239ce95aefc26ad01a9d55f3150a2 # shrinks to below = 2
+cc 0b88e109f649a57a46ff99d16bb0984b410adc0b24ed9e12a801ec186a7341cf # shrinks to first = 16
