@@ -263,6 +263,26 @@ The allowlist gates shipment creation only. After a shipment is created, all pay
 
 ### Allowed-Token List Cap and Buyer Token Allowlist (#387, #388)
 
+### Granular Per-Operation Pause Flags
+
+ChainSettle allows administrators to pause specific operational sub-systems without halting the entire contract. This enables targeted incident containment (e.g., stopping new shipment creation while allowing existing in-flight shipments to settle and release escrow).
+
+- **Supported Operations**: `create`, `confirm`, `dispute`, `advance`, `claim`.
+- **Functions**:
+  - `set_operation_paused(admin: Address, op: Symbol, paused: bool)`: Admin-only. Sets the pause flag for the specified operation. Emits `operation_paused_set` event `((Symbol("operation_paused_set"), op), paused)`.
+  - `is_operation_paused(op: Symbol) -> bool`: Read-only, permissionless. Returns whether the operation is paused. Global `pause()` and emergency freeze override everything (returns `true` when globally paused/frozen).
+- **Gating Behavior**:
+  - `create`: Gates `create_shipment`, `create_shipment_with_allowance`, and template/vault creation.
+  - `confirm`: Gates `confirm_milestone` and `confirm_milestone_graded`.
+  - `dispute`: Gates `raise_dispute`, `raise_partial_dispute`, `resolve_dispute`, and `resolve_dispute_timeout`.
+  - `advance`: Gates `request_advance` and `approve_advance`.
+  - `claim`: Gates `claim_payout`, `claim_deadline_refund`, and `claim_auto_confirmation`.
+- **Precedence & Validation**:
+  - Global `pause()` takes precedence over per-operation flags and blocks all operations.
+  - Passing an invalid/unknown operation symbol panics with `"unknown operation"`.
+  - Calling a paused operation panics with `"operation is paused"`.
+
+
 Two complementary features let admins further tighten which tokens buyers can use.
 
 **Allowed-token list cap** — an admin can set an upper bound on how many entries the global allowlist may grow to. This guards against accidental unbounded growth when tokens are added programmatically.
@@ -568,6 +588,17 @@ stellar contract invoke \
 ```
 `get_shipment(shipment_id) → Shipment` (read-only)
 Returns the full shipment record.
+
+`extend_shipment_ttl(shipment_id)` (permissionless)
+Extends the persistent storage TTL (Time-To-Live) of a shipment and all of its associated persistent storage keys (including advances, disputes, notes, splits, retainage, collateral, etc.) to prevent archival in long-running shipments.
+- **Motivation**: Soroban persistent storage entries are subject to TTL expiration. Long-running shipments risk archival if not touched. Integrators and keeper bots can call this function to keep them alive.
+- **Parameters**: `shipment_id: String`
+- **Authorization**: None required (permissionless).
+- **Behavior**: Extends the TTL of the shipment and all existing related keys using `TTL_INITIAL_LEDGERS` (100,000) and `TTL_MAX_LEDGERS` (6,300,000).
+- **Side Effects**: Has no side effects on shipment state, balances, or milestones.
+- **Events**: Emits `shipment_ttl_extended` event with `(Symbol("shipment_ttl_extended"), shipment_id)`.
+- **Errors**: Panics with `"shipment not found"` if the shipment ID does not exist.
+
 `get_milestone(shipment_id, milestone_index) → Milestone` (read-only)
 Returns a single milestone.
 `get_reputation(supplier) → ReputationScore` (read-only)

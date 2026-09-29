@@ -117,6 +117,15 @@ pub fn shipment_exists(env: &Env, shipment_id: &String) -> bool {
         .has(&DataKey::V1Shipment(shipment_id.clone()))
 }
 
+pub fn extend_shipment_ttl(env: &Env, shipment_id: &String) {
+    let key = DataKey::V1Shipment(shipment_id.clone());
+    if env.storage().persistent().has(&key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_INITIAL_LEDGERS, TTL_MAX_LEDGERS);
+    }
+}
+
 // ============================================================
 // CANCEL POLICY ACCESSORS
 // ============================================================
@@ -316,6 +325,23 @@ pub fn is_paused(env: &Env) -> bool {
 
 pub fn set_paused(env: &Env, paused: bool) {
     env.storage().instance().set(&DataKey::V1Paused, &paused);
+}
+
+pub fn is_operation_paused(env: &Env, op: soroban_sdk::Symbol) -> bool {
+    let global_paused = is_paused(env);
+    if global_paused {
+        return true;
+    }
+    env.storage()
+        .instance()
+        .get(&crate::DataKeyExt4::OperationPaused(op))
+        .unwrap_or(false)
+}
+
+pub fn set_operation_paused(env: &Env, op: soroban_sdk::Symbol, paused: bool) {
+    env.storage()
+        .instance()
+        .set(&crate::DataKeyExt4::OperationPaused(op), &paused);
 }
 
 pub fn get_fee_config(env: &Env) -> Option<FeeConfig> {
