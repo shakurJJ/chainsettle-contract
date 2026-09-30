@@ -253,30 +253,40 @@ Parameters:
 Returns: shipment_id (same as input, for confirmation)
 ```
 
-### Contract-Generated Unique Shipment IDs (#564)
-`create_shipment_auto_id(buyer, supplier, logistics, arbiter, token, total_amount, milestones, options) → String`
-Creates a shipment with an auto-incrementing contract counter instead of requiring a manual `shipment_id`. Returns the generated unique ID formatted as `"AUTO-1"`, `"AUTO-2"`, etc.
+### Shipment-Level Cost Estimation (`estimate_shipment_costs`)
 
-### Alternate Collateral Token (#557)
-- `set_collateral_token(buyer, shipment_id, collateral_token)`
-- `get_collateral_token(shipment_id) → Address`
+A read-only simulation query that estimates every fee, payout, bond, and collateral requirement for a whole shipment before creation.
 
-Allows designating a distinct Stellar Asset Contract address for supplier collateral. When set, collateral locking, slashes, and refunds route through this token instead of defaulting to the escrow token.
+```rust
+estimate_shipment_costs(
+    buyer: Address,
+    token: Address,
+    total_amount: i128,
+    milestones: Vec<Milestone>,
+    options: ShipmentOptions,
+) -> ShipmentCostEstimate
+```
 
-### Escrow Token Depeg Guard (#558)
-- `set_depeg_guard(admin, config)`
-- `remove_depeg_guard(admin)`
-- `get_depeg_guard() → Option<DepegGuardConfig>`
-- `is_token_depegged(oracle_address, feed_id, threshold_bps, base_price) → bool`
+**Parameters:**
+- `buyer`: Primary buyer address (used to evaluate buyer lifetime volume tiers and active VIP fee waivers).
+- `token`: Escrow token SAC address (validated against allowlists and min/max value bounds).
+- `total_amount`: Total shipment escrow amount.
+- `milestones`: Ordered list of proposed shipment milestones.
+- `options`: `ShipmentOptions` configuration (splits, dispute bond bps/amount, supplier collateral, logistics fee bps, etc.).
 
-Configures price oracle monitoring (e.g., Band/SEP-40 price feeds) for escrow tokens. `confirm_milestone` asserts the token is not depegged beyond `threshold_bps` from its base price. If depegged, releases are paused.
+**Returns: `ShipmentCostEstimate`**
+- `total_amount` (`i128`): Total gross shipment amount.
+- `total_platform_fee` (`i128`): Sum of platform fees across all milestones.
+- `total_logistics_fee` (`i128`): Sum of logistics fees across all milestones.
+- `total_net_amount` (`i128`): Total net amount payable to supplier across all milestones.
+- `collateral_required` (`i128`): Required supplier collateral.
+- `dispute_bond` (`i128`): Total dispute bond locked by buyer at creation.
+- `applied_fee_bps` (`u32`): Effective platform fee rate applied (reflects active fee holidays, VIP waivers, and volume tiers).
+- `milestones` (`Vec<MilestoneCostEstimate>`): Per-milestone breakdown with `milestone_index`, `gross_amount`, `platform_fee`, `logistics_fee`, and `net_amount`.
 
-### Global Cap on Total Escrowed Value (TVL Cap) (#559)
-- `set_tvl_cap(admin, token, cap)`
-- `get_tvl_cap(token) → i128`
-- `get_tvl(token) → i128`
-
-Enforces an admin-configured global TVL cap per token. `create_shipment` and `top_up_escrow` reject deposits exceeding the cap with `TvlCapExceeded`.
+**Key Properties:**
+- **Read-only & Auth-Free**: Requires no signatures or transaction fees.
+- **Accurate Upfront Pricing**: Fully accounts for active fee holidays (`0 bps`), VIP partner waivers, and buyer lifetime volume tiers.
 
 Allowed token list
 The `token` parameter on `create_shipment` is checked against an admin-managed allowlist (`DataKey::AllowedTokens`). By default the list is empty, which means **open mode**: any Stellar Asset Contract (SAC) address is accepted. Once the admin adds at least one token, `create_shipment` only accepts tokens on that list — a non-listed token panics with `"token is not in the approved whitelist"`.
@@ -287,6 +297,26 @@ Function Who Effect
 The allowlist gates shipment creation only. After a shipment is created, all payouts (`confirm_milestone`, dispute resolution, cancellation refunds, etc.) always use the token address stored on that shipment — they never re-check the allowlist.
 
 ### Allowed-Token List Cap and Buyer Token Allowlist (#387, #388)
+
+### Granular Per-Operation Pause Flags
+
+ChainSettle allows administrators to pause specific operational sub-systems without halting the entire contract. This enables targeted incident containment (e.g., stopping new shipment creation while allowing existing in-flight shipments to settle and release escrow).
+
+- **Supported Operations**: `create`, `confirm`, `dispute`, `advance`, `claim`.
+- **Functions**:
+  - `set_operation_paused(admin: Address, op: Symbol, paused: bool)`: Admin-only. Sets the pause flag for the specified operation. Emits `operation_paused_set` event `((Symbol("operation_paused_set"), op), paused)`.
+  - `is_operation_paused(op: Symbol) -> bool`: Read-only, permissionless. Returns whether the operation is paused. Global `pause()` and emergency freeze override everything (returns `true` when globally paused/frozen).
+- **Gating Behavior**:
+  - `create`: Gates `create_shipment`, `create_shipment_with_allowance`, and template/vault creation.
+  - `confirm`: Gates `confirm_milestone` and `confirm_milestone_graded`.
+  - `dispute`: Gates `raise_dispute`, `raise_partial_dispute`, `resolve_dispute`, and `resolve_dispute_timeout`.
+  - `advance`: Gates `request_advance` and `approve_advance`.
+  - `claim`: Gates `claim_payout`, `claim_deadline_refund`, and `claim_auto_confirmation`.
+- **Precedence & Validation**:
+  - Global `pause()` takes precedence over per-operation flags and blocks all operations.
+  - Passing an invalid/unknown operation symbol panics with `"unknown operation"`.
+  - Calling a paused operation panics with `"operation is paused"`.
+
 
 Two complementary features let admins further tighten which tokens buyers can use.
 
@@ -593,6 +623,17 @@ stellar contract invoke \
 ```
 `get_shipment(shipment_id) → Shipment` (read-only)
 Returns the full shipment record.
+
+`extend_shipment_ttl(shipment_id)` (permissionless)
+Extends the persistent storage TTL (Time-To-Live) of a shipment and all of its associated persistent storage keys (including advances, disputes, notes, splits, retainage, collateral, etc.) to prevent archival in long-running shipments.
+- **Motivation**: Soroban persistent storage entries are subject to TTL expiration. Long-running shipments risk archival if not touched. Integrators and keeper bots can call this function to keep them alive.
+- **Parameters**: `shipment_id: String`
+- **Authorization**: None required (permissionless).
+- **Behavior**: Extends the TTL of the shipment and all existing related keys using `TTL_INITIAL_LEDGERS` (100,000) and `TTL_MAX_LEDGERS` (6,300,000).
+- **Side Effects**: Has no side effects on shipment state, balances, or milestones.
+- **Events**: Emits `shipment_ttl_extended` event with `(Symbol("shipment_ttl_extended"), shipment_id)`.
+- **Errors**: Panics with `"shipment not found"` if the shipment ID does not exist.
+
 `get_milestone(shipment_id, milestone_index) → Milestone` (read-only)
 Returns a single milestone.
 `get_reputation(supplier) → ReputationScore` (read-only)
@@ -3040,3 +3081,71 @@ stellar contract invoke --id <CONTRACT_ID> \
   --network testnet -- get_shipments_by_jurisdiction \
   --jurisdiction US
 ```
+
+---
+
+### Granular Admin Roles (Least Privilege)
+
+To enforce the principle of least privilege, operational keys can be granted scoped administrative roles without requiring full contract admin powers.
+
+#### Role Enum
+The `Role` enum defines four operational roles:
+- `Pauser`: Controls contract-wide pausing and unpausing.
+- `FeeManager`: Controls platform fee configs, fee holidays, fee tiers, referral fees, and shipment fee overrides.
+- `ComplianceOfficer`: Controls blacklisting, appeals, whitelist management, token allowances, and buyer-specific token permissions.
+- `ArbiterManager`: Manages the global arbiter pool (adding and removing arbiters).
+
+#### Role Management API
+| Function | Who | Behaviour |
+| --- | --- | --- |
+| `grant_role(admin, role, address)` | Primary Admin only | Grants `role` to `address`. Emits `role_granted` event and appends to admin audit trail. |
+| `revoke_role(admin, role, address)` | Primary Admin only | Revokes `role` from `address`. Takes effect immediately. Emits `role_revoked` event and appends to admin audit trail. |
+| `has_role(role, address) → bool` | Anyone (read-only) | Returns `true` if `address` holds `role` or is the primary contract admin. |
+
+#### Role-to-Function Permission Matrix
+
+| Role | Permitted Functions | Description |
+| --- | --- | --- |
+| **Pauser** | `pause(admin)`<br>`unpause(admin)` | Emergency halting and resumption of contract operations. |
+| **FeeManager** | `set_fee_config(admin, fee_bps, treasury)`<br>`schedule_fee_holiday(admin, start_ledger, end_ledger)`<br>`cancel_fee_holiday(admin)`<br>`set_fee_recipients(admin, recipients)`<br>`set_referral_fee_bps(admin, bps)`<br>`set_fee_tiers(admin, tiers)`<br>`set_shipment_fee_override(admin, shipment_id, fee_bps)`<br>`clear_shipment_fee_override(admin, shipment_id)` | Configuration of platform fees, fee holidays, revenue shares, and overrides. |
+| **ComplianceOfficer** | `blacklist_address(admin, address, reason_hash)`<br>`remove_from_blacklist(admin, address)`<br>`review_blacklist_appeal(admin, address, approve)`<br>`add_to_whitelist(admin, address)`<br>`remove_from_whitelist(admin, address)`<br>`set_require_mutual_preapproval(admin, enabled)`<br>`set_max_allowed_tokens(admin, max_allowed)`<br>`set_buyer_allowed_tokens(admin, buyer, tokens)` | Compliance rules, sanctions, whitelists, and token restrictions. |
+| **ArbiterManager** | `add_arbiter_to_pool(admin, arbiter)`<br>`remove_arbiter_from_pool(admin, arbiter)` | Arbiter pool membership management. |
+| **Primary Admin** | **All functions above** + role management, contract upgrades, timelock, and admin nominations. | Full super-admin access implicitly retains permissions for all scoped roles. |
+
+#### Key Properties
+1. **Implicit Super-Admin Access:** The primary contract admin retains access to all functions across every role without needing explicit role grants.
+2. **Immediate Revocation:** Role grants and revocations take effect instantaneously upon execution.
+3. **Multi-Role Assignment:** An address can be granted multiple distinct roles independently.
+4. **Audit Trail & Events:** All `grant_role` and `revoke_role` invocations emit event notifications (`role_granted`, `role_revoked`) and append entries to the immutable `admin_action_log`.
+
+#### CLI Usage Example
+
+```bash
+# Admin grants the FeeManager role to an operational address
+stellar contract invoke --id <CONTRACT_ID> --source admin \
+  --network testnet -- grant_role \
+  --admin <ADMIN_ADDRESS> \
+  --role FeeManager \
+  --address <OPERATIONAL_ADDRESS>
+
+# Check if the address holds the role
+stellar contract invoke --id <CONTRACT_ID> \
+  --network testnet -- has_role \
+  --role FeeManager \
+  --address <OPERATIONAL_ADDRESS>
+
+# Operational address updates the platform fee
+stellar contract invoke --id <CONTRACT_ID> --source operator \
+  --network testnet -- set_fee_config \
+  --admin <OPERATIONAL_ADDRESS> \
+  --fee_bps 200 \
+  --treasury <TREASURY_ADDRESS>
+
+# Admin revokes the role
+stellar contract invoke --id <CONTRACT_ID> --source admin \
+  --network testnet -- revoke_role \
+  --admin <ADMIN_ADDRESS> \
+  --role FeeManager \
+  --address <OPERATIONAL_ADDRESS>
+```
+
