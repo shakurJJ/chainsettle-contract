@@ -58,7 +58,6 @@ fn create_ship(
 
     let mut opts = default_options(&t.env);
     opts.supplier_collateral = collateral;
-    opts.collateral_slash_bps_per_miss = slash_bps;
 
     let shipment_id = sid(&t.env, id);
     client.create_shipment(
@@ -72,6 +71,9 @@ fn create_ship(
         &milestone_with_deadline(&t.env, deadline),
         &opts,
     );
+    if slash_bps > 0 {
+        client.set_collateral_slash_bps(&t.buyer, &shipment_id, &slash_bps);
+    }
     shipment_id
 }
 
@@ -211,7 +213,6 @@ fn test_second_milestone_slashes_the_reduced_balance() {
     t.env.ledger().set_sequence_number(1);
     let mut opts = default_options(&t.env);
     opts.supplier_collateral = 1_000_000;
-    opts.collateral_slash_bps_per_miss = 1_000; // 10%
 
     let id = sid(&t.env, "slash-two-ms");
     let milestones = vec![
@@ -250,6 +251,7 @@ fn test_second_milestone_slashes_the_reduced_balance() {
         &milestones,
         &opts,
     );
+    client.set_collateral_slash_bps(&t.buyer, &id, &1_000);
 
     t.env.ledger().set_sequence_number(200);
     let before = token_client.balance(&t.buyer);
@@ -543,7 +545,7 @@ fn test_slash_rejected_when_collateral_already_drained() {
 // ============================================================
 
 #[test]
-#[should_panic(expected = "collateral_slash_bps_per_miss cannot exceed 10000")]
+#[should_panic(expected = "bps cannot exceed 10000")]
 fn test_creation_rejects_bps_above_10000() {
     let t = setup();
     let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
@@ -551,10 +553,10 @@ fn test_creation_rejects_bps_above_10000() {
 
     let mut opts = default_options(&t.env);
     opts.supplier_collateral = 1_000_000;
-    opts.collateral_slash_bps_per_miss = 10_001;
 
+    let id = sid(&t.env, "slash-bad-bps");
     client.create_shipment(
-        &sid(&t.env, "slash-bad-bps"),
+        &id,
         &single_buyer_vec(&t.env, &t.buyer),
         &t.supplier,
         &t.logistics,
@@ -564,29 +566,7 @@ fn test_creation_rejects_bps_above_10000() {
         &milestone_with_deadline(&t.env, 100),
         &opts,
     );
-}
-
-#[test]
-#[should_panic(expected = "collateral_slash_bps_per_miss requires supplier_collateral")]
-fn test_creation_rejects_bps_without_collateral() {
-    let t = setup();
-    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
-
-    let mut opts = default_options(&t.env);
-    opts.supplier_collateral = 0;
-    opts.collateral_slash_bps_per_miss = 1_000;
-
-    client.create_shipment(
-        &sid(&t.env, "slash-no-collat"),
-        &single_buyer_vec(&t.env, &t.buyer),
-        &t.supplier,
-        &t.logistics,
-        &t.arbiter,
-        &t.token_id,
-        &1_000_000,
-        &milestone_with_deadline(&t.env, 100),
-        &opts,
-    );
+    client.set_collateral_slash_bps(&t.buyer, &id, &10_001);
 }
 
 #[test]
@@ -597,7 +577,6 @@ fn test_creation_accepts_10000_bps_with_collateral() {
 
     let mut opts = default_options(&t.env);
     opts.supplier_collateral = 1_000_000;
-    opts.collateral_slash_bps_per_miss = 10_000;
 
     let id = sid(&t.env, "slash-full-rate-ok");
     client.create_shipment(
@@ -611,6 +590,7 @@ fn test_creation_accepts_10000_bps_with_collateral() {
         &milestone_with_deadline(&t.env, 100),
         &opts,
     );
+    client.set_collateral_slash_bps(&t.buyer, &id, &10_000);
 
     assert_eq!(client.get_collateral_slash_bps(&id), 10_000);
 }
@@ -623,7 +603,6 @@ fn test_default_bps_is_zero_and_no_key_written() {
 
     let mut opts = default_options(&t.env);
     opts.supplier_collateral = 1_000_000;
-    assert_eq!(opts.collateral_slash_bps_per_miss, 0);
 
     let id = sid(&t.env, "slash-default");
     client.create_shipment(
@@ -759,7 +738,6 @@ fn test_slash_from_a_vault_funded_shipment_credits_the_vault() {    let t = setu
     let mut opts = default_options(&t.env);
     opts.fund_from_vault = true;
     opts.supplier_collateral = 1_000_000;
-    opts.collateral_slash_bps_per_miss = 1_000;
 
     let id = sid(&t.env, "slash-vault");
     client.create_shipment(
@@ -773,6 +751,7 @@ fn test_slash_from_a_vault_funded_shipment_credits_the_vault() {    let t = setu
         &milestone_with_deadline(&t.env, 100),
         &opts,
     );
+    client.set_collateral_slash_bps(&t.buyer, &id, &1_000);
 
     t.env.ledger().set_sequence_number(200);
     let slashed = client.slash_collateral_for_miss(&t.buyer, &id, &0u32);
