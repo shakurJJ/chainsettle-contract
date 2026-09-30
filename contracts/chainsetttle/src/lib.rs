@@ -1620,6 +1620,10 @@ pub enum DataKeyExt4 {
     /// Total ledgers a shipment's expiry has already been extended by, so the
     /// admin ceiling applies cumulatively rather than per extension.
     TotalExpiryExtended(String),
+
+    // ── Granular per-operation pause flags ────────────────────────────────
+    /// Granular per-operation pause flag: Symbol -> bool.
+    OperationPaused(Symbol),
 }
 
 /// #549 – Pending proposal to move a shipment's `expires_at_ledger` later.
@@ -2170,6 +2174,62 @@ impl ChainSettleContract {
             (Symbol::new(&env, "contract_unpaused"),),
             env.ledger().sequence(),
         );
+    }
+
+    // ----------------------------------------------------------
+    // ADMIN: GRANULAR PER-OPERATION PAUSE FLAGS
+    // ----------------------------------------------------------
+
+    /// Granular per-operation pause. Sets whether a specific operation
+    /// (`create`, `confirm`, `dispute`, `advance`, `claim`) is paused.
+    /// Admin only.
+    pub fn set_operation_paused(env: Env, admin: Address, op: Symbol, paused: bool) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        Self::validate_operation(&env, &op);
+
+        env.storage()
+            .instance()
+            .set(&DataKeyExt4::OperationPaused(op.clone()), &paused);
+
+        Self::append_admin_action(
+            &env,
+            Symbol::new(&env, "set_op_paused"),
+            if paused {
+                Symbol::new(&env, "op_paused")
+            } else {
+                Symbol::new(&env, "op_unpaused")
+            },
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "operation_paused_set"), op),
+            paused,
+        );
+    }
+
+    /// Returns whether a specific operation is paused.
+    /// The global pause and emergency freeze override everything (returns true if globally paused).
+    /// Read-only; no auth required.
+    pub fn is_operation_paused(env: Env, op: Symbol) -> bool {
+        Self::validate_operation(&env, &op);
+        let global_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        let frozen: bool = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt2::EmergencyFrozen)
+            .unwrap_or(false);
+        if global_paused || frozen {
+            return true;
+        }
+        env.storage()
+            .instance()
+            .get(&DataKeyExt4::OperationPaused(op))
+            .unwrap_or(false)
     }
 
     // ----------------------------------------------------------
@@ -3388,7 +3448,7 @@ impl ChainSettleContract {
         env.storage()
             .instance()
             .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "create"));
         params.spender.require_auth();
 
         if params.buyers.is_empty() {
@@ -6791,7 +6851,7 @@ impl ChainSettleContract {
         env.storage()
             .instance()
             .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "create"));
         let response_deadline = options.response_deadline;
         let penalty_bps = options.penalty_bps;
         let milestone_mode = options.milestone_mode;
@@ -8114,7 +8174,7 @@ impl ChainSettleContract {
         env.storage()
             .instance()
             .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "advance"));
 
         let shipment = Self::get_shipment_internal(&env, &shipment_id);
 
@@ -8171,7 +8231,7 @@ impl ChainSettleContract {
         env.storage()
             .instance()
             .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "advance"));
 
         let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
 
@@ -9292,7 +9352,7 @@ impl ChainSettleContract {
         env.storage()
             .instance()
             .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "confirm"));
 
         // Batch read shipment and contract stats in a single context fetch.
         let ctx = Self::fetch_confirm_milestone_ctx(&env, &shipment_id);
@@ -10193,7 +10253,7 @@ impl ChainSettleContract {
     }
 
     pub fn raise_dispute(env: Env, buyer: Address, shipment_id: String, milestone_index: u32) {
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "dispute"));
 
         let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
 
@@ -10440,7 +10500,7 @@ impl ChainSettleContract {
         milestone_index: u32,
         contested_percent: u32,
     ) {
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "dispute"));
 
         if contested_percent == 0 || contested_percent >= 100 {
             panic!("contested_percent must be between 1 and 99");
@@ -10731,7 +10791,7 @@ impl ChainSettleContract {
         approve: bool,
         reason: Option<ResolutionReason>,
     ) {
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "dispute"));
 
         let reason = reason.unwrap_or(if approve {
             ResolutionReason::ProofValid
@@ -12454,7 +12514,7 @@ impl ChainSettleContract {
     /// Claim auto-confirmation for a milestone when the auto-confirm window has expired.
     /// Callable by anyone. Transfers payment to supplier and returns penalty to buyer if applicable.
     pub fn claim_auto_confirmation(env: Env, shipment_id: String, milestone_index: u32) {
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "claim"));
 
         let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
 
@@ -12842,7 +12902,7 @@ impl ChainSettleContract {
     /// Applies the shipment's default_resolution: pays the supplier or refunds the buyer.
     /// Arbiter resolution before the timeout window always takes priority.
     pub fn resolve_dispute_timeout(env: Env, shipment_id: String, milestone_index: u32) {
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "dispute"));
 
         let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
         let arbiter = shipment.arbiter.clone();
@@ -14195,7 +14255,7 @@ impl ChainSettleContract {
         shipment_id: String,
         milestone_index: u32,
     ) {
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "claim"));
 
         let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
 
@@ -16398,6 +16458,39 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
+    // PERMISSIONLESS SHIPMENT STORAGE TTL EXTENSION
+    // ----------------------------------------------------------
+
+    /// Permissionless. Extends the persistent storage TTL of a shipment and all
+    /// of its associated persistent storage keys (e.g. advances, disputes, notes,
+    /// splits, retainage, collateral, etc.) to prevent archival.
+    ///
+    /// Panics with `"shipment not found"` if the shipment does not exist.
+    /// Has no side effects on the shipment's internal state.
+    pub fn extend_shipment_ttl(env: Env, shipment_id: String) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+
+        // Validates shipment existence (panics with "shipment not found" if unknown).
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+
+        let shipment_key = DataKey::Shipment(shipment_id.clone());
+        env.storage().persistent().extend_ttl(
+            &shipment_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        Self::extend_shipment_related_keys_ttl(&env, &shipment_id, &shipment);
+
+        env.events().publish(
+            (Symbol::new(&env, "shipment_ttl_extended"), shipment_id),
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
+    // ----------------------------------------------------------
     // #575 — LIGHTWEIGHT SHIPMENT SUMMARY
     // ----------------------------------------------------------
 
@@ -17281,6 +17374,29 @@ impl ChainSettleContract {
         }
     }
 
+    fn validate_operation(env: &Env, op: &Symbol) {
+        if *op != Symbol::new(env, "create")
+            && *op != Symbol::new(env, "confirm")
+            && *op != Symbol::new(env, "dispute")
+            && *op != Symbol::new(env, "advance")
+            && *op != Symbol::new(env, "claim")
+        {
+            panic!("unknown operation");
+        }
+    }
+
+    fn assert_operation_not_paused(env: &Env, op: Symbol) {
+        Self::assert_not_paused(env);
+        let op_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt4::OperationPaused(op))
+            .unwrap_or(false);
+        if op_paused {
+            panic!("operation is paused");
+        }
+    }
+
     fn is_shipment_paused_internal(env: &Env, shipment_id: &String) -> bool {
         env.storage()
             .persistent()
@@ -17871,7 +17987,7 @@ impl ChainSettleContract {
     /// `payout_claimed` event. Otherwise falls back to paying out in `token`
     /// unchanged (never reverts due to a missing/insufficient route).
     pub fn claim_payout(env: Env, supplier: Address, token: Address) {
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "claim"));
         supplier.require_auth();
 
         let pending: i128 = env
@@ -19923,7 +20039,7 @@ impl ChainSettleContract {
         env.storage()
             .instance()
             .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "confirm"));
 
         let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
         if shipment.status != ShipmentStatus::Active {
@@ -21148,6 +21264,150 @@ impl ChainSettleContract {
             (primary_buyer, retainage, warranty),
         );
     }
+
+    fn extend_shipment_related_keys_ttl(
+        env: &Env,
+        shipment_id: &String,
+        shipment: &Shipment,
+    ) {
+        macro_rules! bump_key {
+            ($k:expr) => {{
+                let key = $k;
+                if env.storage().persistent().has(&key) {
+                    env.storage().persistent().extend_ttl(
+                        &key,
+                        constants::TTL_INITIAL_LEDGERS,
+                        constants::TTL_MAX_LEDGERS,
+                    );
+                }
+            }};
+        }
+
+        // Shipment-level keys
+        bump_key!(DataKey::CancelPolicy(shipment_id.clone()));
+        bump_key!(DataKey::SupplierCollateral(shipment_id.clone()));
+        bump_key!(DataKey::PendingRecovery(shipment_id.clone()));
+        bump_key!(DataKey::ConfirmationDelegate(shipment_id.clone()));
+
+        bump_key!(DataKeyExt::ShipmentFeeBps(shipment_id.clone()));
+        bump_key!(DataKeyExt::MilestoneSplits(shipment_id.clone()));
+        bump_key!(DataKeyExt::MilestoneTimestampDeadlines(shipment_id.clone()));
+        bump_key!(DataKeyExt::BackupArbiter(shipment_id.clone()));
+        bump_key!(DataKeyExt::ShipmentConfirmationCooldown(shipment_id.clone()));
+        bump_key!(DataKeyExt::DisputeDecayStartLedger(shipment_id.clone()));
+        bump_key!(DataKeyExt::ShipmentFeeOverride(shipment_id.clone()));
+        bump_key!(DataKeyExt::ArbiterPanel(shipment_id.clone()));
+        bump_key!(DataKeyExt::ShipmentPaused(shipment_id.clone()));
+        bump_key!(DataKeyExt::ShipmentPauseRequest(shipment_id.clone()));
+        bump_key!(DataKeyExt::ShipmentPausedAt(shipment_id.clone()));
+        bump_key!(DataKeyExt::ArchivedShipment(shipment_id.clone()));
+
+        bump_key!(DataKeyExt2::CoBuyer(shipment_id.clone()));
+        bump_key!(DataKeyExt2::ComplianceHold(shipment_id.clone()));
+        bump_key!(DataKeyExt2::ShipmentMediator(shipment_id.clone()));
+        bump_key!(DataKeyExt2::ShipmentJurisdiction(shipment_id.clone()));
+        bump_key!(DataKeyExt2::ShipmentObservers(shipment_id.clone()));
+
+        bump_key!(DataKeyExt3::ShipmentOraclePurpose(shipment_id.clone()));
+        let meta_keys_key = DataKeyExt3::ShipmentMetadataKeys(shipment_id.clone());
+        if env.storage().persistent().has(&meta_keys_key) {
+            env.storage().persistent().extend_ttl(
+                &meta_keys_key,
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+            if let Some(keys) = env
+                .storage()
+                .persistent()
+                .get::<DataKeyExt3, Vec<Symbol>>(&meta_keys_key)
+            {
+                for i in 0..keys.len() {
+                    let k = keys.get(i).unwrap();
+                    bump_key!(DataKeyExt3::ShipmentMetadata(shipment_id.clone(), k));
+                }
+            }
+        }
+        bump_key!(DataKeyExt3::QualityGrades(shipment_id.clone()));
+        bump_key!(DataKeyExt3::MilestoneQuantities(shipment_id.clone()));
+        bump_key!(DataKeyExt3::RetainageBps(shipment_id.clone()));
+        bump_key!(DataKeyExt3::RetainageBalance(shipment_id.clone()));
+        bump_key!(DataKeyExt3::WarrantyConfig(shipment_id.clone()));
+        bump_key!(DataKeyExt3::WarrantyBalance(shipment_id.clone()));
+        bump_key!(DataKeyExt3::WarrantyEndsAt(shipment_id.clone()));
+        bump_key!(DataKeyExt3::WarrantyClaim(shipment_id.clone()));
+        bump_key!(DataKeyExt3::IncrementalCollateral(shipment_id.clone()));
+        bump_key!(DataKeyExt3::IncrementalCollateralBase(shipment_id.clone()));
+        bump_key!(DataKeyExt3::MilestoneMergeProposal(shipment_id.clone()));
+        bump_key!(DataKeyExt3::MilestoneSplitProposal(shipment_id.clone()));
+        bump_key!(DataKeyExt3::ShipmentInspector(shipment_id.clone()));
+        bump_key!(DataKeyExt3::InspectedMilestones(shipment_id.clone()));
+        bump_key!(DataKeyExt3::ProofSubmitters(shipment_id.clone()));
+        bump_key!(DataKeyExt3::RequireDualAttestation(shipment_id.clone()));
+
+        bump_key!(DataKeyExt4::ShipmentFeesPaid(shipment_id.clone()));
+        bump_key!(DataKeyExt4::ShipmentHadDispute(shipment_id.clone()));
+        bump_key!(DataKeyExt4::PendingExpiryExtension(shipment_id.clone()));
+        bump_key!(DataKeyExt4::TotalExpiryExtended(shipment_id.clone()));
+
+        let oracle_purpose = env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt3, Symbol>(&DataKeyExt3::ShipmentOraclePurpose(shipment_id.clone()));
+
+        // Per-milestone keys
+        for i in 0..shipment.milestones.len() {
+            bump_key!(DataKey::ProofSubmittedAt(shipment_id.clone(), i));
+            bump_key!(DataKey::AdvanceRequest(shipment_id.clone(), i));
+            bump_key!(DataKey::MilestoneProofWhitelist(shipment_id.clone(), i));
+            bump_key!(DataKey::SubmittedProofType(shipment_id.clone(), i));
+            bump_key!(DataKey::DisputeContestedPercent(shipment_id.clone(), i));
+            bump_key!(DataKey::EvidenceCount(shipment_id.clone(), i));
+
+            bump_key!(DataKeyExt::MilestoneInvoiceHash(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::AmendmentLog(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::ExtensionRequest(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::MilestoneDeadline(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::DisputeOpenedAt(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::EffectiveDisputeBond(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::DisputeVotes(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::MilestonePayees(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::ProofSubmitter(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::MilestoneNotes(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::DisputeEvidence(shipment_id.clone(), i));
+
+            bump_key!(DataKeyExt2::DeadlineWarningFired(shipment_id.clone(), i));
+            bump_key!(DataKeyExt2::JointConfirmation(shipment_id.clone(), i));
+            bump_key!(DataKeyExt2::DisputeResolvedAtLedger(shipment_id.clone(), i));
+            bump_key!(DataKeyExt2::DisputeAppealed(shipment_id.clone(), i));
+            bump_key!(DataKeyExt2::MediationProposal(shipment_id.clone(), i));
+            bump_key!(DataKeyExt2::DisputeAppealOriginal(shipment_id.clone(), i));
+            bump_key!(DataKeyExt2::DisputeResolvedApprove(shipment_id.clone(), i));
+            bump_key!(DataKeyExt2::DisputeResolutionReason(shipment_id.clone(), i));
+            bump_key!(DataKeyExt2::ExtensionRequestCount(shipment_id.clone(), i));
+
+            bump_key!(DataKeyExt3::RefundClaimableAtLedger(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::MilestoneGrade(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::PendingGrade(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::GradeDispute(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::DeliveredQuantity(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::PartialQtyReleased(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::DisputeRaisedBy(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::InspectionReport(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::PendingDualProof(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::ConditionBreachReports(shipment_id.clone(), i));
+
+            bump_key!(DataKeyExt4::SubstituteProposal(shipment_id.clone(), i));
+            bump_key!(DataKeyExt4::MilestoneSupplier(shipment_id.clone(), i));
+
+            if let Some(ref purpose) = oracle_purpose {
+                bump_key!(DataKeyExt3::OracleAttestations(
+                    shipment_id.clone(),
+                    i,
+                    purpose.clone()
+                ));
+            }
+        }
+    }
 }
 
 pub mod constants;
@@ -21157,8 +21417,10 @@ mod test_arbiter_slashing;
 mod test_cancellation_reason;
 mod test_common;
 mod test_correct_proof;
+mod test_extend_shipment_ttl;
 mod test_feat_four;
 mod test_new_features;
+mod test_operation_pause;
 
 // Legacy test modules — some have pre-existing compilation issues.
 // They are kept as source but only enabled when their API drift is resolved.
