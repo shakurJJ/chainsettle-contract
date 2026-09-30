@@ -125,6 +125,16 @@ pub enum ResolutionReason {
     MutualSettlement,
 }
 
+/// Granular administrative roles for least-privilege access control.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role {
+    Pauser,
+    FeeManager,
+    ComplianceOfficer,
+    ArbiterManager,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub struct Milestone {
@@ -622,6 +632,32 @@ pub struct PayoutPreview {
     pub would_be_held: bool,
     /// True if confirming this milestone would complete the shipment.
     pub is_final_milestone: bool,
+}
+
+/// Estimated payout and fees for an individual milestone in a proposed shipment.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct MilestoneCostEstimate {
+    pub milestone_index: u32,
+    pub gross_amount: i128,
+    pub platform_fee: i128,
+    pub logistics_fee: i128,
+    pub net_amount: i128,
+}
+
+/// Read-only simulation of total costs, fees, payouts, dispute bond, and collateral
+/// for an entire shipment before creation.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct ShipmentCostEstimate {
+    pub total_amount: i128,
+    pub total_platform_fee: i128,
+    pub total_logistics_fee: i128,
+    pub total_net_amount: i128,
+    pub collateral_required: i128,
+    pub dispute_bond: i128,
+    pub applied_fee_bps: u32,
+    pub milestones: Vec<MilestoneCostEstimate>,
 }
 
 #[contracttype]
@@ -1527,6 +1563,10 @@ pub enum DataKeyExt3 {
     /// Oracles that have reported a condition breach for a milestone:
     /// Vec<(Address, BytesN<32>)> of (oracle, data_hash).
     ConditionBreachReports(String, u32),
+
+    // ── Granular Admin Roles ──────────────────────────────────────────────
+    /// Granular role assignment for least-privilege operations: (role, address) -> bool.
+    UserRole(Role, Address),
 }
 
 /// `DataKeyExt3` is at the 50-variant XDR ceiling, so keys added from here on
@@ -1580,6 +1620,10 @@ pub enum DataKeyExt4 {
     /// Total ledgers a shipment's expiry has already been extended by, so the
     /// admin ceiling applies cumulatively rather than per extension.
     TotalExpiryExtended(String),
+
+    // ── Granular per-operation pause flags ────────────────────────────────
+    /// Granular per-operation pause flag: Symbol -> bool.
+    OperationPaused(Symbol),
 }
 
 /// #549 – Pending proposal to move a shipment's `expires_at_ledger` later.
@@ -2049,13 +2093,61 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
+    // GRANULAR ADMIN ROLES (LEAST PRIVILEGE)
+    // ----------------------------------------------------------
+
+    /// Grants a scoped operational role to an address. Admin only.
+    pub fn grant_role(env: Env, admin: Address, role: Role, address: Address) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        let key = DataKeyExt3::UserRole(role, address.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        Self::append_admin_action(
+            &env,
+            Symbol::new(&env, "grant_role"),
+            Symbol::new(&env, "role_granted"),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "role_granted"), admin),
+            (role, address),
+        );
+    }
+
+    /// Revokes a scoped operational role from an address. Admin only.
+    pub fn revoke_role(env: Env, admin: Address, role: Role, address: Address) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        let key = DataKeyExt3::UserRole(role, address.clone());
+        env.storage().persistent().remove(&key);
+        Self::append_admin_action(
+            &env,
+            Symbol::new(&env, "revoke_role"),
+            Symbol::new(&env, "role_revoked"),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "role_revoked"), admin),
+            (role, address),
+        );
+    }
+
+    /// Returns true if `address` holds `role` (or is the primary contract admin).
+    pub fn has_role(env: Env, role: Role, address: Address) -> bool {
+        Self::check_has_role(&env, &role, &address)
+    }
+
+    // ----------------------------------------------------------
     // ADMIN: PAUSE / UNPAUSE
     // ----------------------------------------------------------
 
-    /// Pause all state-changing operations. Admin only.
+    /// Pause all state-changing operations. Pauser or Admin only.
     pub fn pause(env: Env, admin: Address) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::Pauser);
         Self::append_admin_action(
             &env,
             Symbol::new(&env, "pause"),
@@ -2068,10 +2160,10 @@ impl ChainSettleContract {
         );
     }
 
-    /// Resume all state-changing operations. Admin only.
+    /// Resume all state-changing operations. Pauser or Admin only.
     pub fn unpause(env: Env, admin: Address) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::Pauser);
         Self::append_admin_action(
             &env,
             Symbol::new(&env, "unpause"),
@@ -2082,6 +2174,62 @@ impl ChainSettleContract {
             (Symbol::new(&env, "contract_unpaused"),),
             env.ledger().sequence(),
         );
+    }
+
+    // ----------------------------------------------------------
+    // ADMIN: GRANULAR PER-OPERATION PAUSE FLAGS
+    // ----------------------------------------------------------
+
+    /// Granular per-operation pause. Sets whether a specific operation
+    /// (`create`, `confirm`, `dispute`, `advance`, `claim`) is paused.
+    /// Admin only.
+    pub fn set_operation_paused(env: Env, admin: Address, op: Symbol, paused: bool) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        Self::validate_operation(&env, &op);
+
+        env.storage()
+            .instance()
+            .set(&DataKeyExt4::OperationPaused(op.clone()), &paused);
+
+        Self::append_admin_action(
+            &env,
+            Symbol::new(&env, "set_op_paused"),
+            if paused {
+                Symbol::new(&env, "op_paused")
+            } else {
+                Symbol::new(&env, "op_unpaused")
+            },
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "operation_paused_set"), op),
+            paused,
+        );
+    }
+
+    /// Returns whether a specific operation is paused.
+    /// The global pause and emergency freeze override everything (returns true if globally paused).
+    /// Read-only; no auth required.
+    pub fn is_operation_paused(env: Env, op: Symbol) -> bool {
+        Self::validate_operation(&env, &op);
+        let global_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        let frozen: bool = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt2::EmergencyFrozen)
+            .unwrap_or(false);
+        if global_paused || frozen {
+            return true;
+        }
+        env.storage()
+            .instance()
+            .get(&DataKeyExt4::OperationPaused(op))
+            .unwrap_or(false)
     }
 
     // ----------------------------------------------------------
@@ -3010,10 +3158,10 @@ impl ChainSettleContract {
     // ADMIN: FEE CONFIG
     // ----------------------------------------------------------
 
-    /// Set or update the platform fee. Max 1000 bps (10%). Admin only.
+    /// Set or update the platform fee. Max 1000 bps (10%). FeeManager or Admin only.
     pub fn set_fee_config(env: Env, admin: Address, fee_bps: u32, treasury: Address) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::FeeManager);
         if fee_bps > constants::MAX_FEE_BPS {
             panic!("fee_bps exceeds maximum of 1000");
         }
@@ -3027,12 +3175,12 @@ impl ChainSettleContract {
             .set(&DataKey::FeeConfig, &FeeConfig { fee_bps, treasury });
     }
 
-    /// #413: Schedule a time-boxed, contract-wide fee holiday. Admin only.
+    /// #413: Schedule a time-boxed, contract-wide fee holiday. FeeManager or Admin only.
     /// While `start_ledger <= env.ledger().sequence() <= end_ledger`, the protocol
     /// fee is waived (deduct_fee* return the full gross amount) for all shipments.
     pub fn schedule_fee_holiday(env: Env, admin: Address, start_ledger: u32, end_ledger: u32) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::FeeManager);
         if end_ledger < start_ledger {
             panic!("end_ledger must be >= start_ledger");
         }
@@ -3054,10 +3202,10 @@ impl ChainSettleContract {
         );
     }
 
-    /// #413: Cancel any scheduled/active fee holiday. Admin only.
+    /// #413: Cancel any scheduled/active fee holiday. FeeManager or Admin only.
     pub fn cancel_fee_holiday(env: Env, admin: Address) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::FeeManager);
         env.storage().instance().remove(&DataKeyExt3::FeeHoliday);
         Self::append_admin_action(
             &env,
@@ -3071,11 +3219,11 @@ impl ChainSettleContract {
         Self::fee_holiday_active(&env)
     }
 
-    /// Set multiple fee recipients with basis-point shares. Admin only.
+    /// Set multiple fee recipients with basis-point shares. FeeManager or Admin only.
     /// Shares must sum to exactly 10000 (100%).
     pub fn set_fee_recipients(env: Env, admin: Address, recipients: Vec<FeeRecipient>) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::FeeManager);
 
         if recipients.is_empty() {
             panic!("recipients cannot be empty");
@@ -3300,7 +3448,7 @@ impl ChainSettleContract {
         env.storage()
             .instance()
             .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "create"));
         params.spender.require_auth();
 
         if params.buyers.is_empty() {
@@ -5520,7 +5668,7 @@ impl ChainSettleContract {
 
     pub fn blacklist_address(env: Env, admin: Address, address: Address, reason_hash: BytesN<32>) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::ComplianceOfficer);
         env.storage()
             .instance()
             .set(&DataKey::Blacklisted(address.clone()), &reason_hash);
@@ -5533,7 +5681,7 @@ impl ChainSettleContract {
 
     pub fn remove_from_blacklist(env: Env, admin: Address, address: Address) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::ComplianceOfficer);
         env.storage()
             .instance()
             .remove(&DataKey::Blacklisted(address.clone()));
@@ -5600,7 +5748,7 @@ impl ChainSettleContract {
     /// removed from the blacklist; either way the appeal is marked decided.
     pub fn review_blacklist_appeal(env: Env, admin: Address, address: Address, approve: bool) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::ComplianceOfficer);
 
         let key = DataKeyExt3::BlacklistAppeal(address.clone());
         let mut appeal: BlacklistAppeal = env
@@ -5640,11 +5788,11 @@ impl ChainSettleContract {
     // ADMIN: SUPPLIER WHITELIST (Issue #100)
     // ----------------------------------------------------------
 
-    /// Add an address to the supplier whitelist. Admin only.
+    /// Add an address to the supplier whitelist. ComplianceOfficer or Admin only.
     /// Once the whitelist is non-empty, only whitelisted suppliers may call create_shipment.
     pub fn add_to_whitelist(env: Env, admin: Address, address: Address) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::ComplianceOfficer);
         let mut list: Vec<Address> = env
             .storage()
             .instance()
@@ -5663,10 +5811,10 @@ impl ChainSettleContract {
             .publish((Symbol::new(&env, "supplier_whitelisted"),), address);
     }
 
-    /// Remove an address from the supplier whitelist. Admin only.
+    /// Remove an address from the supplier whitelist. ComplianceOfficer or Admin only.
     pub fn remove_from_whitelist(env: Env, admin: Address, address: Address) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::ComplianceOfficer);
         let list: Vec<Address> = env
             .storage()
             .instance()
@@ -5773,7 +5921,7 @@ impl ChainSettleContract {
     /// where only supplier whitelisting (buyer-side gate) applies.
     pub fn set_require_mutual_preapproval(env: Env, admin: Address, enabled: bool) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::ComplianceOfficer);
         env.storage()
             .instance()
             .set(&DataKeyExt3::RequireMutualPreapproval, &enabled);
@@ -5800,11 +5948,11 @@ impl ChainSettleContract {
     // ADMIN: REFERRAL FEE (Issue #105)
     // ----------------------------------------------------------
 
-    /// Set the referral fee basis points (0–10000). Admin only.
+    /// Set the referral fee basis points (0–10000). FeeManager or Admin only.
     /// Default is 500 (5% of the total protocol fee paid to the referrer on completion).
     pub fn set_referral_fee_bps(env: Env, admin: Address, bps: u32) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::FeeManager);
         if bps > 10_000 {
             panic!("referral_fee_bps cannot exceed 10000");
         }
@@ -5873,11 +6021,11 @@ impl ChainSettleContract {
     // #113 – FEE TIERS
     // ----------------------------------------------------------
 
-    /// Admin configures up to 5 volume-based fee tiers.
+    /// Admin configures up to 5 volume-based fee tiers. FeeManager or Admin only.
     /// Tiers should be ordered with highest min_lifetime_volume first.
     pub fn set_fee_tiers(env: Env, admin: Address, tiers: Vec<FeeTier>) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::FeeManager);
         if tiers.len() > 5 {
             panic!("max 5 fee tiers");
         }
@@ -6172,11 +6320,10 @@ impl ChainSettleContract {
     }
 
     /// #387: Set the maximum number of entries allowed in the allowed-token
-    /// whitelist (0 = no cap). Existing lists larger than a newly lowered cap
-    /// remain valid — the cap is only enforced by `add_allowed_token`.
+    /// whitelist (0 = no cap). ComplianceOfficer or Admin only.
     pub fn set_max_allowed_tokens(env: Env, admin: Address, max_allowed: u32) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::ComplianceOfficer);
         env.storage()
             .instance()
             .set(&DataKeyExt2::MaxAllowedTokens, &max_allowed);
@@ -6194,13 +6341,10 @@ impl ChainSettleContract {
     }
 
     /// Configure the subset of globally allowed tokens that a given buyer may
-    /// use when creating shipments. Empty list means the buyer has no override,
-    /// which is interpreted as "no restriction beyond the global allowlist".
-    /// Each entry must already be in the global allowlist (or the global list is
-    /// empty, meaning all tokens are globally allowed).
+    /// use when creating shipments. ComplianceOfficer or Admin only.
     pub fn set_buyer_allowed_tokens(env: Env, admin: Address, buyer: Address, tokens: Vec<Address>) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::ComplianceOfficer);
 
         let global_tokens: Vec<Address> = env
             .storage()
@@ -6293,7 +6437,7 @@ impl ChainSettleContract {
     /// `reinstate_arbiter` first.
     pub fn add_arbiter_to_pool(env: Env, admin: Address, arbiter: Address) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::ArbiterManager);
         if env
             .storage()
             .persistent()
@@ -6330,7 +6474,7 @@ impl ChainSettleContract {
     /// Remove an arbiter from the admin-managed pool.
     pub fn remove_arbiter_from_pool(env: Env, admin: Address, arbiter: Address) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::ArbiterManager);
         let pool_key = Symbol::new(&env, "arbiters_pool");
         let pool_idx_key = Symbol::new(&env, "arb_pool_idx");
         let pool: Vec<Address> = env
@@ -6707,7 +6851,7 @@ impl ChainSettleContract {
         env.storage()
             .instance()
             .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "create"));
         let response_deadline = options.response_deadline;
         let penalty_bps = options.penalty_bps;
         let milestone_mode = options.milestone_mode;
@@ -8030,7 +8174,7 @@ impl ChainSettleContract {
         env.storage()
             .instance()
             .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "advance"));
 
         let shipment = Self::get_shipment_internal(&env, &shipment_id);
 
@@ -8087,7 +8231,7 @@ impl ChainSettleContract {
         env.storage()
             .instance()
             .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "advance"));
 
         let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
 
@@ -8908,6 +9052,9 @@ impl ChainSettleContract {
         is_final: bool,
         fee_out: &mut i128,
     ) -> (i128, u32) {
+        if Self::fee_holiday_active(env) {
+            return (gross, 0);
+        }
         let override_bps: Option<u32> = env
             .storage()
             .persistent()
@@ -8946,6 +9093,258 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ESTIMATE SHIPMENT COSTS (READ-ONLY)
+    // ----------------------------------------------------------
+
+    /// Estimates every fee and payout for a whole shipment before creation.
+    ///
+    /// Computes per-milestone gross, platform fee, logistics fee, and net amounts,
+    /// as well as the total required supplier collateral and dispute bond.
+    ///
+    /// Applies active VIP fee waivers, fee holidays, and volume tiers for the given buyer.
+    /// Does not require authentication and does not mutate any contract state.
+    pub fn estimate_shipment_costs(
+        env: Env,
+        buyer: Address,
+        token: Address,
+        total_amount: i128,
+        milestones: Vec<Milestone>,
+        options: ShipmentOptions,
+    ) -> ShipmentCostEstimate {
+        if total_amount < constants::MIN_SHIPMENT_AMOUNT {
+            panic!("amount must be greater than zero");
+        }
+
+        if milestones.is_empty() {
+            panic!("milestones cannot be empty");
+        }
+
+        let max_milestone_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt2::MaxMilestoneCount)
+            .unwrap_or(constants::DEFAULT_MAX_MILESTONE_COUNT);
+        if milestones.len() > max_milestone_count {
+            panic!("TooManyMilestones");
+        }
+
+        // Validate dispute bond bps cap if provided
+        if options.dispute_bond_bps > 0 {
+            let max_bps: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKeyExt3::MaxDisputeBondBps)
+                .unwrap_or(constants::DEFAULT_MAX_DISPUTE_BOND_BPS);
+            if options.dispute_bond_bps > max_bps {
+                panic!("dispute_bond_bps exceeds maximum allowed");
+            }
+        }
+
+        if options.dispute_bond_amount < 0 {
+            panic!("dispute bond cannot be negative");
+        }
+
+        if options.supplier_collateral < 0 {
+            panic!("collateral cannot be negative");
+        }
+
+        if options.buyer_cancel_fee_bps > constants::MAX_FEE_BPS {
+            panic!("buyer_cancel_fee_bps cannot exceed 1000 (10%)");
+        }
+
+        // Check if buyer is blacklisted
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, BytesN<32>>(&DataKey::Blacklisted(buyer.clone()))
+            .is_some()
+        {
+            panic!("unauthorized");
+        }
+
+        // Token whitelist validation
+        let allowed_tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env));
+        if allowed_tokens.len() > 0 {
+            let mut found = false;
+            for i in 0..allowed_tokens.len() {
+                if allowed_tokens.get(i).unwrap() == token {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                panic!("token is not in the approved whitelist");
+            }
+        }
+
+        // Buyer-specific token allowlist validation
+        let buyer_allowed: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt2::BuyerAllowedTokens(buyer.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        if buyer_allowed.len() > 0 {
+            let mut found = false;
+            for j in 0..buyer_allowed.len() {
+                if buyer_allowed.get(j).unwrap() == token {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                panic!("token is not allowed for this buyer");
+            }
+        }
+
+        // Value limits
+        let effective_max_value: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt2::TokenMaxShipmentValue(token.clone()))
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::MaxShipmentValue)
+                    .unwrap_or(0)
+            });
+        if effective_max_value > 0 && total_amount > effective_max_value {
+            panic!("total amount exceeds maximum shipment value");
+        }
+
+        let effective_min_value: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt2::TokenMinShipmentValue(token.clone()))
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&DataKeyExt2::MinShipmentValueFloor)
+                    .unwrap_or(0)
+            });
+        if effective_min_value > 0 && total_amount < effective_min_value {
+            panic!("MinShipmentValueNotMet");
+        }
+
+        // Validate milestone splits / percentages
+        if options.milestone_splits.len() > 0 {
+            if options.milestone_splits.len() != milestones.len() {
+                panic!("InvalidSplitConfiguration");
+            }
+            let mut total_bps: u32 = 0;
+            for i in 0..options.milestone_splits.len() {
+                total_bps += options.milestone_splits.get(i).unwrap();
+            }
+            if total_bps != 10_000 {
+                panic!("InvalidSplitConfiguration");
+            }
+        } else {
+            let min_pct: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::MinMilestonePercentage)
+                .unwrap_or(0);
+            let mut total_percent: u32 = 0;
+            for i in 0..milestones.len() {
+                let percent = milestones.get(i).unwrap().payment_percent;
+                if percent < min_pct {
+                    panic!("InvalidPercentages");
+                }
+                total_percent += percent;
+            }
+            if total_percent != 100 {
+                panic!("milestone percentages must sum to 100");
+            }
+        }
+
+        if options.deadlines.len() > 0 && options.deadlines.len() != milestones.len() {
+            panic!("deadline count must match milestone count");
+        }
+
+        // Fee rate calculation
+        let (applied_fee_bps, is_holiday) = if Self::fee_holiday_active(&env) {
+            (0u32, true)
+        } else {
+            let base_bps = Self::resolve_fee_bps_for(&env, &buyer);
+            let waiver_bps = Self::resolve_fee_waiver_bps(&env, &buyer);
+            let bps = if waiver_bps > 0 {
+                base_bps - ((base_bps as u64 * waiver_bps as u64) / 10_000) as u32
+            } else {
+                base_bps
+            };
+            (bps, false)
+        };
+
+        let mut milestone_estimates: Vec<MilestoneCostEstimate> = Vec::new(&env);
+        let mut total_platform_fee: i128 = 0;
+        let mut total_logistics_fee: i128 = 0;
+        let mut total_net_amount: i128 = 0;
+
+        for i in 0..milestones.len() {
+            let gross_amount = if options.milestone_splits.len() > 0 {
+                let bps = options.milestone_splits.get(i).unwrap();
+                (total_amount * bps as i128) / 10_000
+            } else {
+                let m = milestones.get(i).unwrap();
+                (total_amount * m.payment_percent as i128) / 100
+            };
+
+            let platform_fee = if is_holiday || applied_fee_bps == 0 {
+                0
+            } else {
+                (gross_amount * applied_fee_bps as i128) / 10_000
+            };
+
+            let mut logistics_fee: i128 = 0;
+            if options.logistics_fee_bps > 0 {
+                let after_platform = gross_amount - platform_fee;
+                let candidate_fee = (gross_amount * options.logistics_fee_bps as i128) / 10_000;
+                if candidate_fee > 0 && candidate_fee <= after_platform {
+                    logistics_fee = candidate_fee;
+                }
+            }
+
+            let net_amount = gross_amount - platform_fee - logistics_fee;
+
+            total_platform_fee += platform_fee;
+            total_logistics_fee += logistics_fee;
+            total_net_amount += net_amount;
+
+            milestone_estimates.push_back(MilestoneCostEstimate {
+                milestone_index: i,
+                gross_amount,
+                platform_fee,
+                logistics_fee,
+                net_amount,
+            });
+        }
+
+        let scaled_bond = (total_amount * options.dispute_bond_bps as i128) / 10_000;
+        let per_dispute_bond = options.dispute_bond_amount + scaled_bond;
+        let dispute_bond = if per_dispute_bond > 0 {
+            per_dispute_bond * milestones.len() as i128
+        } else {
+            0
+        };
+
+        let collateral_required = options.supplier_collateral;
+
+        ShipmentCostEstimate {
+            total_amount,
+            total_platform_fee,
+            total_logistics_fee,
+            total_net_amount,
+            collateral_required,
+            dispute_bond,
+            applied_fee_bps,
+            milestones: milestone_estimates,
+        }
+    }
+
+    // ----------------------------------------------------------
     // CONFIRM MILESTONE (multi-sig)
     // ----------------------------------------------------------
 
@@ -8953,7 +9352,7 @@ impl ChainSettleContract {
         env.storage()
             .instance()
             .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "confirm"));
 
         // Batch read shipment and contract stats in a single context fetch.
         let ctx = Self::fetch_confirm_milestone_ctx(&env, &shipment_id);
@@ -9854,7 +10253,7 @@ impl ChainSettleContract {
     }
 
     pub fn raise_dispute(env: Env, buyer: Address, shipment_id: String, milestone_index: u32) {
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "dispute"));
 
         let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
 
@@ -10101,7 +10500,7 @@ impl ChainSettleContract {
         milestone_index: u32,
         contested_percent: u32,
     ) {
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "dispute"));
 
         if contested_percent == 0 || contested_percent >= 100 {
             panic!("contested_percent must be between 1 and 99");
@@ -10392,7 +10791,7 @@ impl ChainSettleContract {
         approve: bool,
         reason: Option<ResolutionReason>,
     ) {
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "dispute"));
 
         let reason = reason.unwrap_or(if approve {
             ResolutionReason::ProofValid
@@ -12115,7 +12514,7 @@ impl ChainSettleContract {
     /// Claim auto-confirmation for a milestone when the auto-confirm window has expired.
     /// Callable by anyone. Transfers payment to supplier and returns penalty to buyer if applicable.
     pub fn claim_auto_confirmation(env: Env, shipment_id: String, milestone_index: u32) {
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "claim"));
 
         let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
 
@@ -12503,7 +12902,7 @@ impl ChainSettleContract {
     /// Applies the shipment's default_resolution: pays the supplier or refunds the buyer.
     /// Arbiter resolution before the timeout window always takes priority.
     pub fn resolve_dispute_timeout(env: Env, shipment_id: String, milestone_index: u32) {
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "dispute"));
 
         let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
         let arbiter = shipment.arbiter.clone();
@@ -13856,7 +14255,7 @@ impl ChainSettleContract {
         shipment_id: String,
         milestone_index: u32,
     ) {
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "claim"));
 
         let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
 
@@ -14315,7 +14714,7 @@ impl ChainSettleContract {
 
     pub fn set_shipment_fee_override(env: Env, admin: Address, shipment_id: String, fee_bps: u32) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::FeeManager);
         let shipment = Self::get_shipment_internal(&env, &shipment_id);
         if shipment.status != ShipmentStatus::Active {
             panic!("shipment is not active");
@@ -14332,7 +14731,7 @@ impl ChainSettleContract {
 
     pub fn clear_shipment_fee_override(env: Env, admin: Address, shipment_id: String) {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_role(&env, &admin, Role::FeeManager);
         env.storage()
             .persistent()
             .remove(&DataKeyExt::ShipmentFeeOverride(shipment_id.clone()));
@@ -16059,6 +16458,39 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
+    // PERMISSIONLESS SHIPMENT STORAGE TTL EXTENSION
+    // ----------------------------------------------------------
+
+    /// Permissionless. Extends the persistent storage TTL of a shipment and all
+    /// of its associated persistent storage keys (e.g. advances, disputes, notes,
+    /// splits, retainage, collateral, etc.) to prevent archival.
+    ///
+    /// Panics with `"shipment not found"` if the shipment does not exist.
+    /// Has no side effects on the shipment's internal state.
+    pub fn extend_shipment_ttl(env: Env, shipment_id: String) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+
+        // Validates shipment existence (panics with "shipment not found" if unknown).
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+
+        let shipment_key = DataKey::Shipment(shipment_id.clone());
+        env.storage().persistent().extend_ttl(
+            &shipment_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        Self::extend_shipment_related_keys_ttl(&env, &shipment_id, &shipment);
+
+        env.events().publish(
+            (Symbol::new(&env, "shipment_ttl_extended"), shipment_id),
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
+    // ----------------------------------------------------------
     // #575 — LIGHTWEIGHT SHIPMENT SUMMARY
     // ----------------------------------------------------------
 
@@ -16942,6 +17374,29 @@ impl ChainSettleContract {
         }
     }
 
+    fn validate_operation(env: &Env, op: &Symbol) {
+        if *op != Symbol::new(env, "create")
+            && *op != Symbol::new(env, "confirm")
+            && *op != Symbol::new(env, "dispute")
+            && *op != Symbol::new(env, "advance")
+            && *op != Symbol::new(env, "claim")
+        {
+            panic!("unknown operation");
+        }
+    }
+
+    fn assert_operation_not_paused(env: &Env, op: Symbol) {
+        Self::assert_not_paused(env);
+        let op_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt4::OperationPaused(op))
+            .unwrap_or(false);
+        if op_paused {
+            panic!("operation is paused");
+        }
+    }
+
     fn is_shipment_paused_internal(env: &Env, shipment_id: &String) -> bool {
         env.storage()
             .persistent()
@@ -17078,6 +17533,25 @@ impl ChainSettleContract {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic!("unauthorized"));
         if *caller != stored_admin {
+            panic!("unauthorized");
+        }
+    }
+
+    fn check_has_role(env: &Env, role: &Role, caller: &Address) -> bool {
+        let stored_admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        if let Some(ref admin) = stored_admin {
+            if *caller == *admin {
+                return true;
+            }
+        }
+        env.storage()
+            .persistent()
+            .get::<DataKeyExt3, bool>(&DataKeyExt3::UserRole(*role, caller.clone()))
+            .unwrap_or(false)
+    }
+
+    fn assert_role(env: &Env, caller: &Address, role: Role) {
+        if !Self::check_has_role(env, &role, caller) {
             panic!("unauthorized");
         }
     }
@@ -17513,7 +17987,7 @@ impl ChainSettleContract {
     /// `payout_claimed` event. Otherwise falls back to paying out in `token`
     /// unchanged (never reverts due to a missing/insufficient route).
     pub fn claim_payout(env: Env, supplier: Address, token: Address) {
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "claim"));
         supplier.require_auth();
 
         let pending: i128 = env
@@ -19565,7 +20039,7 @@ impl ChainSettleContract {
         env.storage()
             .instance()
             .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
-        Self::assert_not_paused(&env);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "confirm"));
 
         let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
         if shipment.status != ShipmentStatus::Active {
@@ -20790,6 +21264,150 @@ impl ChainSettleContract {
             (primary_buyer, retainage, warranty),
         );
     }
+
+    fn extend_shipment_related_keys_ttl(
+        env: &Env,
+        shipment_id: &String,
+        shipment: &Shipment,
+    ) {
+        macro_rules! bump_key {
+            ($k:expr) => {{
+                let key = $k;
+                if env.storage().persistent().has(&key) {
+                    env.storage().persistent().extend_ttl(
+                        &key,
+                        constants::TTL_INITIAL_LEDGERS,
+                        constants::TTL_MAX_LEDGERS,
+                    );
+                }
+            }};
+        }
+
+        // Shipment-level keys
+        bump_key!(DataKey::CancelPolicy(shipment_id.clone()));
+        bump_key!(DataKey::SupplierCollateral(shipment_id.clone()));
+        bump_key!(DataKey::PendingRecovery(shipment_id.clone()));
+        bump_key!(DataKey::ConfirmationDelegate(shipment_id.clone()));
+
+        bump_key!(DataKeyExt::ShipmentFeeBps(shipment_id.clone()));
+        bump_key!(DataKeyExt::MilestoneSplits(shipment_id.clone()));
+        bump_key!(DataKeyExt::MilestoneTimestampDeadlines(shipment_id.clone()));
+        bump_key!(DataKeyExt::BackupArbiter(shipment_id.clone()));
+        bump_key!(DataKeyExt::ShipmentConfirmationCooldown(shipment_id.clone()));
+        bump_key!(DataKeyExt::DisputeDecayStartLedger(shipment_id.clone()));
+        bump_key!(DataKeyExt::ShipmentFeeOverride(shipment_id.clone()));
+        bump_key!(DataKeyExt::ArbiterPanel(shipment_id.clone()));
+        bump_key!(DataKeyExt::ShipmentPaused(shipment_id.clone()));
+        bump_key!(DataKeyExt::ShipmentPauseRequest(shipment_id.clone()));
+        bump_key!(DataKeyExt::ShipmentPausedAt(shipment_id.clone()));
+        bump_key!(DataKeyExt::ArchivedShipment(shipment_id.clone()));
+
+        bump_key!(DataKeyExt2::CoBuyer(shipment_id.clone()));
+        bump_key!(DataKeyExt2::ComplianceHold(shipment_id.clone()));
+        bump_key!(DataKeyExt2::ShipmentMediator(shipment_id.clone()));
+        bump_key!(DataKeyExt2::ShipmentJurisdiction(shipment_id.clone()));
+        bump_key!(DataKeyExt2::ShipmentObservers(shipment_id.clone()));
+
+        bump_key!(DataKeyExt3::ShipmentOraclePurpose(shipment_id.clone()));
+        let meta_keys_key = DataKeyExt3::ShipmentMetadataKeys(shipment_id.clone());
+        if env.storage().persistent().has(&meta_keys_key) {
+            env.storage().persistent().extend_ttl(
+                &meta_keys_key,
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+            if let Some(keys) = env
+                .storage()
+                .persistent()
+                .get::<DataKeyExt3, Vec<Symbol>>(&meta_keys_key)
+            {
+                for i in 0..keys.len() {
+                    let k = keys.get(i).unwrap();
+                    bump_key!(DataKeyExt3::ShipmentMetadata(shipment_id.clone(), k));
+                }
+            }
+        }
+        bump_key!(DataKeyExt3::QualityGrades(shipment_id.clone()));
+        bump_key!(DataKeyExt3::MilestoneQuantities(shipment_id.clone()));
+        bump_key!(DataKeyExt3::RetainageBps(shipment_id.clone()));
+        bump_key!(DataKeyExt3::RetainageBalance(shipment_id.clone()));
+        bump_key!(DataKeyExt3::WarrantyConfig(shipment_id.clone()));
+        bump_key!(DataKeyExt3::WarrantyBalance(shipment_id.clone()));
+        bump_key!(DataKeyExt3::WarrantyEndsAt(shipment_id.clone()));
+        bump_key!(DataKeyExt3::WarrantyClaim(shipment_id.clone()));
+        bump_key!(DataKeyExt3::IncrementalCollateral(shipment_id.clone()));
+        bump_key!(DataKeyExt3::IncrementalCollateralBase(shipment_id.clone()));
+        bump_key!(DataKeyExt3::MilestoneMergeProposal(shipment_id.clone()));
+        bump_key!(DataKeyExt3::MilestoneSplitProposal(shipment_id.clone()));
+        bump_key!(DataKeyExt3::ShipmentInspector(shipment_id.clone()));
+        bump_key!(DataKeyExt3::InspectedMilestones(shipment_id.clone()));
+        bump_key!(DataKeyExt3::ProofSubmitters(shipment_id.clone()));
+        bump_key!(DataKeyExt3::RequireDualAttestation(shipment_id.clone()));
+
+        bump_key!(DataKeyExt4::ShipmentFeesPaid(shipment_id.clone()));
+        bump_key!(DataKeyExt4::ShipmentHadDispute(shipment_id.clone()));
+        bump_key!(DataKeyExt4::PendingExpiryExtension(shipment_id.clone()));
+        bump_key!(DataKeyExt4::TotalExpiryExtended(shipment_id.clone()));
+
+        let oracle_purpose = env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt3, Symbol>(&DataKeyExt3::ShipmentOraclePurpose(shipment_id.clone()));
+
+        // Per-milestone keys
+        for i in 0..shipment.milestones.len() {
+            bump_key!(DataKey::ProofSubmittedAt(shipment_id.clone(), i));
+            bump_key!(DataKey::AdvanceRequest(shipment_id.clone(), i));
+            bump_key!(DataKey::MilestoneProofWhitelist(shipment_id.clone(), i));
+            bump_key!(DataKey::SubmittedProofType(shipment_id.clone(), i));
+            bump_key!(DataKey::DisputeContestedPercent(shipment_id.clone(), i));
+            bump_key!(DataKey::EvidenceCount(shipment_id.clone(), i));
+
+            bump_key!(DataKeyExt::MilestoneInvoiceHash(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::AmendmentLog(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::ExtensionRequest(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::MilestoneDeadline(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::DisputeOpenedAt(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::EffectiveDisputeBond(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::DisputeVotes(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::MilestonePayees(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::ProofSubmitter(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::MilestoneNotes(shipment_id.clone(), i));
+            bump_key!(DataKeyExt::DisputeEvidence(shipment_id.clone(), i));
+
+            bump_key!(DataKeyExt2::DeadlineWarningFired(shipment_id.clone(), i));
+            bump_key!(DataKeyExt2::JointConfirmation(shipment_id.clone(), i));
+            bump_key!(DataKeyExt2::DisputeResolvedAtLedger(shipment_id.clone(), i));
+            bump_key!(DataKeyExt2::DisputeAppealed(shipment_id.clone(), i));
+            bump_key!(DataKeyExt2::MediationProposal(shipment_id.clone(), i));
+            bump_key!(DataKeyExt2::DisputeAppealOriginal(shipment_id.clone(), i));
+            bump_key!(DataKeyExt2::DisputeResolvedApprove(shipment_id.clone(), i));
+            bump_key!(DataKeyExt2::DisputeResolutionReason(shipment_id.clone(), i));
+            bump_key!(DataKeyExt2::ExtensionRequestCount(shipment_id.clone(), i));
+
+            bump_key!(DataKeyExt3::RefundClaimableAtLedger(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::MilestoneGrade(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::PendingGrade(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::GradeDispute(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::DeliveredQuantity(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::PartialQtyReleased(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::DisputeRaisedBy(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::InspectionReport(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::PendingDualProof(shipment_id.clone(), i));
+            bump_key!(DataKeyExt3::ConditionBreachReports(shipment_id.clone(), i));
+
+            bump_key!(DataKeyExt4::SubstituteProposal(shipment_id.clone(), i));
+            bump_key!(DataKeyExt4::MilestoneSupplier(shipment_id.clone(), i));
+
+            if let Some(ref purpose) = oracle_purpose {
+                bump_key!(DataKeyExt3::OracleAttestations(
+                    shipment_id.clone(),
+                    i,
+                    purpose.clone()
+                ));
+            }
+        }
+    }
 }
 
 pub mod constants;
@@ -20799,8 +21417,10 @@ mod test_arbiter_slashing;
 mod test_cancellation_reason;
 mod test_common;
 mod test_correct_proof;
+mod test_extend_shipment_ttl;
 mod test_feat_four;
 mod test_new_features;
+mod test_operation_pause;
 
 // Legacy test modules — some have pre-existing compilation issues.
 // They are kept as source but only enabled when their API drift is resolved.
@@ -20862,6 +21482,8 @@ mod test_feat_issues;
 mod test_feat_issues_551_553_554_556;
 mod test_feat_earnings;
 mod test_slash_collateral;
+mod test_shipment_cost_estimate;
+mod test_granular_roles;
 // Disabled: exercises milestone insurance holdback / oracle price-condition
 // APIs (see NEW_MILESTONE_FEATURES.md) that have not been implemented yet.
 // mod test_milestone_insurance_and_oracle;

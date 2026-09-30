@@ -253,6 +253,41 @@ Parameters:
 Returns: shipment_id (same as input, for confirmation)
 ```
 
+### Shipment-Level Cost Estimation (`estimate_shipment_costs`)
+
+A read-only simulation query that estimates every fee, payout, bond, and collateral requirement for a whole shipment before creation.
+
+```rust
+estimate_shipment_costs(
+    buyer: Address,
+    token: Address,
+    total_amount: i128,
+    milestones: Vec<Milestone>,
+    options: ShipmentOptions,
+) -> ShipmentCostEstimate
+```
+
+**Parameters:**
+- `buyer`: Primary buyer address (used to evaluate buyer lifetime volume tiers and active VIP fee waivers).
+- `token`: Escrow token SAC address (validated against allowlists and min/max value bounds).
+- `total_amount`: Total shipment escrow amount.
+- `milestones`: Ordered list of proposed shipment milestones.
+- `options`: `ShipmentOptions` configuration (splits, dispute bond bps/amount, supplier collateral, logistics fee bps, etc.).
+
+**Returns: `ShipmentCostEstimate`**
+- `total_amount` (`i128`): Total gross shipment amount.
+- `total_platform_fee` (`i128`): Sum of platform fees across all milestones.
+- `total_logistics_fee` (`i128`): Sum of logistics fees across all milestones.
+- `total_net_amount` (`i128`): Total net amount payable to supplier across all milestones.
+- `collateral_required` (`i128`): Required supplier collateral.
+- `dispute_bond` (`i128`): Total dispute bond locked by buyer at creation.
+- `applied_fee_bps` (`u32`): Effective platform fee rate applied (reflects active fee holidays, VIP waivers, and volume tiers).
+- `milestones` (`Vec<MilestoneCostEstimate>`): Per-milestone breakdown with `milestone_index`, `gross_amount`, `platform_fee`, `logistics_fee`, and `net_amount`.
+
+**Key Properties:**
+- **Read-only & Auth-Free**: Requires no signatures or transaction fees.
+- **Accurate Upfront Pricing**: Fully accounts for active fee holidays (`0 bps`), VIP partner waivers, and buyer lifetime volume tiers.
+
 Allowed token list
 The `token` parameter on `create_shipment` is checked against an admin-managed allowlist (`DataKey::AllowedTokens`). By default the list is empty, which means **open mode**: any Stellar Asset Contract (SAC) address is accepted. Once the admin adds at least one token, `create_shipment` only accepts tokens on that list — a non-listed token panics with `"token is not in the approved whitelist"`.
 Function Who Effect
@@ -262,6 +297,26 @@ Function Who Effect
 The allowlist gates shipment creation only. After a shipment is created, all payouts (`confirm_milestone`, dispute resolution, cancellation refunds, etc.) always use the token address stored on that shipment — they never re-check the allowlist.
 
 ### Allowed-Token List Cap and Buyer Token Allowlist (#387, #388)
+
+### Granular Per-Operation Pause Flags
+
+ChainSettle allows administrators to pause specific operational sub-systems without halting the entire contract. This enables targeted incident containment (e.g., stopping new shipment creation while allowing existing in-flight shipments to settle and release escrow).
+
+- **Supported Operations**: `create`, `confirm`, `dispute`, `advance`, `claim`.
+- **Functions**:
+  - `set_operation_paused(admin: Address, op: Symbol, paused: bool)`: Admin-only. Sets the pause flag for the specified operation. Emits `operation_paused_set` event `((Symbol("operation_paused_set"), op), paused)`.
+  - `is_operation_paused(op: Symbol) -> bool`: Read-only, permissionless. Returns whether the operation is paused. Global `pause()` and emergency freeze override everything (returns `true` when globally paused/frozen).
+- **Gating Behavior**:
+  - `create`: Gates `create_shipment`, `create_shipment_with_allowance`, and template/vault creation.
+  - `confirm`: Gates `confirm_milestone` and `confirm_milestone_graded`.
+  - `dispute`: Gates `raise_dispute`, `raise_partial_dispute`, `resolve_dispute`, and `resolve_dispute_timeout`.
+  - `advance`: Gates `request_advance` and `approve_advance`.
+  - `claim`: Gates `claim_payout`, `claim_deadline_refund`, and `claim_auto_confirmation`.
+- **Precedence & Validation**:
+  - Global `pause()` takes precedence over per-operation flags and blocks all operations.
+  - Passing an invalid/unknown operation symbol panics with `"unknown operation"`.
+  - Calling a paused operation panics with `"operation is paused"`.
+
 
 Two complementary features let admins further tighten which tokens buyers can use.
 
@@ -568,6 +623,17 @@ stellar contract invoke \
 ```
 `get_shipment(shipment_id) → Shipment` (read-only)
 Returns the full shipment record.
+
+`extend_shipment_ttl(shipment_id)` (permissionless)
+Extends the persistent storage TTL (Time-To-Live) of a shipment and all of its associated persistent storage keys (including advances, disputes, notes, splits, retainage, collateral, etc.) to prevent archival in long-running shipments.
+- **Motivation**: Soroban persistent storage entries are subject to TTL expiration. Long-running shipments risk archival if not touched. Integrators and keeper bots can call this function to keep them alive.
+- **Parameters**: `shipment_id: String`
+- **Authorization**: None required (permissionless).
+- **Behavior**: Extends the TTL of the shipment and all existing related keys using `TTL_INITIAL_LEDGERS` (100,000) and `TTL_MAX_LEDGERS` (6,300,000).
+- **Side Effects**: Has no side effects on shipment state, balances, or milestones.
+- **Events**: Emits `shipment_ttl_extended` event with `(Symbol("shipment_ttl_extended"), shipment_id)`.
+- **Errors**: Panics with `"shipment not found"` if the shipment ID does not exist.
+
 `get_milestone(shipment_id, milestone_index) → Milestone` (read-only)
 Returns a single milestone.
 `get_reputation(supplier) → ReputationScore` (read-only)
@@ -3018,325 +3084,68 @@ stellar contract invoke --id <CONTRACT_ID> \
 
 ---
 
-### Confirmation Delegate (#505)
+### Granular Admin Roles (Least Privilege)
 
-A buyer can authorize a trusted third-party address (e.g. a logistics broker) to call
-`confirm_milestone` on their behalf, up to a configurable per-transaction payment cap.
-There is exactly one delegate slot per shipment; authorizing a new address replaces any
-previous one.
+To enforce the principle of least privilege, operational keys can be granted scoped administrative roles without requiring full contract admin powers.
 
-#### Functions
+#### Role Enum
+The `Role` enum defines four operational roles:
+- `Pauser`: Controls contract-wide pausing and unpausing.
+- `FeeManager`: Controls platform fee configs, fee holidays, fee tiers, referral fees, and shipment fee overrides.
+- `ComplianceOfficer`: Controls blacklisting, appeals, whitelist management, token allowances, and buyer-specific token permissions.
+- `ArbiterManager`: Manages the global arbiter pool (adding and removing arbiters).
 
-**`authorize_delegate(env, buyer, shipment_id, delegate, per_tx_cap)`**
+#### Role Management API
+| Function | Who | Behaviour |
+| --- | --- | --- |
+| `grant_role(admin, role, address)` | Primary Admin only | Grants `role` to `address`. Emits `role_granted` event and appends to admin audit trail. |
+| `revoke_role(admin, role, address)` | Primary Admin only | Revokes `role` from `address`. Takes effect immediately. Emits `role_revoked` event and appends to admin audit trail. |
+| `has_role(role, address) → bool` | Anyone (read-only) | Returns `true` if `address` holds `role` or is the primary contract admin. |
 
-- **Caller:** buyer only (requires auth)
-- **Parameters:**
-  - `buyer` — the shipment buyer's address
-  - `shipment_id` — the shipment to delegate
-  - `delegate` — the address that will be permitted to call `confirm_milestone`
-  - `per_tx_cap` — maximum gross milestone payment (in token stroops) the delegate may
-    approve per call; must be > 0
-- **Effect:** stores a `DelegateConfig` entry; replaces any existing delegate
-- **Reverts if:** shipment is not Active, or `per_tx_cap ≤ 0`
+#### Role-to-Function Permission Matrix
 
-**`revoke_delegate(env, buyer, shipment_id)`**
+| Role | Permitted Functions | Description |
+| --- | --- | --- |
+| **Pauser** | `pause(admin)`<br>`unpause(admin)` | Emergency halting and resumption of contract operations. |
+| **FeeManager** | `set_fee_config(admin, fee_bps, treasury)`<br>`schedule_fee_holiday(admin, start_ledger, end_ledger)`<br>`cancel_fee_holiday(admin)`<br>`set_fee_recipients(admin, recipients)`<br>`set_referral_fee_bps(admin, bps)`<br>`set_fee_tiers(admin, tiers)`<br>`set_shipment_fee_override(admin, shipment_id, fee_bps)`<br>`clear_shipment_fee_override(admin, shipment_id)` | Configuration of platform fees, fee holidays, revenue shares, and overrides. |
+| **ComplianceOfficer** | `blacklist_address(admin, address, reason_hash)`<br>`remove_from_blacklist(admin, address)`<br>`review_blacklist_appeal(admin, address, approve)`<br>`add_to_whitelist(admin, address)`<br>`remove_from_whitelist(admin, address)`<br>`set_require_mutual_preapproval(admin, enabled)`<br>`set_max_allowed_tokens(admin, max_allowed)`<br>`set_buyer_allowed_tokens(admin, buyer, tokens)` | Compliance rules, sanctions, whitelists, and token restrictions. |
+| **ArbiterManager** | `add_arbiter_to_pool(admin, arbiter)`<br>`remove_arbiter_from_pool(admin, arbiter)` | Arbiter pool membership management. |
+| **Primary Admin** | **All functions above** + role management, contract upgrades, timelock, and admin nominations. | Full super-admin access implicitly retains permissions for all scoped roles. |
 
-- **Caller:** buyer only (requires auth)
-- **Effect:** removes the delegate entry immediately; any future `confirm_milestone` call
-  by the old delegate will be rejected
-- **Reverts if:** caller is not the shipment buyer
+#### Key Properties
+1. **Implicit Super-Admin Access:** The primary contract admin retains access to all functions across every role without needing explicit role grants.
+2. **Immediate Revocation:** Role grants and revocations take effect instantaneously upon execution.
+3. **Multi-Role Assignment:** An address can be granted multiple distinct roles independently.
+4. **Audit Trail & Events:** All `grant_role` and `revoke_role` invocations emit event notifications (`role_granted`, `role_revoked`) and append entries to the immutable `admin_action_log`.
 
-**`get_delegate(env, shipment_id) -> Option<DelegateConfig>`**
-
-- **Caller:** anyone (read-only)
-- **Returns:** `Some(DelegateConfig)` if a delegate is registered, `None` otherwise
-
-#### `DelegateConfig` fields
-
-| Field | Type | Description |
-|---|---|---|
-| `delegate` | `Address` | Address permitted to call `confirm_milestone` |
-| `per_tx_cap` | `i128` | Max gross payment the delegate may approve in a single call |
-
-The cap is compared against the milestone's gross payment amount. If the milestone value
-exceeds `per_tx_cap` the confirmation is rejected even though the delegate is authorized.
-
-#### Example
+#### CLI Usage Example
 
 ```bash
-# Buyer authorizes a broker to confirm milestones up to 10,000 USDC (in stroops)
-stellar contract invoke --id <CONTRACT_ID> \
-  --source buyer-account --network testnet \
-  -- authorize_delegate \
-  --buyer <BUYER_ADDRESS> \
-  --shipment_id "shipment-001" \
-  --delegate <BROKER_ADDRESS> \
-  --per_tx_cap 100000000000
-
-# Broker confirms milestone 0 (gross payment must be ≤ per_tx_cap)
-stellar contract invoke --id <CONTRACT_ID> \
-  --source broker-account --network testnet \
-  -- confirm_milestone \
-  --buyer <BROKER_ADDRESS> \
-  --shipment_id "shipment-001" \
-  --milestone_index 0
-
-# Revoke at any time
-stellar contract invoke --id <CONTRACT_ID> \
-  --source buyer-account --network testnet \
-  -- revoke_delegate \
-  --buyer <BUYER_ADDRESS> \
-  --shipment_id "shipment-001"
-
-# Check current delegate
-stellar contract invoke --id <CONTRACT_ID> \
-  --network testnet -- get_delegate \
-  --shipment_id "shipment-001"
-```
-
----
-
-### Shipment Observers (#504)
-
-A buyer can attach one or more read-only observer addresses to a shipment. Observers have
-**no on-chain authority** — they cannot confirm milestones, raise disputes, or alter any
-state. The observer list is intended as a hook for off-chain event-routing tooling: an
-indexer or notification service can call `get_shipment_observers` after each event to
-determine which addresses should receive push notifications.
-
-Only the buyer manages observers; suppliers cannot add or remove them.
-
-#### Functions
-
-**`add_shipment_observer(env, buyer, shipment_id, observer_address)`**
-
-- **Caller:** buyer only (requires auth)
-- **Parameters:**
-  - `buyer` — the shipment buyer
-  - `shipment_id` — the shipment to attach the observer to
-  - `observer_address` — the address to add
-- **Effect:** appends `observer_address` to the shipment's observer list (no-op if already
-  present — duplicates are silently ignored)
-- **Reverts if:** caller is not the shipment buyer
-
-**`remove_shipment_observer(env, buyer, shipment_id, observer_address)`**
-
-- **Caller:** buyer only (requires auth)
-- **Effect:** removes `observer_address` from the list; no-op if not present
-- **Reverts if:** caller is not the shipment buyer
-
-**`get_shipment_observers(env, shipment_id) -> Vec<Address>`**
-
-- **Caller:** anyone (read-only)
-- **Returns:** the current observer list; empty `Vec` when no observers are registered
-
-#### Example
-
-```bash
-# Buyer adds a notification service address as observer
-stellar contract invoke --id <CONTRACT_ID> \
-  --source buyer-account --network testnet \
-  -- add_shipment_observer \
-  --buyer <BUYER_ADDRESS> \
-  --shipment_id "shipment-001" \
-  --observer_address <NOTIFIER_ADDRESS>
-
-# Off-chain service reads the observer list after an event
-stellar contract invoke --id <CONTRACT_ID> \
-  --network testnet -- get_shipment_observers \
-  --shipment_id "shipment-001"
-
-# Buyer removes an observer
-stellar contract invoke --id <CONTRACT_ID> \
-  --source buyer-account --network testnet \
-  -- remove_shipment_observer \
-  --buyer <BUYER_ADDRESS> \
-  --shipment_id "shipment-001" \
-  --observer_address <NOTIFIER_ADDRESS>
-```
-
----
-
-### N-of-M Oracle Attestation (#499)
-
-Milestone confirmation can be gated on a quorum of off-chain oracle signatures. An admin
-registers a named oracle *group* (a set of trusted addresses plus a threshold), assigns
-that group to a shipment, and then each oracle calls `submit_oracle_attestation` to record
-its approval. Once the threshold is reached `confirm_milestone` proceeds normally;
-until then it is blocked.
-
-Assigning an unregistered `purpose` symbol to a shipment is allowed — the gate has no
-effect until the admin also registers a group under that purpose name.
-
-#### Functions
-
-**`register_oracle_group(env, admin, purpose, oracles, threshold)`**
-
-- **Caller:** admin only (requires auth)
-- **Parameters:**
-  - `purpose` — a `Symbol` key that names this oracle set (e.g. `Symbol::new(&env, "customs")`)
-  - `oracles` — `Vec<Address>` of oracle members; must be non-empty
-  - `threshold` — number of attestations required; must satisfy `1 ≤ threshold ≤ oracles.len()`
-- **Effect:** stores or replaces the oracle group for `purpose`
-- **Reverts if:** `oracles` is empty, or `threshold` is 0 or > `oracles.len()`
-
-**`get_oracle_group(env, purpose) -> Option<(Vec<Address>, u32)>`**
-
-- **Caller:** anyone (read-only)
-- **Returns:** `Some((oracles, threshold))` if registered, `None` otherwise
-
-**`set_shipment_oracle_purpose(env, admin, shipment_id, purpose)`**
-
-- **Caller:** admin only (requires auth)
-- **Effect:** associates `purpose` with `shipment_id`; milestone confirmation for this
-  shipment will require the corresponding oracle group's threshold to be met
-- **Note:** assigning an unregistered purpose is allowed but has no gating effect until
-  the group is registered
-
-**`submit_oracle_attestation(env, oracle, shipment_id, milestone_index)`**
-
-- **Caller:** a member of the shipment's assigned oracle group (requires auth)
-- **Parameters:**
-  - `oracle` — the attesting oracle address
-  - `milestone_index` — which milestone the attestation applies to
-- **Effect:** records the oracle's vote; each oracle may attest at most once per
-  `(shipment_id, milestone_index)` pair
-- **Reverts if:** shipment has no assigned purpose, oracle group is not registered,
-  caller is not a group member, or oracle has already attested
-
-**`get_oracle_attestation_count(env, shipment_id, milestone_index) -> u32`**
-
-- **Caller:** anyone (read-only)
-- **Returns:** number of distinct oracle attestations recorded for the given milestone;
-  returns `0` if no purpose is assigned
-
-#### Example
-
-```bash
-# 1. Admin registers a 2-of-3 customs oracle group
-stellar contract invoke --id <CONTRACT_ID> \
-  --source admin-account --network testnet \
-  -- register_oracle_group \
+# Admin grants the FeeManager role to an operational address
+stellar contract invoke --id <CONTRACT_ID> --source admin \
+  --network testnet -- grant_role \
   --admin <ADMIN_ADDRESS> \
-  --purpose customs \
-  --oracles '[<ORACLE_1>, <ORACLE_2>, <ORACLE_3>]' \
-  --threshold 2
+  --role FeeManager \
+  --address <OPERATIONAL_ADDRESS>
 
-# 2. Admin assigns the group to a shipment
+# Check if the address holds the role
 stellar contract invoke --id <CONTRACT_ID> \
-  --source admin-account --network testnet \
-  -- set_shipment_oracle_purpose \
+  --network testnet -- has_role \
+  --role FeeManager \
+  --address <OPERATIONAL_ADDRESS>
+
+# Operational address updates the platform fee
+stellar contract invoke --id <CONTRACT_ID> --source operator \
+  --network testnet -- set_fee_config \
+  --admin <OPERATIONAL_ADDRESS> \
+  --fee_bps 200 \
+  --treasury <TREASURY_ADDRESS>
+
+# Admin revokes the role
+stellar contract invoke --id <CONTRACT_ID> --source admin \
+  --network testnet -- revoke_role \
   --admin <ADMIN_ADDRESS> \
-  --shipment_id "shipment-001" \
-  --purpose customs
-
-# 3. Two oracles attest to milestone 0
-stellar contract invoke --id <CONTRACT_ID> \
-  --source oracle1-account --network testnet \
-  -- submit_oracle_attestation \
-  --oracle <ORACLE_1> \
-  --shipment_id "shipment-001" \
-  --milestone_index 0
-
-stellar contract invoke --id <CONTRACT_ID> \
-  --source oracle2-account --network testnet \
-  -- submit_oracle_attestation \
-  --oracle <ORACLE_2> \
-  --shipment_id "shipment-001" \
-  --milestone_index 0
-
-# 4. Threshold met (2/3) — buyer can now confirm milestone 0
-stellar contract invoke --id <CONTRACT_ID> \
-  --network testnet -- get_oracle_attestation_count \
-  --shipment_id "shipment-001" \
-  --milestone_index 0
-# → 2
+  --role FeeManager \
+  --address <OPERATIONAL_ADDRESS>
 ```
 
----
-
-### Mutual-Consent Shipment Pause (#507)
-
-Either the buyer or supplier can request a temporary freeze of a shipment's milestone
-deadlines. The pause only takes effect when the **other** party approves — it is a mutual
-handshake, not a unilateral action. While a shipment is paused all deadline counters are
-frozen; when it resumes the deadlines are extended by the exact number of ledgers the
-shipment was paused.
-
-This feature is distinct from:
-
-- **Contract-wide `pause()`** — an admin emergency halt that freezes all shipments at once
-- **Admin compliance hold** — a per-shipment hold imposed by an admin without counterpart
-  consent
-
-The mutual-consent pause requires both parties to agree to both pause *and* resume.
-
-#### Functions
-
-**`request_shipment_pause(env, caller, shipment_id)`**
-
-- **Caller:** buyer or supplier of the shipment (requires auth)
-- **Effect:** records a pending pause request from `caller`; no deadlines change yet
-- **Reverts if:** shipment is not Active, already paused, or the request falls within
-  the configured minimum-notice window before the next pending milestone deadline
-
-**`approve_shipment_pause(env, caller, shipment_id)`**
-
-- **Caller:** the counterpart party (buyer approves if supplier requested, or vice versa)
-  (requires auth)
-- **Effect:** activates the pause; records `paused_at` ledger; milestone deadlines are
-  frozen from this point
-- **Reverts if:** no pending pause request exists, the existing request is a resume
-  request rather than a pause request, or the caller is the same party who requested
-
-**`resume_shipment(env, caller, shipment_id)`**
-
-- **Caller:** buyer or supplier (requires auth) — called **twice**, once by each party
-- **First call:** records a pending resume request; shipment remains paused
-- **Second call (by the other party):** completes the resume; bumps all pending milestone
-  deadlines by `(current_ledger − paused_at)` ledgers to compensate for the frozen period;
-  clears the paused state
-- **Reverts if:** shipment is not paused, or caller tries to approve their own resume request
-
-**`is_shipment_paused(env, shipment_id) -> bool`**
-
-- **Caller:** anyone (read-only)
-- **Returns:** `true` if the shipment is currently in the mutual-consent paused state
-
-#### Example
-
-```bash
-# 1. Supplier requests a pause
-stellar contract invoke --id <CONTRACT_ID> \
-  --source supplier-account --network testnet \
-  -- request_shipment_pause \
-  --caller <SUPPLIER_ADDRESS> \
-  --shipment_id "shipment-001"
-
-# 2. Buyer approves — shipment is now paused
-stellar contract invoke --id <CONTRACT_ID> \
-  --source buyer-account --network testnet \
-  -- approve_shipment_pause \
-  --caller <BUYER_ADDRESS> \
-  --shipment_id "shipment-001"
-
-# Check pause state
-stellar contract invoke --id <CONTRACT_ID> \
-  --network testnet -- is_shipment_paused \
-  --shipment_id "shipment-001"
-# → true
-
-# 3. Buyer requests to resume
-stellar contract invoke --id <CONTRACT_ID> \
-  --source buyer-account --network testnet \
-  -- resume_shipment \
-  --caller <BUYER_ADDRESS> \
-  --shipment_id "shipment-001"
-
-# 4. Supplier approves resumption — deadlines are extended by the paused duration
-stellar contract invoke --id <CONTRACT_ID> \
-  --source supplier-account --network testnet \
-  -- resume_shipment \
-  --caller <SUPPLIER_ADDRESS> \
-  --shipment_id "shipment-001"
-```
