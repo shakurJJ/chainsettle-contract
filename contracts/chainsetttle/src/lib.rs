@@ -1586,6 +1586,10 @@ pub enum DataKeyExt3 {
     // ── Granular Admin Roles ──────────────────────────────────────────────
     /// Granular role assignment for least-privilege operations: (role, address) -> bool.
     UserRole(Role, Address),
+
+    // ── Buyer default options profile ─────────────────────────────────────
+    /// Saved default ShipmentOptions profile for a buyer.
+    BuyerDefaultOptions(Address),
 }
 
 /// `DataKeyExt3` is at the 50-variant XDR ceiling, so keys added from here on
@@ -9907,7 +9911,7 @@ impl ChainSettleContract {
             panic!("shipment is not active");
         }
 
-        let mut milestone = shipment.milestones.get(milestone_index).unwrap();
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
 
         if milestone.status != MilestoneStatus::ConfirmedHeld {
             panic!("milestone is not in ConfirmedHeld status");
@@ -9917,7 +9921,73 @@ impl ChainSettleContract {
             panic!("holdback period not yet expired");
         }
 
-        let gross = Self::milestone_gross_payment(&env, &shipment, milestone_index);
+        Self::execute_release_held_payment(&env, &mut shipment, &shipment_id, milestone_index);
+    }
+
+    /// Releases multiple ConfirmedHeld milestones across one or more shipments in a single transaction.
+    ///
+    /// Skips milestones whose holdback has not expired or which are otherwise not eligible for release,
+    /// returning the list of successfully released `(shipment_id, milestone_index)` items.
+    /// Rejects batches larger than `constants::MAX_BATCH_RELEASE_HELD_PAYMENTS`.
+    pub fn batch_release_held_payments(
+        env: Env,
+        items: Vec<(String, u32)>,
+    ) -> Vec<(String, u32)> {
+        Self::assert_not_paused(&env);
+
+        if items.len() > constants::MAX_BATCH_RELEASE_HELD_PAYMENTS {
+            panic!("batch too large");
+        }
+
+        let mut released: Vec<(String, u32)> = Vec::new(&env);
+        if items.is_empty() {
+            return released;
+        }
+
+        for i in 0..items.len() {
+            let (shipment_id, milestone_index) = items.get(i).unwrap();
+            let key = DataKey::Shipment(shipment_id.clone());
+            let mut shipment: Shipment = match env.storage().persistent().get(&key) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            if shipment.status != ShipmentStatus::Active {
+                continue;
+            }
+
+            if milestone_index as usize >= shipment.milestones.len() as usize {
+                continue;
+            }
+
+            let milestone = match shipment.milestones.get(milestone_index) {
+                Some(m) => m,
+                None => continue,
+            };
+
+            if milestone.status != MilestoneStatus::ConfirmedHeld {
+                continue;
+            }
+
+            if env.ledger().sequence() < milestone.release_after_ledger {
+                continue;
+            }
+
+            Self::execute_release_held_payment(&env, &mut shipment, &shipment_id, milestone_index);
+            released.push_back((shipment_id, milestone_index));
+        }
+
+        released
+    }
+
+    fn execute_release_held_payment(
+        env: &Env,
+        shipment: &mut Shipment,
+        shipment_id: &String,
+        milestone_index: u32,
+    ) {
+        let mut milestone = shipment.milestones.get(milestone_index).unwrap();
+        let gross = Self::milestone_gross_payment(env, shipment, milestone_index);
 
         // #519: A graded confirmation releases only the graded share to the supplier;
         // the remainder is refunded to the buyer.
@@ -9931,14 +10001,14 @@ impl ChainSettleContract {
 
         // Deduct any approved advance for this milestone.
         let advance_deducted =
-            Self::consume_advance_for_milestone(&env, &mut shipment, &shipment_id, milestone_index);
+            Self::consume_advance_for_milestone(env, shipment, shipment_id, milestone_index);
 
         let mut fee_amount: i128 = 0;
-        let net_payment = Self::deduct_fee(&env, payment, &shipment.token, &mut fee_amount);
+        let net_payment = Self::deduct_fee(env, payment, &shipment.token, &mut fee_amount);
 
         // Check circuit breaker before transferring payment
-        Self::check_circuit_breaker(&env, payment);
-        Self::check_address_outflow(&env, &shipment.supplier, payment);
+        Self::check_circuit_breaker(env, payment);
+        Self::check_address_outflow(env, &shipment.supplier, payment);
 
         milestone.status = MilestoneStatus::Confirmed;
         milestone.release_after_ledger = 0;
@@ -9948,10 +10018,10 @@ impl ChainSettleContract {
         // #162: Track last confirmed milestone.
         shipment.last_confirmed_milestone_index = Some(milestone_index);
         // #475: Release this milestone's collateral share if opted in.
-        Self::release_milestone_collateral_share(&env, &shipment, &shipment_id, milestone_index);
+        Self::release_milestone_collateral_share(env, shipment, shipment_id, milestone_index);
 
         let mut actual_transfer = net_payment - advance_deducted;
-        let token_client = token::Client::new(&env, &shipment.token);
+        let token_client = token::Client::new(env, &shipment.token);
 
         // Deduct logistics fee and pay logistics provider.
         if shipment.logistics_fee_bps > 0 {
@@ -9967,7 +10037,7 @@ impl ChainSettleContract {
         }
 
         // Pay referral fee on shipment completion (deducted from final supplier payment).
-        if Self::all_milestones_done(&shipment) {
+        if Self::all_milestones_done(shipment) {
             if let Some(referrer_addr) = shipment.referrer.clone() {
                 let referral_bps: u32 = env
                     .storage()
@@ -9999,8 +10069,8 @@ impl ChainSettleContract {
         if actual_transfer > 0 {
             // Feature C: split payment across milestone payees if configured.
             Self::pay_milestone_to_payees(
-                &env,
-                &shipment_id,
+                env,
+                shipment_id,
                 milestone_index,
                 actual_transfer,
                 &shipment.supplier,
@@ -10013,7 +10083,7 @@ impl ChainSettleContract {
         {
             let primary_buyer = shipment.buyers.get(0).unwrap();
             Self::record_release_counters(
-                &env,
+                env,
                 shipment.supplier.clone(),
                 primary_buyer,
                 shipment.token.clone(),
@@ -10033,19 +10103,19 @@ impl ChainSettleContract {
                 );
             }
             Self::append_audit_entry(
-                &env,
-                &mut shipment,
+                env,
+                shipment,
                 env.current_contract_address(),
-                Symbol::new(&env, "grade_settled"),
-                Symbol::new(&env, "release_held_payment"),
+                Symbol::new(env, "grade_settled"),
+                Symbol::new(env, "release_held_payment"),
             );
             env.events().publish(
-                (Symbol::new(&env, "grade_settled"), shipment_id.clone()),
+                (Symbol::new(env, "grade_settled"), shipment_id.clone()),
                 (milestone_index, grade, grade_bps, payment, grade_refund),
             );
         }
 
-        if Self::all_milestones_done(&shipment) {
+        if Self::all_milestones_done(shipment) {
             // Return unused early bonus pool to buyer on completion.
             if shipment.early_bonus_remaining > 0 {
                 let primary_buyer = shipment.buyers.get(0).unwrap();
@@ -10072,15 +10142,15 @@ impl ChainSettleContract {
             env.storage()
                 .instance()
                 .set(&DataKey::ContractStats, &stats);
-            Self::increment_reputation_internal(&env, &shipment.supplier, 1, 0, 0);
+            Self::increment_reputation_internal(env, &shipment.supplier, 1, 0, 0);
             // Move from Active to Completed status index.
             Self::move_shipment_status_index(
-                &env,
+                env,
                 ShipmentStatus::Active,
                 ShipmentStatus::Completed,
-                &shipment_id,
+                shipment_id,
             );
-            Self::settle_on_completion(&env, &shipment_id, &mut shipment);
+            Self::settle_on_completion(env, shipment_id, shipment);
         }
 
         // Decrement total escrowed value (net of any advance already deducted).
@@ -10097,16 +10167,16 @@ impl ChainSettleContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+            .set(&DataKey::Shipment(shipment_id.clone()), shipment);
 
         env.events().publish(
             (
-                Symbol::new(&env, "held_payment_released"),
+                Symbol::new(env, "held_payment_released"),
                 shipment_id.clone(),
             ),
             (milestone_index, payment, fee_amount),
         );
-        Self::emit_milestone_confirmed(&env, &shipment_id, milestone_index, payment);
+        Self::emit_milestone_confirmed(env, shipment_id, milestone_index, payment);
     }
 
     // ----------------------------------------------------------
@@ -20070,6 +20140,160 @@ impl ChainSettleContract {
             options,
         )
     }
+
+    // ----------------------------------------------------------
+    // BUYER DEFAULT SHIPMENT OPTIONS PROFILE
+    // ----------------------------------------------------------
+
+    /// Saves a default `ShipmentOptions` profile for a buyer.
+    ///
+    /// Validates options configuration and requires buyer authorization.
+    pub fn set_default_options(env: Env, buyer: Address, options: ShipmentOptions) {
+        buyer.require_auth();
+
+        if options.dispute_bond_amount < 0 {
+            panic!("dispute bond cannot be negative");
+        }
+        if options.supplier_collateral < 0 {
+            panic!("collateral cannot be negative");
+        }
+        if options.buyer_cancel_fee_bps > constants::MAX_FEE_BPS {
+            panic!("buyer_cancel_fee_bps cannot exceed 1000 (10%)");
+        }
+        if options.penalty_bps > constants::MAX_FEE_BPS {
+            panic!("penalty_bps cannot exceed 1000 (10%)");
+        }
+        if options.dispute_bond_bps > 0 {
+            let max_bps: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKeyExt3::MaxDisputeBondBps)
+                .unwrap_or(constants::DEFAULT_MAX_DISPUTE_BOND_BPS);
+            if options.dispute_bond_bps > max_bps {
+                panic!("dispute_bond_bps exceeds maximum allowed");
+            }
+        }
+        if options.retainage_bps > constants::MAX_RETAINAGE_BPS {
+            panic!("retainage_bps exceeds maximum allowed");
+        }
+        if options.warranty_bps > constants::MAX_WARRANTY_BPS {
+            panic!("warranty_bps exceeds maximum allowed");
+        }
+        if options.warranty_bps > 0 && options.warranty_ledgers == 0 {
+            panic!("warranty_ledgers must be greater than zero when warranty_bps is set");
+        }
+        if options.quality_grades.len() > constants::MAX_QUALITY_GRADES {
+            panic!("too many quality grades");
+        }
+
+        let key = DataKeyExt3::BuyerDefaultOptions(buyer.clone());
+        env.storage().persistent().set(&key, &options);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        env.events()
+            .publish((Symbol::new(&env, "default_options_set"), buyer), ());
+    }
+
+    /// Clears the saved default `ShipmentOptions` profile for a buyer.
+    ///
+    /// Subsequent shipments created with defaults will fall back to the contract standard defaults.
+    pub fn clear_default_options(env: Env, buyer: Address) {
+        buyer.require_auth();
+        let key = DataKeyExt3::BuyerDefaultOptions(buyer.clone());
+        env.storage().persistent().remove(&key);
+
+        env.events()
+            .publish((Symbol::new(&env, "default_options_cleared"), buyer), ());
+    }
+
+    /// Returns the saved default `ShipmentOptions` profile for a buyer, or `None` if not set.
+    pub fn get_default_options(env: Env, buyer: Address) -> Option<ShipmentOptions> {
+        let key = DataKeyExt3::BuyerDefaultOptions(buyer);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Creates a shipment omitting explicit `options`, applying the primary buyer's saved
+    /// default profile if configured, or contract standard defaults otherwise.
+    pub fn create_shipment_with_defaults(
+        env: Env,
+        shipment_id: String,
+        buyers: Vec<Address>,
+        supplier: Address,
+        logistics: Address,
+        arbiter: Address,
+        token: Address,
+        total_amount: i128,
+        milestones: Vec<Milestone>,
+    ) -> String {
+        if buyers.is_empty() {
+            panic!("at least one buyer is required");
+        }
+        let primary_buyer = buyers.get(0).unwrap();
+        let options = Self::get_default_options(env.clone(), primary_buyer)
+            .unwrap_or_else(|| Self::contract_default_options(&env));
+
+        Self::create_shipment(
+            env,
+            shipment_id,
+            buyers,
+            supplier,
+            logistics,
+            arbiter,
+            token,
+            total_amount,
+            milestones,
+            options,
+        )
+    }
+
+    /// Constructs standard fallback `ShipmentOptions` with contract defaults.
+    pub fn contract_default_options(env: &Env) -> ShipmentOptions {
+        ShipmentOptions {
+            response_deadline: 0,
+            penalty_bps: 0,
+            milestone_mode: MilestoneMode::Parallel,
+            holdback_ledgers: 0,
+            dispute_cooldown_ledgers: 0,
+            late_penalty_bps_per_ledger: 0,
+            auto_confirm_ledgers: 0,
+            dispute_bond_amount: 0,
+            dispute_bond_bps: 0,
+            arbiter_fee_bps: 0,
+            logistics_fee_bps: 0,
+            supplier_collateral: 0,
+            expires_at_ledger: None,
+            metadata_hash: None,
+            referrer: None,
+            buyer_cancel_fee_bps: 0,
+            early_bonus_pool: 0,
+            review_window_ledgers: None,
+            milestone_splits: Vec::new(env),
+            deadlines: Vec::new(env),
+            dispute_timeout_seconds: 0,
+            default_resolution: Resolution::Buyer,
+            backup_arbiter: None,
+            confirmation_cooldown_ledgers: None,
+            arbiter_panel: Vec::new(env),
+            jurisdiction: None,
+            grace_period_ledgers: 0,
+            quality_grades: Vec::new(env),
+            milestone_quantities: Vec::new(env),
+            retainage_bps: 0,
+            warranty_bps: 0,
+            warranty_ledgers: 0,
+            inspector: None,
+            inspected_milestones: Vec::new(env),
+            proof_submitters: Vec::new(env),
+            require_dual_attestation: false,
+            fund_from_vault: false,
+            milestone_suppliers: Vec::new(env),
+            refund_recipient: None,
+        }
+    }
 }
 
 // ============================================================
@@ -21769,6 +21993,10 @@ mod test_feat_earnings;
 mod test_slash_collateral;
 mod test_shipment_cost_estimate;
 mod test_granular_roles;
+mod test_batch_release_held_payments;
+mod test_default_options_profile;
 // Disabled: exercises milestone insurance holdback / oracle price-condition
 // APIs (see NEW_MILESTONE_FEATURES.md) that have not been implemented yet.
 // mod test_milestone_insurance_and_oracle;
+
+

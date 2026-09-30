@@ -38,6 +38,10 @@ pub const DEFAULT_EMERGENCY_FREEZE_SUPERMAJORITY_BPS: u32 = 8_000;
 /// Max shipments accepted by `batch_cancel_shipments` (#580) in one call.
 pub const MAX_BATCH_CANCEL_SHIPMENTS: u32 = 20;
 
+/// Max milestone items accepted by `batch_release_held_payments` in one call.
+pub const MAX_BATCH_RELEASE_HELD_PAYMENTS: u32 = 20;
+
+
 /// Maximum basis points a shipment creator may configure for a value-scaled
 /// dispute bond (#391) when the admin has not set a stricter cap via
 /// `set_max_dispute_bond_bps`. 2000 = 20% of shipment value.

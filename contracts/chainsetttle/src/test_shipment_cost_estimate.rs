@@ -469,3 +469,131 @@ fn test_estimate_unapproved_token_panics() {
     // t.token_id is not other_token
     client.estimate_shipment_costs(&t.buyer, &t.token_id, &1_000_000i128, &milestones, &opts);
 }
+
+#[test]
+#[should_panic(expected = "token is not allowed for this buyer")]
+fn test_estimate_buyer_allowed_token_restriction_panics() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let other_token = Address::generate(&t.env);
+    client.set_buyer_allowed_tokens(&t.buyer, &t.buyer, &vec![&t.env, other_token]);
+
+    let milestones = build_milestones(&t.env);
+    let opts = default_options(&t.env);
+
+    client.estimate_shipment_costs(&t.buyer, &t.token_id, &1_000_000i128, &milestones, &opts);
+}
+
+#[test]
+#[should_panic(expected = "collateral cannot be negative")]
+fn test_estimate_negative_collateral_panics() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let milestones = build_milestones(&t.env);
+    let mut opts = default_options(&t.env);
+    opts.supplier_collateral = -1;
+
+    client.estimate_shipment_costs(&t.buyer, &t.token_id, &1_000_000i128, &milestones, &opts);
+}
+
+#[test]
+#[should_panic(expected = "dispute bond cannot be negative")]
+fn test_estimate_negative_dispute_bond_panics() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let milestones = build_milestones(&t.env);
+    let mut opts = default_options(&t.env);
+    opts.dispute_bond_amount = -1;
+
+    client.estimate_shipment_costs(&t.buyer, &t.token_id, &1_000_000i128, &milestones, &opts);
+}
+
+#[test]
+#[should_panic(expected = "buyer_cancel_fee_bps cannot exceed 1000 (10%)")]
+fn test_estimate_excessive_cancel_fee_bps_panics() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let milestones = build_milestones(&t.env);
+    let mut opts = default_options(&t.env);
+    opts.buyer_cancel_fee_bps = 1001;
+
+    client.estimate_shipment_costs(&t.buyer, &t.token_id, &1_000_000i128, &milestones, &opts);
+}
+
+#[test]
+#[should_panic(expected = "total amount exceeds maximum shipment value")]
+fn test_estimate_exceeds_max_shipment_value_panics() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    client.set_max_shipment_value(&t.buyer, &500_000i128);
+
+    let milestones = build_milestones(&t.env);
+    let opts = default_options(&t.env);
+
+    client.estimate_shipment_costs(&t.buyer, &t.token_id, &1_000_000i128, &milestones, &opts);
+}
+
+#[test]
+#[should_panic(expected = "MinShipmentValueNotMet")]
+fn test_estimate_below_min_shipment_value_floor_panics() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    client.set_min_shipment_value_floor(&t.buyer, &2_000_000i128);
+
+    let milestones = build_milestones(&t.env);
+    let opts = default_options(&t.env);
+
+    client.estimate_shipment_costs(&t.buyer, &t.token_id, &1_000_000i128, &milestones, &opts);
+}
+
+#[test]
+#[should_panic(expected = "InvalidSplitConfiguration")]
+fn test_estimate_split_count_mismatch_panics() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let milestones = build_milestones(&t.env); // 3 milestones
+    let mut opts = default_options(&t.env);
+    opts.milestone_splits = vec![&t.env, 5000u32, 5000u32]; // only 2 splits
+
+    client.estimate_shipment_costs(&t.buyer, &t.token_id, &1_000_000i128, &milestones, &opts);
+}
+
+#[test]
+#[should_panic(expected = "deadline count must match milestone count")]
+fn test_estimate_deadline_count_mismatch_panics() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let milestones = build_milestones(&t.env); // 3 milestones
+    let mut opts = default_options(&t.env);
+    opts.deadlines = vec![&t.env, 100u64]; // only 1 deadline
+
+    client.estimate_shipment_costs(&t.buyer, &t.token_id, &1_000_000i128, &milestones, &opts);
+}
+
+#[test]
+#[should_panic(expected = "InvalidPercentages")]
+fn test_estimate_percentage_below_min_panics() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    client.set_min_milestone_percentage(&t.buyer, &30u32);
+
+    let milestones = build_milestones(&t.env); // has 25%, 50%, 25% (25 < 30)
+    let opts = default_options(&t.env);
+
+    client.estimate_shipment_costs(&t.buyer, &t.token_id, &1_000_000i128, &milestones, &opts);
+}
+
+#[test]
+#[should_panic(expected = "TooManyMilestones")]
+fn test_estimate_too_many_milestones_panics() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    client.set_max_milestone_count(&t.buyer, &2u32);
+
+    let milestones = build_milestones(&t.env); // 3 milestones > max 2
+    let opts = default_options(&t.env);
+
+    client.estimate_shipment_costs(&t.buyer, &t.token_id, &1_000_000i128, &milestones, &opts);
+}
+

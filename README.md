@@ -3149,3 +3149,163 @@ stellar contract invoke --id <CONTRACT_ID> --source admin \
   --address <OPERATIONAL_ADDRESS>
 ```
 
+---
+
+### Shipment Cost Estimation Query (`estimate_shipment_costs`)
+
+A read-only simulation query that calculates all fees, net payouts, dispute bonds, and supplier collateral for an entire shipment before it is created on-chain.
+
+#### Motivation
+`preview_milestone_payout` only evaluates an existing shipment for a single milestone at a time. `estimate_shipment_costs` allows buyers and marketplaces to compute complete upfront financial projections across all milestones before locking funds in escrow.
+
+#### Function Signature
+```rust
+pub fn estimate_shipment_costs(
+    env: Env,
+    buyer: Address,
+    token: Address,
+    total_amount: i128,
+    milestones: Vec<Milestone>,
+    options: ShipmentOptions,
+) -> ShipmentCostEstimate
+```
+
+#### Return Types
+
+```rust
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct MilestoneCostEstimate {
+    pub milestone_index: u32,
+    pub gross_amount: i128,
+    pub platform_fee: i128,
+    pub logistics_fee: i128,
+    pub net_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct ShipmentCostEstimate {
+    pub total_amount: i128,
+    pub total_platform_fee: i128,
+    pub total_logistics_fee: i128,
+    pub total_net_amount: i128,
+    pub collateral_required: i128,
+    pub dispute_bond: i128,
+    pub applied_fee_bps: u32,
+    pub milestones: Vec<MilestoneCostEstimate>,
+}
+```
+
+#### Key Properties & Calculations
+1. **Dynamic Fee Resolution:** Automatically applies active platform fee config, volume tier discounts, and active VIP fee waivers configured for the buyer.
+2. **Fee Holiday Awareness:** If a contract-wide fee holiday is active, platform fees are automatically set to `0` bps.
+3. **Flexible Milestone Splitting:** Supports both standard milestone `payment_percent` (summing to 100%) and custom basis-point distributions via `options.milestone_splits` (summing to 10,000 bps).
+4. **Logistics Fee Deduction:** Deducts configured `options.logistics_fee_bps` from the gross payout after platform fee deduction.
+5. **Collateral & Dispute Bond Simulation:** Computes the total supplier collateral required and the dispute bond pool across all milestones based on `options.dispute_bond_amount` and `options.dispute_bond_bps`.
+6. **Zero State Mutation & No Auth Required:** Executable by any caller (read-only query) without signing permissions or modifying ledger state.
+7. **Strict Input Validation:** Rejects invalid configurations with clear panics (e.g., zero amount, empty milestones, invalid split sums, blacklisted addresses, unapproved tokens, and out-of-bound parameter values).
+
+#### CLI Usage Example
+
+```bash
+stellar contract invoke --id <CONTRACT_ID> \
+  --network testnet -- estimate_shipment_costs \
+  --buyer <BUYER_ADDRESS> \
+  --token <USDC_TOKEN_ADDRESS> \
+  --total_amount 10000000 \
+  --milestones '[{"name":"Dispatch","payment_percent":50,"proof_hash":"","status":"Pending","release_after_ledger":0,"proof_submitted_ledger":null,"dispute_opened_ledger":null,"deadline_ledger":0,"penalty_bps_per_ledger":0},{"name":"Delivery","payment_percent":50,"proof_hash":"","status":"Pending","release_after_ledger":0,"proof_submitted_ledger":null,"dispute_opened_ledger":null,"deadline_ledger":0,"penalty_bps_per_ledger":0}]' \
+  --options '{"dispute_bond_amount":100000,"dispute_bond_bps":0,"supplier_collateral":500000,"buyer_cancel_fee_bps":0,"milestone_splits":[],"deadlines":[],"logistics_fee_bps":200}'
+```
+
+---
+
+### Batch Release of Held Payments (`batch_release_held_payments`)
+
+Releases multiple `ConfirmedHeld` milestones across one or more shipments in a single transaction.
+
+#### Motivation
+When holdback is enabled, suppliers or automation bots previously had to invoke `release_held_payment` once per milestone. `batch_release_held_payments` enables batching multiple releases across different shipments into one atomic call, saving transaction fees and execution overhead.
+
+#### Function Signature
+```rust
+pub fn batch_release_held_payments(
+    env: Env,
+    items: Vec<(String, u32)>,
+) -> Vec<(String, u32)>
+```
+
+#### Key Properties & Rules
+1. **Partial / Non-blocking Execution:** Milestones whose holdback window has not yet elapsed (or which are not in `ConfirmedHeld` status) are skipped rather than causing the whole transaction to fail.
+2. **Return Value:** Returns a `Vec<(String, u32)>` listing only the `(shipment_id, milestone_index)` items that were successfully released.
+3. **Batch Size Cap:** Enforces a maximum batch size capped at `MAX_BATCH_RELEASE_HELD_PAYMENTS` (`20`). Oversized batches panic with `"batch too large"`.
+4. **Event Emission & Audit Logs:** Emits the standard `held_payment_released` and `milestone_confirmed` events for every milestone successfully released in the batch.
+5. **No Auth Gating:** Can be triggered by any caller (suppliers, buyers, keepers, crons) once holdback periods have expired.
+
+#### CLI Usage Example
+
+```bash
+stellar contract invoke --id <CONTRACT_ID> \
+  --network testnet -- batch_release_held_payments \
+  --items '[["SHIP-2026-001", 0], ["SHIP-2026-002", 0]]'
+```
+
+---
+
+### Buyer Default `ShipmentOptions` Profile
+
+Allows buyers to save a persistent `ShipmentOptions` profile that is automatically applied whenever they create a shipment without explicitly supplying options.
+
+#### Motivation
+Enterprise buyers frequently use the same configuration (such as holdback duration, penalty basis points, dispute bonds, and logistics fee rates) across hundreds of shipments. Saved profiles eliminate boilerplate, streamline integrations, and prevent configuration errors.
+
+#### API Reference
+
+| Function | Access | Behaviour |
+| --- | --- | --- |
+| `set_default_options(buyer, options)` | Buyer only (`require_auth`) | Validates and persists `options` as `buyer`'s default configuration. Emits `default_options_set`. |
+| `clear_default_options(buyer)` | Buyer only (`require_auth`) | Removes `buyer`'s saved profile. Subsequent shipments created with defaults fall back to contract standard defaults. Emits `default_options_cleared`. |
+| `get_default_options(buyer) → Option<ShipmentOptions>` | Read-only | Returns the saved `ShipmentOptions` profile for `buyer`, or `None` if not set. |
+| `create_shipment_with_defaults(shipment_id, buyers, supplier, logistics, arbiter, token, total_amount, milestones) → String` | Buyer (`require_auth`) | Creates a shipment omitting explicit options. Applies the primary buyer's saved profile, falling back to contract defaults if none is set. |
+
+#### Key Properties & Rules
+1. **Strict Buyer Ownership:** Only the buyer can create, update, or clear their own default options profile (`buyer.require_auth()`).
+2. **Upfront Validation:** The saved profile is validated at the time of calling `set_default_options` against all contract option constraints (caps on fee bps, dispute bonds, retainage, warranty, and quality grades).
+3. **Graceful Fallback:** When no profile is saved (or after clearing), `create_shipment_with_defaults` falls back to standard zero/disabled contract defaults.
+4. **Event Tracking:** Emits `default_options_set` and `default_options_cleared` events upon modification.
+
+#### CLI Usage Example
+
+```bash
+# 1. Buyer saves a default profile
+stellar contract invoke --id <CONTRACT_ID> --source buyer \
+  --network testnet -- set_default_options \
+  --buyer <BUYER_ADDRESS> \
+  --options '{"holdback_ledgers":100,"late_penalty_bps_per_ledger":10,"logistics_fee_bps":200,"dispute_bond_amount":50000,"dispute_bond_bps":0,"supplier_collateral":0,"buyer_cancel_fee_bps":0,"milestone_splits":[],"deadlines":[],"quality_grades":[]}'
+
+# 2. Check saved profile
+stellar contract invoke --id <CONTRACT_ID> \
+  --network testnet -- get_default_options \
+  --buyer <BUYER_ADDRESS>
+
+# 3. Create shipment applying default profile automatically
+stellar contract invoke --id <CONTRACT_ID> --source buyer \
+  --network testnet -- create_shipment_with_defaults \
+  --shipment_id "SHIP-2026-AUTO-01" \
+  --buyers '["<BUYER_ADDRESS>"]' \
+  --supplier <SUPPLIER_ADDRESS> \
+  --logistics <LOGISTICS_ADDRESS> \
+  --arbiter <ARBITER_ADDRESS> \
+  --token <USDC_TOKEN_ADDRESS> \
+  --total_amount 10000000 \
+  --milestones '[{"name":"Delivery","payment_percent":100,"proof_hash":"","status":"Pending","release_after_ledger":0,"proof_submitted_ledger":null,"dispute_opened_ledger":null,"deadline_ledger":0,"penalty_bps_per_ledger":0}]'
+
+# 4. Clear profile when no longer needed
+stellar contract invoke --id <CONTRACT_ID> --source buyer \
+  --network testnet -- clear_default_options \
+  --buyer <BUYER_ADDRESS>
+```
+
+
+
+

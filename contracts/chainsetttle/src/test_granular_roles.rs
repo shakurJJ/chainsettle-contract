@@ -374,3 +374,72 @@ fn test_grant_revoke_audit_log_and_events() {
     assert_eq!(last_revoked.action, Symbol::new(&t.env, "revoke_role"));
     assert_eq!(last_revoked.result, Symbol::new(&t.env, "role_revoked"));
 }
+
+#[test]
+fn test_fee_manager_can_override_shipment_fee() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let fee_mgr = Address::generate(&t.env);
+    let shipment_id = String::from_str(&t.env, "SHIP-OVERRIDE-01");
+
+    client.grant_role(&t.buyer, &Role::FeeManager, &fee_mgr);
+
+    // Fee manager can set and clear shipment fee override
+    client.set_shipment_fee_override(&fee_mgr, &shipment_id, &150u32);
+    assert_eq!(client.get_shipment_fee_override(&shipment_id), Some(150u32));
+
+    client.clear_shipment_fee_override(&fee_mgr, &shipment_id);
+    assert_eq!(client.get_shipment_fee_override(&shipment_id), None);
+}
+
+#[test]
+fn test_compliance_officer_can_set_buyer_allowed_tokens_and_review_appeal() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let compliance = Address::generate(&t.env);
+    let buyer = Address::generate(&t.env);
+    let token = Address::generate(&t.env);
+
+    client.grant_role(&t.buyer, &Role::ComplianceOfficer, &compliance);
+
+    // Set buyer allowed tokens
+    client.set_buyer_allowed_tokens(&compliance, &buyer, &vec![&t.env, token.clone()]);
+    let allowed = client.get_buyer_allowed_tokens(&buyer);
+    assert_eq!(allowed.len(), 1);
+    assert_eq!(allowed.get(0).unwrap(), token);
+
+    // Blacklist, submit appeal, and review appeal
+    let reason_hash = BytesN::from_array(&t.env, &[4u8; 32]);
+    client.blacklist_address(&compliance, &buyer, &reason_hash);
+    assert!(client.is_blacklisted(&buyer));
+
+    client.submit_blacklist_appeal(&buyer, &String::from_str(&t.env, "ipfs://appeal-evidence"));
+    client.review_blacklist_appeal(&compliance, &buyer, &true);
+    assert!(!client.is_blacklisted(&buyer));
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_non_fee_manager_cannot_override_shipment_fee() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let compliance = Address::generate(&t.env);
+    let shipment_id = String::from_str(&t.env, "SHIP-OVERRIDE-02");
+
+    client.grant_role(&t.buyer, &Role::ComplianceOfficer, &compliance);
+    client.set_shipment_fee_override(&compliance, &shipment_id, &150u32);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_non_compliance_officer_cannot_set_buyer_allowed_tokens() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let fee_mgr = Address::generate(&t.env);
+    let buyer = Address::generate(&t.env);
+    let token = Address::generate(&t.env);
+
+    client.grant_role(&t.buyer, &Role::FeeManager, &fee_mgr);
+    client.set_buyer_allowed_tokens(&fee_mgr, &buyer, &vec![&t.env, token]);
+}
+
