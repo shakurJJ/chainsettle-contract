@@ -253,6 +253,41 @@ Parameters:
 Returns: shipment_id (same as input, for confirmation)
 ```
 
+### Shipment-Level Cost Estimation (`estimate_shipment_costs`)
+
+A read-only simulation query that estimates every fee, payout, bond, and collateral requirement for a whole shipment before creation.
+
+```rust
+estimate_shipment_costs(
+    buyer: Address,
+    token: Address,
+    total_amount: i128,
+    milestones: Vec<Milestone>,
+    options: ShipmentOptions,
+) -> ShipmentCostEstimate
+```
+
+**Parameters:**
+- `buyer`: Primary buyer address (used to evaluate buyer lifetime volume tiers and active VIP fee waivers).
+- `token`: Escrow token SAC address (validated against allowlists and min/max value bounds).
+- `total_amount`: Total shipment escrow amount.
+- `milestones`: Ordered list of proposed shipment milestones.
+- `options`: `ShipmentOptions` configuration (splits, dispute bond bps/amount, supplier collateral, logistics fee bps, etc.).
+
+**Returns: `ShipmentCostEstimate`**
+- `total_amount` (`i128`): Total gross shipment amount.
+- `total_platform_fee` (`i128`): Sum of platform fees across all milestones.
+- `total_logistics_fee` (`i128`): Sum of logistics fees across all milestones.
+- `total_net_amount` (`i128`): Total net amount payable to supplier across all milestones.
+- `collateral_required` (`i128`): Required supplier collateral.
+- `dispute_bond` (`i128`): Total dispute bond locked by buyer at creation.
+- `applied_fee_bps` (`u32`): Effective platform fee rate applied (reflects active fee holidays, VIP waivers, and volume tiers).
+- `milestones` (`Vec<MilestoneCostEstimate>`): Per-milestone breakdown with `milestone_index`, `gross_amount`, `platform_fee`, `logistics_fee`, and `net_amount`.
+
+**Key Properties:**
+- **Read-only & Auth-Free**: Requires no signatures or transaction fees.
+- **Accurate Upfront Pricing**: Fully accounts for active fee holidays (`0 bps`), VIP partner waivers, and buyer lifetime volume tiers.
+
 Allowed token list
 The `token` parameter on `create_shipment` is checked against an admin-managed allowlist (`DataKey::AllowedTokens`). By default the list is empty, which means **open mode**: any Stellar Asset Contract (SAC) address is accepted. Once the admin adds at least one token, `create_shipment` only accepts tokens on that list — a non-listed token panics with `"token is not in the approved whitelist"`.
 Function Who Effect
@@ -3015,3 +3050,71 @@ stellar contract invoke --id <CONTRACT_ID> \
   --network testnet -- get_shipments_by_jurisdiction \
   --jurisdiction US
 ```
+
+---
+
+### Granular Admin Roles (Least Privilege)
+
+To enforce the principle of least privilege, operational keys can be granted scoped administrative roles without requiring full contract admin powers.
+
+#### Role Enum
+The `Role` enum defines four operational roles:
+- `Pauser`: Controls contract-wide pausing and unpausing.
+- `FeeManager`: Controls platform fee configs, fee holidays, fee tiers, referral fees, and shipment fee overrides.
+- `ComplianceOfficer`: Controls blacklisting, appeals, whitelist management, token allowances, and buyer-specific token permissions.
+- `ArbiterManager`: Manages the global arbiter pool (adding and removing arbiters).
+
+#### Role Management API
+| Function | Who | Behaviour |
+| --- | --- | --- |
+| `grant_role(admin, role, address)` | Primary Admin only | Grants `role` to `address`. Emits `role_granted` event and appends to admin audit trail. |
+| `revoke_role(admin, role, address)` | Primary Admin only | Revokes `role` from `address`. Takes effect immediately. Emits `role_revoked` event and appends to admin audit trail. |
+| `has_role(role, address) → bool` | Anyone (read-only) | Returns `true` if `address` holds `role` or is the primary contract admin. |
+
+#### Role-to-Function Permission Matrix
+
+| Role | Permitted Functions | Description |
+| --- | --- | --- |
+| **Pauser** | `pause(admin)`<br>`unpause(admin)` | Emergency halting and resumption of contract operations. |
+| **FeeManager** | `set_fee_config(admin, fee_bps, treasury)`<br>`schedule_fee_holiday(admin, start_ledger, end_ledger)`<br>`cancel_fee_holiday(admin)`<br>`set_fee_recipients(admin, recipients)`<br>`set_referral_fee_bps(admin, bps)`<br>`set_fee_tiers(admin, tiers)`<br>`set_shipment_fee_override(admin, shipment_id, fee_bps)`<br>`clear_shipment_fee_override(admin, shipment_id)` | Configuration of platform fees, fee holidays, revenue shares, and overrides. |
+| **ComplianceOfficer** | `blacklist_address(admin, address, reason_hash)`<br>`remove_from_blacklist(admin, address)`<br>`review_blacklist_appeal(admin, address, approve)`<br>`add_to_whitelist(admin, address)`<br>`remove_from_whitelist(admin, address)`<br>`set_require_mutual_preapproval(admin, enabled)`<br>`set_max_allowed_tokens(admin, max_allowed)`<br>`set_buyer_allowed_tokens(admin, buyer, tokens)` | Compliance rules, sanctions, whitelists, and token restrictions. |
+| **ArbiterManager** | `add_arbiter_to_pool(admin, arbiter)`<br>`remove_arbiter_from_pool(admin, arbiter)` | Arbiter pool membership management. |
+| **Primary Admin** | **All functions above** + role management, contract upgrades, timelock, and admin nominations. | Full super-admin access implicitly retains permissions for all scoped roles. |
+
+#### Key Properties
+1. **Implicit Super-Admin Access:** The primary contract admin retains access to all functions across every role without needing explicit role grants.
+2. **Immediate Revocation:** Role grants and revocations take effect instantaneously upon execution.
+3. **Multi-Role Assignment:** An address can be granted multiple distinct roles independently.
+4. **Audit Trail & Events:** All `grant_role` and `revoke_role` invocations emit event notifications (`role_granted`, `role_revoked`) and append entries to the immutable `admin_action_log`.
+
+#### CLI Usage Example
+
+```bash
+# Admin grants the FeeManager role to an operational address
+stellar contract invoke --id <CONTRACT_ID> --source admin \
+  --network testnet -- grant_role \
+  --admin <ADMIN_ADDRESS> \
+  --role FeeManager \
+  --address <OPERATIONAL_ADDRESS>
+
+# Check if the address holds the role
+stellar contract invoke --id <CONTRACT_ID> \
+  --network testnet -- has_role \
+  --role FeeManager \
+  --address <OPERATIONAL_ADDRESS>
+
+# Operational address updates the platform fee
+stellar contract invoke --id <CONTRACT_ID> --source operator \
+  --network testnet -- set_fee_config \
+  --admin <OPERATIONAL_ADDRESS> \
+  --fee_bps 200 \
+  --treasury <TREASURY_ADDRESS>
+
+# Admin revokes the role
+stellar contract invoke --id <CONTRACT_ID> --source admin \
+  --network testnet -- revoke_role \
+  --admin <ADMIN_ADDRESS> \
+  --role FeeManager \
+  --address <OPERATIONAL_ADDRESS>
+```
+
