@@ -21,6 +21,7 @@ Invoice hash
 rebalance_milestones
 Milestone Payee Splits
 Partial Disputes & Escalation Checks
+Mutual Buyer+Supplier Pre-Approval (#417)
 Blacklist Appeal Process
 Supplier Cancel Cooldown
 
@@ -1576,6 +1577,97 @@ and blacklisted cannot be used to create a shipment. Conversely, removing an
 address from the blacklist only removes that denial; the supplier must still
 be on a non-empty whitelist to be eligible. Neither control changes an
 already-created shipment.
+
+The supplier whitelist is separate from the approved-token whitelist, the
+per-milestone proof content-type whitelist, and mutual buyer pre-approval
+(see below).
+
+### Mutual Buyer+Supplier Pre-Approval (#417)
+
+Optional symmetric allowlist that lets each **supplier** decide which **buyers**
+may open shipments with them. The gate is **disabled by default**: until a
+ComplianceOfficer or admin enables it, `create_shipment` only enforces the
+existing supplier whitelist / blacklist checks (prior behaviour). When the gate
+is on, every address in the shipment's `buyers` vector must already appear in
+that supplier's own approved-buyer list, or creation panics with
+`"BuyerNotPreapproved"`.
+
+Use this when a curated supplier network needs per-supplier buyer consent —
+for example a manufacturer that only accepts purchase orders from known
+distributors — without requiring the platform admin to manage one global
+buyer list.
+
+#### Relation to the supplier whitelist
+
+| Control | Who manages | What it gates |
+| --- | --- | --- |
+| Supplier whitelist (`add_to_whitelist`) | Admin / ComplianceOfficer | Which **suppliers** may appear on new shipments. Empty list = open mode. |
+| Mutual buyer pre-approval (`add_approved_buyer`) | Each supplier (own auth) | Which **buyers** may appear on new shipments **with that supplier**, once the admin gate is enabled. |
+
+Both are enforced only at `create_shipment` time; neither affects shipments
+that already exist. Blacklisting still takes precedence over both controls.
+The gate flag is stored in instance storage (`DataKeyExt3::RequireMutualPreapproval`);
+approved-buyer lists live in persistent storage per supplier
+(`DataKeyExt3::ApprovedBuyers(supplier)`) and their TTL is renewed on every write.
+
+#### Functions
+
+| Function | Who | Behaviour |
+| --- | --- | --- |
+| `add_approved_buyer(supplier, buyer)` | Supplier (own `require_auth`) | Appends `buyer` to the supplier's approved-buyer list. No-op if already present. Emits `approved_buyer_added (supplier) → buyer`. |
+| `remove_approved_buyer(supplier, buyer)` | Supplier (own `require_auth`) | Removes `buyer` from the list (no error if absent). Emits `approved_buyer_removed (supplier) → buyer`. |
+| `get_approved_buyers(supplier) → Vec<Address>` | Anyone (read-only) | Returns the buyers that `supplier` has pre-approved. Empty vector when none exist. |
+| `set_require_mutual_preapproval(admin, enabled)` | Admin or ComplianceOfficer | Toggles the global gate. Emits `mutual_preapproval_updated (admin, enabled, ledger)` and appends an admin-audit entry. |
+| `get_require_mutual_preapproval() → bool` | Anyone (read-only) | Returns the current gate state. Defaults to `false` when never set. |
+
+#### Defaults and what `create_shipment` checks
+
+- The gate state defaults to **disabled** (`false`) — behaviour matches the
+  contract before this feature existed.
+- When **disabled**, approved-buyer lists may be written and read, but
+  `create_shipment` never consults them.
+- When **enabled**, the contract loads the named supplier's approved-buyer list
+  and requires **every** entry in the shipment's `buyers` vector to be present.
+  A single missing buyer reverts the whole creation with `"BuyerNotPreapproved"`.
+- An empty approved-buyer list plus an enabled gate means no buyer can open a
+  shipment with that supplier until the supplier adds at least one.
+- Enabling the gate does not retroactively validate shipments that already exist.
+- Enabling the gate does not affect the supplier whitelist check; both run
+  independently when configured.
+
+#### Usage example
+
+```bash
+# ComplianceOfficer (or admin) turns the gate on
+stellar contract invoke --id <CONTRACT_ID> --source compliance-account \
+  --network testnet -- set_require_mutual_preapproval \
+  --admin <COMPLIANCE_ADDRESS> \
+  --enabled true
+
+# Supplier pre-approves a buyer (supplier signs, not the admin)
+stellar contract invoke --id <CONTRACT_ID> --source supplier-account \
+  --network testnet -- add_approved_buyer \
+  --supplier <SUPPLIER_ADDRESS> \
+  --buyer <BUYER_ADDRESS>
+
+# Read back the supplier's approved list
+stellar contract invoke --id <CONTRACT_ID> \
+  --network testnet -- get_approved_buyers \
+  --supplier <SUPPLIER_ADDRESS>
+
+# Check whether the gate is currently enabled
+stellar contract invoke --id <CONTRACT_ID> \
+  --network testnet -- get_require_mutual_preapproval
+
+# Supplier revokes a buyer later
+stellar contract invoke --id <CONTRACT_ID> --source supplier-account \
+  --network testnet -- remove_approved_buyer \
+  --supplier <SUPPLIER_ADDRESS> \
+  --buyer <BUYER_ADDRESS>
+```
+
+With the gate enabled, `create_shipment` succeeds only when every named buyer
+is on the supplier's list; otherwise it reverts with `"BuyerNotPreapproved"`.
 
 ### Blacklist Appeal Process
 
