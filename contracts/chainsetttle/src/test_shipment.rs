@@ -64,6 +64,7 @@ fn test_create_shipment_invalid_percentages() {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         },
         Milestone {
             name: String::from_str(&t.env, "Step 2"),
@@ -75,6 +76,7 @@ fn test_create_shipment_invalid_percentages() {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         },
         Milestone {
             name: String::from_str(&t.env, "Step 3"),
@@ -86,6 +88,7 @@ fn test_create_shipment_invalid_percentages() {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         },
     ];
 

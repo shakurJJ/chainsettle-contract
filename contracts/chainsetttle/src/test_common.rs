@@ -75,6 +75,7 @@ pub fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         },
         Milestone {
             name: String::from_str(env, "In Transit"),
@@ -86,6 +87,7 @@ pub fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         },
         Milestone {
             name: String::from_str(env, "Delivered"),
@@ -97,6 +99,7 @@ pub fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         },
     ]
 }
@@ -146,6 +149,7 @@ pub fn default_options(_env: &Env) -> ShipmentOptions {
         fund_from_vault: false,
         milestone_suppliers: vec![_env],
         refund_recipient: None,
+        require_encrypted_evidence: false,
     }
 }
 
@@ -260,7 +264,7 @@ pub fn try_submit_proof(
     caller: &Address,
     shipment_id: &String,
     milestone_index: u32,
-) -> Result<(), Error> {
+) -> Result<(), soroban_sdk::Error> {
     let client = ChainSettleContractClient::new(&setup.env, &setup.contract_id);
     let proof = String::from_str(&setup.env, "proof_hash_123");
     client.try_submit_proof(
@@ -270,6 +274,17 @@ pub fn try_submit_proof(
         &proof,
         &Symbol::new(&setup.env, "ipfs"),
     )
+    .map(|_| ())
+    .map_err(|e| match e {
+        Ok(contract_err) => contract_err.into(),
+        Err(soroban_sdk::InvokeError::Contract(code)) => {
+            soroban_sdk::Error::from_contract_error(code)
+        }
+        Err(soroban_sdk::InvokeError::Abort) => soroban_sdk::Error::from_type_and_code(
+            soroban_sdk::xdr::ScErrorType::Context,
+            soroban_sdk::xdr::ScErrorCode::InvalidAction,
+        ),
+    })
 }
 
 /// Attempt `correct_proof` as `caller`, returning `Ok(())` on success or the
@@ -280,7 +295,7 @@ pub fn try_correct_proof(
     caller: &Address,
     shipment_id: &String,
     milestone_index: u32,
-) -> Result<(), Error> {
+) -> Result<(), soroban_sdk::Error> {
     let client = ChainSettleContractClient::new(&setup.env, &setup.contract_id);
     let proof = String::from_str(&setup.env, "corrected_proof_hash");
     client.try_correct_proof(
@@ -290,4 +305,24 @@ pub fn try_correct_proof(
         &proof,
         &Symbol::new(&setup.env, "ipfs"),
     )
+    .map(|_| ())
+    .map_err(|e| match e {
+        Ok(contract_err) => contract_err.into(),
+        Err(soroban_sdk::InvokeError::Contract(code)) => {
+            soroban_sdk::Error::from_contract_error(code)
+        }
+        Err(soroban_sdk::InvokeError::Abort) => soroban_sdk::Error::from_type_and_code(
+            soroban_sdk::xdr::ScErrorType::Context,
+            soroban_sdk::xdr::ScErrorCode::InvalidAction,
+        ),
+    })
+}
+
+/// Proptest case count: `default` for everyday runs, overridable with the
+/// `PROPTEST_CASES` env var for a deeper sweep (e.g. `PROPTEST_CASES=10000`).
+pub fn proptest_cases(default: u32) -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }

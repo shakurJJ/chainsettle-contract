@@ -23,6 +23,7 @@ fn single_milestone(env: &Env) -> soroban_sdk::Vec<Milestone> {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         },
     ]
 }

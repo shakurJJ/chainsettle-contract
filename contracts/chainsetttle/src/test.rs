@@ -76,6 +76,7 @@ fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         },
         Milestone {
             name: String::from_str(env, "In Transit"),
@@ -87,6 +88,7 @@ fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         },
         Milestone {
             name: String::from_str(env, "Delivered"),
@@ -98,6 +100,7 @@ fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         },
     ]
 }
@@ -147,6 +150,7 @@ fn default_options(_env: &Env) -> ShipmentOptions {
         fund_from_vault: false,
         milestone_suppliers: soroban_sdk::vec![_env],
         refund_recipient: None,
+        require_encrypted_evidence: false,
     }
 }
 
@@ -289,6 +293,7 @@ fn test_dispute_cooldown_blocks_early_redispute() {
             fund_from_vault: false,
             milestone_suppliers: soroban_sdk::vec![&t.env],
             refund_recipient: None,
+            require_encrypted_evidence: false,
         },
     );
 
@@ -515,6 +520,7 @@ fn test_deadline_cancellation_too_early() {
             fund_from_vault: false,
             milestone_suppliers: soroban_sdk::vec![&t.env],
             refund_recipient: None,
+            require_encrypted_evidence: false,
         },
     );
 

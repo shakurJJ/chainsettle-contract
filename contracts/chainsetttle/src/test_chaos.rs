@@ -84,6 +84,7 @@ fn two_milestone_chaos(env: &Env) -> soroban_sdk::Vec<Milestone> {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         },
         Milestone {
             name: String::from_str(env, "B"),
@@ -95,6 +96,7 @@ fn two_milestone_chaos(env: &Env) -> soroban_sdk::Vec<Milestone> {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         },
     ]
 }
@@ -172,6 +174,7 @@ fn exec(
                 fund_from_vault: false,
                 milestone_suppliers: vec![env],
                 refund_recipient: None,
+                require_encrypted_evidence: false,
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 client.create_shipment(
@@ -280,7 +283,7 @@ fn assert_escrow_invariant(
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: 5_000,
+        cases: crate::test_common::proptest_cases(64),
         // Shrinking is disabled for speed — the full sequence is logged on failure.
         max_shrink_iters: 0,
         ..Default::default()

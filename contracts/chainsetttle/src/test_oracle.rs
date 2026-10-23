@@ -73,6 +73,7 @@ fn build_single_milestone(env: &Env) -> Vec<Milestone> {
         dispute_opened_ledger: None,
         deadline_ledger: 0,
         penalty_bps_per_ledger: 0,
+        not_before_ledger: 0,
     });
     v
 }
@@ -89,6 +90,7 @@ fn build_three_milestones(env: &Env) -> Vec<Milestone> {
         dispute_opened_ledger: None,
         deadline_ledger: 0,
         penalty_bps_per_ledger: 0,
+        not_before_ledger: 0,
     });
     v.push_back(Milestone {
         name: String::from_str(&env, "Transit"),
@@ -100,6 +102,7 @@ fn build_three_milestones(env: &Env) -> Vec<Milestone> {
         dispute_opened_ledger: None,
         deadline_ledger: 0,
         penalty_bps_per_ledger: 0,
+        not_before_ledger: 0,
     });
     v.push_back(Milestone {
         name: String::from_str(&env, "Delivery"),
@@ -111,6 +114,7 @@ fn build_three_milestones(env: &Env) -> Vec<Milestone> {
         dispute_opened_ledger: None,
         deadline_ledger: 0,
         penalty_bps_per_ledger: 0,
+        not_before_ledger: 0,
     });
     v
 }
@@ -158,6 +162,7 @@ fn default_options(env: &Env) -> ShipmentOptions {
         fund_from_vault: false,
         milestone_suppliers: Vec::new(env),
         refund_recipient: None,
+        require_encrypted_evidence: false,
     }
 }
 

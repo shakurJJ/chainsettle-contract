@@ -368,10 +368,10 @@ fn test_partial_collateral_withdrawal_with_debt() {
 #[test]
 fn test_sequential_deposits_accumulate_correctly() {
     let s = setup();
-    
-    s.client().deposit(&s.d1, &1_000);
-    s.client().deposit(&s.d1, &2_000);
-    s.client().deposit(&s.d1, &3_000);
+
+    seed_liquidity(&s, &[&s.d1], &[1_000]);
+    seed_liquidity(&s, &[&s.d1], &[2_000]);
+    seed_liquidity(&s, &[&s.d1], &[3_000]);
     
     let balance = s.client().get_depositor_balance(&s.d1);
     assert_eq!(balance, 6_000);

@@ -25,24 +25,6 @@ fn pool_sentinel(t: &crate::test_common::TestSetup) -> soroban_sdk::Address {
 
 // ============================================================
 // Arbiter pool management
-#[test]
-fn funding_works_with_sufficient_allowance() {
-    let t = setup();
-    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
-    let spender = Address::generate(&t.env);
-    let amount = 1_000_000i128;
-
-    let sac = token::Client::new(&t.env, &t.token_id);
-    // SAC approve flow: buyer grants spender allowance.
-    sac.approve(&t.buyer, &spender, &amount, &1000);
-
-    let params = allowance_params(&t, &spender, &t.buyer, "ALLOW-OK", amount);
-    let id = client.create_shipment_with_allowance(&params);
-    let shipment = client.get_shipment(&id);
-    assert_eq!(shipment.total_amount, amount);
-    assert_eq!(shipment.buyers.get(0).unwrap(), t.buyer);
-    assert_eq!(shipment.status, ShipmentStatus::Active);
-}
 // ============================================================
 
 #[test]

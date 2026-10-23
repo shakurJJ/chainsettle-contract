@@ -32,6 +32,7 @@ fn milestone_with_deadline(env: &soroban_sdk::Env, deadline: u32) -> Vec<Milesto
             dispute_opened_ledger: None,
             deadline_ledger: deadline,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         },
     ]
 }

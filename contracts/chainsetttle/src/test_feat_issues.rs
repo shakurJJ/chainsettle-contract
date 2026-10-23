@@ -54,6 +54,7 @@ fn milestone_with_deadline(env: &Env, pct: u32, deadline_ledger: u32) -> Milesto
         dispute_opened_ledger: None,
         deadline_ledger,
         penalty_bps_per_ledger: 0,
+        not_before_ledger: 0,
     }
 }
 

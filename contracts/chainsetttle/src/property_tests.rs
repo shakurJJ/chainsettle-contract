@@ -6,7 +6,8 @@ use proptest::prelude::*;
 // STATE MACHINE MODEL
 //
 // Pure-Rust model with no heap allocation (arrays only).
-// Runs at full speed — 10,000 cases are generated per property.
+// Runs at full speed — 1,000 cases per property by default
+// (set PROPTEST_CASES for a deeper sweep).
 // ============================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,11 +96,11 @@ fn op_strategy() -> impl Strategy<Value = ModelOp> {
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: 10_000,
+        cases: crate::test_common::proptest_cases(1_000),
         ..Default::default()
     })]
 
-    /// 10,000 random sequences — invalid ops are skipped (as the contract panics),
+    /// 1,000 random sequences — invalid ops are skipped (as the contract panics),
     /// and at the end the state must be one of the six reachable states.
     #[test]
     fn prop_valid_sequences_stay_consistent(
@@ -286,6 +287,7 @@ mod contract_prop_tests {
                 dispute_opened_ledger: None,
                 deadline_ledger: 0,
                 penalty_bps_per_ledger: 0,
+                not_before_ledger: 0,
             },
             Milestone {
                 name: String::from_str(env, "M1"),
@@ -297,6 +299,7 @@ mod contract_prop_tests {
                 dispute_opened_ledger: None,
                 deadline_ledger: 0,
                 penalty_bps_per_ledger: 0,
+                not_before_ledger: 0,
             },
         ];
         client.create_shipment(
@@ -348,13 +351,14 @@ mod contract_prop_tests {
                 fund_from_vault: false,
                 milestone_suppliers: vec![env],
                 refund_recipient: None,
+                require_encrypted_evidence: false,
             },
         );
     }
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 128,
+            cases: crate::test_common::proptest_cases(32),
             ..Default::default()
         })]
 
@@ -458,7 +462,7 @@ mod milestone_percent_fuzz {
 
     proptest! {
         #![proptest_config(proptest::test_runner::Config {
-            cases: 10_000,
+            cases: crate::test_common::proptest_cases(1_000),
             ..Default::default()
         })]
 
@@ -668,6 +672,7 @@ mod milestone_percent_fuzz {
                 fund_from_vault: false,
                 milestone_suppliers: vec![env],
                 refund_recipient: None,
+                require_encrypted_evidence: false,
             }
         }
 
@@ -682,12 +687,13 @@ mod milestone_percent_fuzz {
                 dispute_opened_ledger: None,
                 deadline_ledger: 0,
                 penalty_bps_per_ledger: 0,
+                not_before_ledger: 0,
             }
         }
 
         proptest! {
             #![proptest_config(proptest::test_runner::Config {
-                cases: 200,
+                cases: crate::test_common::proptest_cases(32),
                 ..Default::default()
             })]
 

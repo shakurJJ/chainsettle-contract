@@ -8,7 +8,7 @@ use super::*;
 use crate::test_common::{
     capture_events, default_options, has_event_topic, setup, single_buyer_vec, TestSetup,
 };
-use soroban_sdk::testutils::Ledger;
+use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{vec, String, Symbol};
 
 fn milestone_with_deadline(env: &Env, pct: u32, deadline_ledger: u32) -> Milestone {
@@ -22,6 +22,7 @@ fn milestone_with_deadline(env: &Env, pct: u32, deadline_ledger: u32) -> Milesto
         dispute_opened_ledger: None,
         deadline_ledger,
         penalty_bps_per_ledger: 0,
+        not_before_ledger: 0,
     }
 }
 

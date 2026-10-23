@@ -98,6 +98,7 @@ fn default_options(_env: &Env) -> ShipmentOptions {
         fund_from_vault: false,
         milestone_suppliers: soroban_sdk::vec![&_env],
         refund_recipient: None,
+        require_encrypted_evidence: false,
     }
 }
 
@@ -118,6 +119,7 @@ fn one_hundred_percent_milestone(env: &Env) -> soroban_sdk::Vec<Milestone> {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         },
     ]
 }
@@ -161,6 +163,7 @@ fn build_ten_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         });
     }
     ms

@@ -23,6 +23,7 @@ fn three_milestone_vec(env: &Env) -> soroban_sdk::Vec<Milestone> {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         },
         Milestone {
             name: String::from_str(env, "Transit"),
@@ -34,6 +35,7 @@ fn three_milestone_vec(env: &Env) -> soroban_sdk::Vec<Milestone> {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         },
         Milestone {
             name: String::from_str(env, "Delivery"),
@@ -45,6 +47,7 @@ fn three_milestone_vec(env: &Env) -> soroban_sdk::Vec<Milestone> {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         },
     ]
 }
@@ -120,6 +123,7 @@ fn create_and_dispute(
             fund_from_vault: false,
             milestone_suppliers: vec![env],
             refund_recipient: None,
+            require_encrypted_evidence: false,
         },
     );
     let proof = String::from_str(env, "ipfs://concurrent-proof");

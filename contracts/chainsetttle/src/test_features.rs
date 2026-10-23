@@ -80,6 +80,7 @@ fn single_milestone(
             dispute_opened_ledger: None,
             deadline_ledger,
             penalty_bps_per_ledger,
+            not_before_ledger: 0,
         },
     ]
 }
@@ -125,6 +126,7 @@ fn default_opts(env: &Env) -> ShipmentOptions {
         fund_from_vault: false,
         milestone_suppliers: Vec::new(env),
         refund_recipient: None,
+        require_encrypted_evidence: false,
     }
 }
 

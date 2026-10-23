@@ -1750,6 +1750,40 @@ pub enum DataKeyExt4 {
     ShipmentBolHash(String, u32),
 }
 
+/// `DataKeyExt4` is at the 50-variant XDR ceiling, so keys added from here on
+/// live in this enum.
+#[contracttype]
+pub enum DataKeyExt5 {
+    // ── Panel escalation for high-value disputes ──────────────────────────
+    /// Per-token escalation config: token -> (threshold, panel_size).
+    PanelEscalation(Address),
+    /// Set when the open dispute on (shipment_id, milestone_index) was
+    /// escalated to an arbiter panel.
+    PanelEscalated(String, u32),
+
+    // ── Split dispute resolution ──────────────────────────────────────────
+    /// Supplier share (bps) of a split resolution for (shipment_id, milestone_index).
+    DisputeSplitBps(String, u32),
+    /// Parked split awaiting finality: (supplier_bps, contested_amount).
+    PendingSplit(String, u32),
+
+    // ── #631 Supplier on-time milestone rate ──────────────────────────────
+    /// On-time vs late confirmed-milestone counters for a supplier.
+    SupplierTimeliness(Address),
+
+    // ── Split an active shipment ──────────────────────────────────────────
+    /// Pending mutual-consent proposal to split a shipment in two.
+    SplitShipmentProposal(String),
+
+    // ── Supplier default terms ────────────────────────────────────────────
+    /// Supplier's default terms profile applied to new shipments.
+    SupplierTermsProfile(Address),
+
+    // ── Milestone not-before ledger ───────────────────────────────────────
+    /// Pending mutual-consent proposal to set a milestone's not-before ledger.
+    MilestoneNotBeforeProposal(String, u32),
+}
+
 /// #621 – Pending proposal to append a milestone to an active shipment.
 #[contracttype]
 #[derive(Clone, PartialEq, Debug)]
@@ -1790,9 +1824,9 @@ pub struct SupplierTermsProfile {
     /// Default holdback ledgers for milestone payments (0 = immediate release).
     pub default_holdback_ledgers: u32,
     /// Default dispute cooldown ledgers between successive disputes.
-    pub default_dispute_cooldown_ledgers: u32,
+    pub default_dispute_cooldown: u32,
     /// Default late penalty basis points per ledger of delay.
-    pub default_late_penalty_bps_per_ledger: u32,
+    pub default_late_penalty_bps: u32,
     /// Default auto-confirmation ledgers after proof submission.
     pub default_auto_confirm_ledgers: u32,
     /// Default arbiter fee basis points.
@@ -1800,7 +1834,7 @@ pub struct SupplierTermsProfile {
     /// Default logistics fee basis points.
     pub default_logistics_fee_bps: u32,
     /// Default supplier collateral percentage (basis points of total_amount).
-    pub default_supplier_collateral_bps: u32,
+    pub default_collateral_bps: u32,
     /// Default milestone mode (Sequential or Parallel).
     pub default_milestone_mode: MilestoneMode,
     /// Whether to require these terms (true) or allow buyers to override (false).
@@ -3181,7 +3215,7 @@ impl ChainSettleContract {
     pub fn get_supplier_timeliness(env: Env, supplier: Address) -> SupplierTimeliness {
         env.storage()
             .persistent()
-            .get(&DataKeyExt4::SupplierTimeliness(supplier))
+            .get(&DataKeyExt5::SupplierTimeliness(supplier))
             .unwrap_or_default()
     }
 
@@ -4027,6 +4061,7 @@ impl ChainSettleContract {
             fund_from_vault: false,
             milestone_suppliers: Vec::new(env),
             refund_recipient: None,
+            require_encrypted_evidence: false,
         }
     }
 
@@ -5547,9 +5582,9 @@ impl ChainSettleContract {
         keys.push_back(DataKeyExt4::SubstituteProposal(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt4::MilestoneSupplier(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt4::CollateralSlashedForMiss(s.clone(), idx).into_val(env));
-        keys.push_back(DataKeyExt4::DisputeSplitBps(s.clone(), idx).into_val(env));
-        keys.push_back(DataKeyExt4::PendingSplit(s.clone(), idx).into_val(env));
-        keys.push_back(DataKeyExt4::PanelEscalated(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt5::DisputeSplitBps(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt5::PendingSplit(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt5::PanelEscalated(s.clone(), idx).into_val(env));
         if let Some(purpose) = env
             .storage()
             .persistent()
@@ -6387,7 +6422,6 @@ impl ChainSettleContract {
         invoice_hash: BytesN<32>,
     ) {
         Self::assert_not_paused(&env);
-        caller.require_auth();
         let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
         if shipment.status != ShipmentStatus::Active {
             panic!("shipment is not active");
@@ -6515,7 +6549,6 @@ impl ChainSettleContract {
         bol_hash: BytesN<32>,
     ) {
         Self::assert_not_paused(&env);
-        caller.require_auth();
         let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
         if shipment.status != ShipmentStatus::Active {
             panic!("shipment is not active");
@@ -7205,8 +7238,8 @@ impl ChainSettleContract {
         if panel_size < constants::MIN_ESCALATION_PANEL_SIZE {
             panic!("arbiter panel must have at least 3 members");
         }
-        let key = DataKeyExt4::PanelEscalation(token.clone());
-        Self::set_persistent4(&env, &key, &(threshold, panel_size));
+        let key = DataKeyExt5::PanelEscalation(token.clone());
+        Self::set_persistent5(&env, &key, &(threshold, panel_size));
         Self::append_admin_action(
             &env,
             Symbol::new(&env, "set_panel_escalation"),
@@ -7224,7 +7257,7 @@ impl ChainSettleContract {
         Self::assert_admin(&env, &admin);
         env.storage()
             .persistent()
-            .remove(&DataKeyExt4::PanelEscalation(token.clone()));
+            .remove(&DataKeyExt5::PanelEscalation(token.clone()));
         Self::append_admin_action(
             &env,
             Symbol::new(&env, "clear_panel_escalation"),
@@ -7238,14 +7271,14 @@ impl ChainSettleContract {
     pub fn get_panel_escalation(env: Env, token: Address) -> Option<(i128, u32)> {
         env.storage()
             .persistent()
-            .get(&DataKeyExt4::PanelEscalation(token))
+            .get(&DataKeyExt5::PanelEscalation(token))
     }
 
     /// Whether the open dispute on this milestone was escalated to a panel.
     pub fn is_dispute_panel_escalated(env: Env, shipment_id: String, milestone_index: u32) -> bool {
         env.storage()
             .persistent()
-            .get(&DataKeyExt4::PanelEscalated(shipment_id, milestone_index))
+            .get(&DataKeyExt5::PanelEscalated(shipment_id, milestone_index))
             .unwrap_or(false)
     }
 
@@ -7262,13 +7295,13 @@ impl ChainSettleContract {
         milestone_index: u32,
         disputed_amount: i128,
     ) {
-        let escalated_key = DataKeyExt4::PanelEscalated(shipment_id.clone(), milestone_index);
+        let escalated_key = DataKeyExt5::PanelEscalated(shipment_id.clone(), milestone_index);
         env.storage().persistent().remove(&escalated_key);
 
         let (threshold, panel_size) = match env
             .storage()
             .persistent()
-            .get::<DataKeyExt4, (i128, u32)>(&DataKeyExt4::PanelEscalation(
+            .get::<DataKeyExt5, (i128, u32)>(&DataKeyExt5::PanelEscalation(
                 shipment.token.clone(),
             )) {
             Some(cfg) => cfg,
@@ -7305,7 +7338,7 @@ impl ChainSettleContract {
         env.storage()
             .persistent()
             .remove(&DataKeyExt::DisputeVotes(shipment_id.clone(), milestone_index));
-        Self::set_persistent4(env, &escalated_key, &true);
+        Self::set_persistent5(env, &escalated_key, &true);
         Self::record_supplier_arbiters(env, &shipment.supplier, &panel);
 
         Self::append_audit_entry(
@@ -7845,12 +7878,12 @@ impl ChainSettleContract {
                 // Supplier enforces their terms - override all
                 (
                     profile.default_holdback_ledgers,
-                    profile.default_dispute_cooldown_ledgers,
-                    profile.default_late_penalty_bps_per_ledger,
+                    profile.default_dispute_cooldown,
+                    profile.default_late_penalty_bps,
                     profile.default_auto_confirm_ledgers,
                     profile.default_arbiter_fee_bps,
                     profile.default_logistics_fee_bps,
-                    (total_amount * profile.default_supplier_collateral_bps as i128) / 10_000,
+                    (total_amount * profile.default_collateral_bps as i128) / 10_000,
                     profile.default_milestone_mode,
                 )
             } else {
@@ -7864,12 +7897,12 @@ impl ChainSettleContract {
                     if dispute_cooldown_ledgers > 0 {
                         dispute_cooldown_ledgers
                     } else {
-                        profile.default_dispute_cooldown_ledgers
+                        profile.default_dispute_cooldown
                     },
                     if late_penalty_bps_per_ledger > 0 {
                         late_penalty_bps_per_ledger
                     } else {
-                        profile.default_late_penalty_bps_per_ledger
+                        profile.default_late_penalty_bps
                     },
                     if auto_confirm_ledgers > 0 {
                         auto_confirm_ledgers
@@ -7881,7 +7914,7 @@ impl ChainSettleContract {
                     if supplier_collateral > 0 {
                         supplier_collateral
                     } else {
-                        (total_amount * profile.default_supplier_collateral_bps as i128) / 10_000
+                        (total_amount * profile.default_collateral_bps as i128) / 10_000
                     },
                     milestone_mode.clone(),
                 )
@@ -8113,6 +8146,7 @@ impl ChainSettleContract {
             last_confirmed_milestone_index: None,
             cancellation_reason: Vec::new(&env),
             grace_period_ledgers: options.grace_period_ledgers,
+            supplier_payout_address: None,
         };
 
         Self::append_audit_entry(
@@ -8667,6 +8701,7 @@ impl ChainSettleContract {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+            not_before_ledger: 0,
         });
         shipment.milestones = milestones;
         shipment.total_amount += amount;
@@ -12079,7 +12114,7 @@ impl ChainSettleContract {
         // #664: Any earlier split outcome is superseded by this resolution.
         env.storage()
             .persistent()
-            .remove(&DataKeyExt4::PendingSplit(shipment_id.clone(), milestone_index));
+            .remove(&DataKeyExt5::PendingSplit(shipment_id.clone(), milestone_index));
 
         // Use pre-fetched partial contested percent from context.
         let is_partial = ctx.partial_contested_percent.is_some();
@@ -12583,9 +12618,9 @@ impl ChainSettleContract {
         }
         let parked = park_ledgers > 0;
 
-        Self::set_persistent4(
+        Self::set_persistent5(
             &env,
-            &DataKeyExt4::DisputeSplitBps(shipment_id.clone(), milestone_index),
+            &DataKeyExt5::DisputeSplitBps(shipment_id.clone(), milestone_index),
             &supplier_bps,
         );
         if parked {
@@ -12593,9 +12628,9 @@ impl ChainSettleContract {
             milestone.release_after_ledger = now.saturating_add(park_ledgers);
             // The contested-percent record is kept so an appeal re-resolution
             // (and the eventual payout) uses the same scope.
-            Self::set_persistent4(
+            Self::set_persistent5(
                 &env,
-                &DataKeyExt4::PendingSplit(shipment_id.clone(), milestone_index),
+                &DataKeyExt5::PendingSplit(shipment_id.clone(), milestone_index),
                 &(supplier_bps, contested),
             );
         } else {
@@ -12746,7 +12781,7 @@ impl ChainSettleContract {
     pub fn get_dispute_split(env: Env, shipment_id: String, milestone_index: u32) -> Option<u32> {
         env.storage()
             .persistent()
-            .get(&DataKeyExt4::DisputeSplitBps(shipment_id, milestone_index))
+            .get(&DataKeyExt5::DisputeSplitBps(shipment_id, milestone_index))
     }
 
     /// Moves the funds of a split resolution (see `resolve_dispute_split`).
@@ -12961,11 +12996,11 @@ impl ChainSettleContract {
         }
 
         // #664: A parked split resolution settles by its stored percentages.
-        let split_key = DataKeyExt4::PendingSplit(shipment_id.clone(), milestone_index);
+        let split_key = DataKeyExt5::PendingSplit(shipment_id.clone(), milestone_index);
         if let Some((supplier_bps, contested)) = env
             .storage()
             .persistent()
-            .get::<DataKeyExt4, (u32, i128)>(&split_key)
+            .get::<DataKeyExt5, (u32, i128)>(&split_key)
         {
             env.storage().persistent().remove(&split_key);
             Self::settle_split_payout(
@@ -13254,11 +13289,11 @@ impl ChainSettleContract {
         // contested funds in escrow for the appeal arbiter's resolution.
         env.storage()
             .persistent()
-            .remove(&DataKeyExt4::PendingSplit(shipment_id.clone(), milestone_index));
+            .remove(&DataKeyExt5::PendingSplit(shipment_id.clone(), milestone_index));
         // #665: The appeal is heard by the single reassigned arbiter.
         env.storage()
             .persistent()
-            .remove(&DataKeyExt4::PanelEscalated(shipment_id.clone(), milestone_index));
+            .remove(&DataKeyExt5::PanelEscalated(shipment_id.clone(), milestone_index));
 
         env.storage()
             .persistent()
@@ -17269,7 +17304,7 @@ impl ChainSettleContract {
             // #665: The panel has decided; an appeal goes back to a single arbiter.
             env.storage()
                 .persistent()
-                .remove(&DataKeyExt4::PanelEscalated(shipment_id.clone(), milestone_index));
+                .remove(&DataKeyExt5::PanelEscalated(shipment_id.clone(), milestone_index));
 
             // Temporarily set shipment.arbiter to the panel caller so
             // require_arbiter_auth inside resolve_dispute passes.
@@ -19928,11 +19963,11 @@ impl ChainSettleContract {
         if milestone.deadline_ledger == 0 {
             return;
         }
-        let proof_ledger = milestone.proof_submitted_ledger.unwrap_or(0);
-        if proof_ledger == 0 {
-            return;
-        }
-        let key = DataKeyExt4::SupplierTimeliness(supplier.clone());
+        let proof_ledger = match milestone.proof_submitted_ledger {
+            Some(ledger) => ledger,
+            None => return,
+        };
+        let key = DataKeyExt5::SupplierTimeliness(supplier.clone());
         let mut timeliness: SupplierTimeliness =
             env.storage().persistent().get(&key).unwrap_or_default();
         if proof_ledger <= milestone.deadline_ledger {
@@ -23154,6 +23189,15 @@ impl ChainSettleContract {
         );
     }
 
+    fn set_persistent5<V: IntoVal<Env, Val>>(env: &Env, key: &DataKeyExt5, value: &V) {
+        env.storage().persistent().set(key, value);
+        env.storage().persistent().extend_ttl(
+            key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
     fn decrease_total_escrowed(env: &Env, token: &Address, amount: i128) {
         let key = DataKey::TotalEscrowed(token.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -23644,9 +23688,9 @@ impl ChainSettleContract {
 
             bump_key!(DataKeyExt4::SubstituteProposal(shipment_id.clone(), i));
             bump_key!(DataKeyExt4::MilestoneSupplier(shipment_id.clone(), i));
-            bump_key!(DataKeyExt4::DisputeSplitBps(shipment_id.clone(), i));
-            bump_key!(DataKeyExt4::PendingSplit(shipment_id.clone(), i));
-            bump_key!(DataKeyExt4::PanelEscalated(shipment_id.clone(), i));
+            bump_key!(DataKeyExt5::DisputeSplitBps(shipment_id.clone(), i));
+            bump_key!(DataKeyExt5::PendingSplit(shipment_id.clone(), i));
+            bump_key!(DataKeyExt5::PanelEscalated(shipment_id.clone(), i));
             bump_key!(DataKeyExt4::ShipmentBolHash(shipment_id.clone(), i));
 
             // #617: keep the uniqueness-registry owners for this milestone's
@@ -23840,7 +23884,7 @@ impl ChainSettleContract {
 
         for i in 0..original_shipment.milestones.len() {
             let milestone = original_shipment.milestones.get(i).unwrap();
-            let should_move = sorted_indices.iter().any(|&idx| idx == i);
+            let should_move = sorted_indices.iter().any(|idx| idx == i);
             
             if should_move {
                 new_milestones.push_back(milestone.clone());
@@ -23895,6 +23939,7 @@ impl ChainSettleContract {
             last_confirmed_milestone_index: None,
             cancellation_reason: Vec::new(env),
             grace_period_ledgers: original_shipment.grace_period_ledgers,
+            supplier_payout_address: original_shipment.supplier_payout_address.clone(),
         };
 
         storage::set_shipment(env, &proposal.new_shipment_id, &new_shipment);
@@ -23930,12 +23975,12 @@ impl ChainSettleContract {
         env: Env,
         supplier: Address,
         default_holdback_ledgers: u32,
-        default_dispute_cooldown_ledgers: u32,
-        default_late_penalty_bps_per_ledger: u32,
+        default_dispute_cooldown: u32,
+        default_late_penalty_bps: u32,
         default_auto_confirm_ledgers: u32,
         default_arbiter_fee_bps: u32,
         default_logistics_fee_bps: u32,
-        default_supplier_collateral_bps: u32,
+        default_collateral_bps: u32,
         default_milestone_mode: MilestoneMode,
         enforce_terms: bool,
     ) {
@@ -23949,18 +23994,18 @@ impl ChainSettleContract {
         if default_logistics_fee_bps > 10000 {
             panic!("logistics fee exceeds 100%");
         }
-        if default_supplier_collateral_bps > 10000 {
+        if default_collateral_bps > 10000 {
             panic!("collateral exceeds 100%");
         }
 
         let profile = SupplierTermsProfile {
             default_holdback_ledgers,
-            default_dispute_cooldown_ledgers,
-            default_late_penalty_bps_per_ledger,
+            default_dispute_cooldown,
+            default_late_penalty_bps,
             default_auto_confirm_ledgers,
             default_arbiter_fee_bps,
             default_logistics_fee_bps,
-            default_supplier_collateral_bps,
+            default_collateral_bps,
             default_milestone_mode,
             enforce_terms,
             updated_at_ledger: env.ledger().sequence(),
@@ -24210,10 +24255,6 @@ pub const MIN_SHIPMENT_AMOUNT: i128 = 1;
 
 /// Maximum platform fee in basis points (1000 bps = 10%).
 pub const MAX_FEE_BPS: u32 = 1_000;
-
-/// Ledgers after shipment creation before emergency recovery is allowed.
-/// ≈ 2 years at 5s/ledger: 5s × 86_400s/day × 365 days × 2.
-pub const RECOVERY_THRESHOLD_LEDGERS: u32 = 12_614_400;
 
 /// Maximum entries retained in the bounded admin action audit log.
 pub const AUDIT_LOG_MAX_ENTRIES: usize = 50;
