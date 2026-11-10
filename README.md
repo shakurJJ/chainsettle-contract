@@ -59,12 +59,12 @@ The core flow above is extended by optional, admin- or party-configured features
 - **Disputes:** partial disputes, evidence, mediation, arbiter pools and panels, appeals, arbiter slashing, finality delay
 - **Payments:** advances, payee splits, retainage, warranties, quality grades, partial quantities, payout batching and currency preference
 - **Risk controls:** supplier collateral and slashing, exposure and TVL caps, buyer spending limits, depeg guard, blacklist with appeals
-- **Fees:** fee tiers, VIP waivers, fee holidays, clean-completion rebates
+- **Fees:** fee tiers, VIP waivers, fee holidays, clean-completion rebates (see [`docs/fees.md`](docs/fees.md))
 - **Admin:** granular roles, multisig, timelock, global and per-operation pause, upgrades with `migrate`
 - **Queries:** shipment summaries, cost estimates, completion percentage, reputation counters, paginated lists
 - **Events:** every state change publishes an event. See [`docs/events.md`](docs/events.md) for each topic, its payload shape and the functions that emit it
 
-For the full API, see the doc comments on each `pub fn` in [`lib.rs`](contracts/chainsetttle/src/lib.rs). Topic notes live in [`docs/`](docs/): [events](docs/events.md), [tokens](docs/tokens.md), [completion percentage](docs/completion-percentage.md), [error catalogue](docs/errors.md), [storage TTL and archival](docs/storage-ttl.md) and [query and pagination reference](docs/queries.md) and [compliance controls](docs/compliance.md).
+For the full API, see the doc comments on each `pub fn` in [`lib.rs`](contracts/chainsetttle/src/lib.rs). Topic notes live in [`docs/`](docs/): [events](docs/events.md), [tokens](docs/tokens.md), [completion percentage](docs/completion-percentage.md), [error catalogue](docs/errors.md), [storage TTL and archival](docs/storage-ttl.md), [query and pagination reference](docs/queries.md), [compliance controls](docs/compliance.md) and [fee model reference](docs/fees.md).
 
 ## Project structure
 
