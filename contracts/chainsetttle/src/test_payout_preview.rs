@@ -131,6 +131,56 @@ fn test_preview_reflects_platform_fee_config() {
 }
 
 #[test]
+fn test_milestone_payment_is_split_between_configured_payees() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let first_payee = soroban_sdk::Address::generate(&t.env);
+    let second_payee = soroban_sdk::Address::generate(&t.env);
+    let shipment_id = String::from_str(&t.env, "PREV-PAYEE-SPLIT");
+
+    client.create_shipment(
+        &shipment_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000i128,
+        &build_milestones(&t.env),
+        &default_options(&t.env),
+    );
+    client.set_milestone_payees(
+        &t.buyer,
+        &shipment_id,
+        &0u32,
+        &vec![
+            &t.env,
+            MilestonePayee {
+                payee: first_payee.clone(),
+                percent: 30,
+            },
+            MilestonePayee {
+                payee: second_payee.clone(),
+                percent: 70,
+            },
+        ],
+    );
+    client.submit_proof(
+        &t.supplier,
+        &shipment_id,
+        &0u32,
+        &String::from_str(&t.env, "proof"),
+        &soroban_sdk::Symbol::new(&t.env, "ipfs"),
+    );
+
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_id);
+    client.confirm_milestone(&t.buyer, &shipment_id, &0u32);
+
+    assert_eq!(token_client.balance(&first_payee), 75_000);
+    assert_eq!(token_client.balance(&second_payee), 175_000);
+}
+
+#[test]
 fn test_preview_matches_combined_fee_waterfall_example() {
     let t = setup();
     let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
@@ -253,6 +303,26 @@ fn test_preview_reports_held_when_holdback_configured() {
     let preview = client.preview_milestone_payout(&shipment_id, &0u32);
     assert!(preview.would_be_held);
     assert_eq!(preview.platform_fee, 0);
+
+    client.submit_proof(
+        &t.supplier,
+        &shipment_id,
+        &0u32,
+        &String::from_str(&t.env, "proof"),
+        &soroban_sdk::Symbol::new(&t.env, "ipfs"),
+    );
+    client.confirm_milestone(&t.buyer, &shipment_id, &0u32);
+    let release_after = client
+        .get_milestone(&shipment_id, &0u32)
+        .release_after_ledger;
+    t.env.ledger().set_sequence_number(release_after);
+
+    let supplier_before = soroban_sdk::token::Client::new(&t.env, &t.token_id).balance(&t.supplier);
+    client.release_held_payment(&shipment_id, &0u32);
+    assert_eq!(
+        soroban_sdk::token::Client::new(&t.env, &t.token_id).balance(&t.supplier) - supplier_before,
+        250_000
+    );
 }
 
 #[test]

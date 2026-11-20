@@ -96,6 +96,26 @@ fn test_withholding_applies_to_net_payment_after_fees() {
 }
 
 #[test]
+fn test_advance_combines_with_platform_fee_and_retainage() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    client.set_fee_config(&t.buyer, &1_000u32, &t.treasury);
+    let id = create(&t, "RET-ADVANCE", &retainage_options(&t, 1_000));
+
+    let supplier_before = balance(&t, &t.supplier);
+    client.request_advance(&t.supplier, &id, &0u32, &10u32);
+    client.approve_advance(&t.buyer, &id, &0u32);
+    assert_eq!(balance(&t, &t.supplier) - supplier_before, 25_000);
+
+    confirm(&t, &id, 0);
+
+    // 250,000 gross - 25,000 fee - 25,000 advance = 200,000;
+    // 10% of that net transfer is retained, leaving 180,000 for the supplier.
+    assert_eq!(balance(&t, &t.supplier) - supplier_before, 205_000);
+    assert_eq!(client.get_retainage_balance(&id), 20_000);
+}
+
+#[test]
 fn test_final_confirmation_releases_all_retainage() {
     let t = setup();
     let client = ChainSettleContractClient::new(&t.env, &t.contract_id);

@@ -82,7 +82,7 @@ fn test_claim_payout_converts_to_preferred_token_when_route_and_liquidity_exist(
     accrue_batched_payout(&t, &client, &shipment_id, &source_token);
 
     let pending = client.get_pending_payout(&t.supplier);
-    assert!(pending > 0);
+    assert_eq!(pending, 250_000);
 
     let preferred_client = token::Client::new(&t.env, &preferred_token);
     let balance_before = preferred_client.balance(&t.supplier);
