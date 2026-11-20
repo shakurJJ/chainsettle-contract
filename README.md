@@ -64,7 +64,7 @@ The core flow above is extended by optional, admin- or party-configured features
 - **Queries:** shipment summaries, cost estimates, completion percentage, reputation counters, paginated lists
 - **Events:** every state change publishes an event. See [`docs/events.md`](docs/events.md) for each topic, its payload shape and the functions that emit it
 
-For the full API, see the doc comments on each `pub fn` in [`lib.rs`](contracts/chainsetttle/src/lib.rs). Topic notes live in [`docs/`](docs/): [events](docs/events.md), [tokens](docs/tokens.md), [completion percentage](docs/completion-percentage.md), [error catalogue](docs/errors.md), [storage TTL and archival](docs/storage-ttl.md) and [query and pagination reference](docs/queries.md) and [compliance controls](docs/compliance.md).
+For the full API, see the doc comments on each `pub fn` in [`lib.rs`](contracts/chainsetttle/src/lib.rs). Topic notes live in [`docs/`](docs/): [events](docs/events.md), [tokens](docs/tokens.md), [completion percentage](docs/completion-percentage.md), [error catalogue](docs/errors.md), [storage TTL and archival](docs/storage-ttl.md), [query and pagination reference](docs/queries.md), [compliance controls](docs/compliance.md) and the [milestone modification guide](docs/milestone-modification-guide.md).
 
 ## Project structure
 
