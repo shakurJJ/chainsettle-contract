@@ -1782,6 +1782,12 @@ pub enum DataKeyExt5 {
     // ── Milestone not-before ledger ───────────────────────────────────────
     /// Pending mutual-consent proposal to set a milestone's not-before ledger.
     MilestoneNotBeforeProposal(String, u32),
+    AutoConfirmWarningFired(String, u32),
+    Organization(Address),
+    OrgMember(Address, Address),
+    OrgShipment(String),
+    OrgShipmentMember(String),
+    OrgBuyerAuthOverride(Address),
 }
 
 /// #621 – Pending proposal to append a milestone to an active shipment.
@@ -1853,6 +1859,21 @@ pub struct MilestoneNotBeforeProposal {
     pub buyer_agreed: bool,
     pub supplier_agreed: bool,
     pub proposed_at_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OrgRole {
+    Creator,
+    Confirmer,
+    Disputer,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct OrgMember {
+    pub role: OrgRole,
+    pub spend_cap: i128,
 }
 
 /// Invoice factoring: a supplier's receivable on a shipment assigned to a financier.
@@ -10656,7 +10677,7 @@ impl ChainSettleContract {
             buyer.require_auth();
             acts_as_buyer = true;
         } else {
-            Self::require_buyer_auth(&shipment, &buyer);
+            Self::require_buyer_auth_with_org_override(&env, &shipment, &buyer);
         }
 
         if milestone_index as usize >= shipment.milestones.len() as usize {
@@ -11544,7 +11565,7 @@ impl ChainSettleContract {
         if supplier_grade_dispute {
             buyer.require_auth();
         } else {
-            Self::require_buyer_auth(&shipment, &buyer);
+            Self::require_buyer_auth_with_org_override(&env, &shipment, &buyer);
             if pending_grade.is_some() {
                 panic!("graded milestone can only be disputed by the supplier");
             }
@@ -13527,6 +13548,72 @@ impl ChainSettleContract {
                 milestone_index,
                 ledgers_remaining,
                 milestone.deadline_ledger,
+            ),
+        );
+    }
+
+    pub fn check_auto_confirm_warning(env: Env, shipment_id: String, milestone_index: u32) {
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        let lead: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt2::WarningLeadLedgers)
+            .unwrap_or(0);
+        if lead == 0 {
+            return;
+        }
+
+        if milestone_index as usize >= shipment.milestones.len() as usize {
+            panic!("invalid milestone index");
+        }
+
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        if milestone.status != MilestoneStatus::ProofSubmitted {
+            return;
+        }
+
+        let proof_ledger = match milestone.proof_submitted_ledger {
+            Some(ledger) => ledger,
+            None => return,
+        };
+        let window = Self::get_effective_auto_confirm_window(&env, &shipment);
+        if window == 0 {
+            return;
+        }
+
+        let auto_confirm_ledger = proof_ledger.saturating_add(window);
+        let window_start = auto_confirm_ledger.saturating_sub(lead);
+        let current_ledger = env.ledger().sequence();
+        if current_ledger < window_start || current_ledger >= auto_confirm_ledger {
+            return;
+        }
+
+        let fired_key =
+            DataKeyExt5::AutoConfirmWarningFired(shipment_id.clone(), milestone_index);
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt5, bool>(&fired_key)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&fired_key, &true);
+        env.storage().persistent().extend_ttl(
+            &fired_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "auto_conf_warn"), shipment_id.clone()),
+            (
+                milestone_index,
+                auto_confirm_ledger - current_ledger,
+                auto_confirm_ledger,
             ),
         );
     }
@@ -19812,6 +19899,17 @@ impl ChainSettleContract {
         Self::assert_is_buyer(shipment, buyer);
     }
 
+    fn require_buyer_auth_with_org_override(env: &Env, shipment: &Shipment, buyer: &Address) {
+        let key = DataKeyExt5::OrgBuyerAuthOverride(buyer.clone());
+        let skip: bool = env.storage().instance().get(&key).unwrap_or(false);
+        if skip {
+            env.storage().instance().remove(&key);
+        } else {
+            buyer.require_auth();
+        }
+        Self::assert_is_buyer(shipment, buyer);
+    }
+
     /// Caller must be the shipment's supplier.
     fn require_supplier_auth(shipment: &Shipment, caller: &Address) {
         caller.require_auth();
@@ -23741,15 +23839,18 @@ impl ChainSettleContract {
         Self::assert_not_paused(&env);
 
         // Verify shipment exists and is active
-        let mut shipment = storage::get_shipment(&env, &shipment_id)
-            .unwrap_or_else(|| panic!("shipment not found"));
-        
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+
         if shipment.status != ShipmentStatus::Active {
             panic!("shipment not active");
         }
 
         // Verify new shipment ID doesn't already exist
-        if storage::shipment_exists(&env, &new_shipment_id) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Shipment(new_shipment_id.clone()))
+        {
             panic!("new shipment ID already exists");
         }
 
@@ -23800,8 +23901,7 @@ impl ChainSettleContract {
         caller.require_auth();
         Self::assert_not_paused(&env);
 
-        let shipment = storage::get_shipment(&env, &shipment_id)
-            .unwrap_or_else(|| panic!("shipment not found"));
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
 
         if shipment.status != ShipmentStatus::Active {
             panic!("shipment not active");
@@ -23868,8 +23968,7 @@ impl ChainSettleContract {
         shipment_id: &String,
         proposal: &SplitShipmentProposal,
     ) {
-        let mut original_shipment = storage::get_shipment(env, shipment_id)
-            .unwrap_or_else(|| panic!("shipment not found"));
+        let mut original_shipment = Self::get_shipment_internal(env, shipment_id);
 
         // Create a new shipment with the split milestones
         let mut new_milestones = Vec::new(env);
@@ -23888,7 +23987,7 @@ impl ChainSettleContract {
             
             if should_move {
                 new_milestones.push_back(milestone.clone());
-                let amount = (original_shipment.total_amount * milestone.payment_percent as i128) / 10000;
+                let amount = Self::milestone_full_gross_payment(env, &original_shipment, i);
                 total_split_amount += amount;
             } else {
                 remaining_milestones.push_back(milestone);
@@ -23899,7 +23998,9 @@ impl ChainSettleContract {
         original_shipment.milestones = remaining_milestones;
         let remaining_amount = original_shipment.total_amount - total_split_amount;
         original_shipment.total_amount = remaining_amount;
-        storage::set_shipment(env, shipment_id, &original_shipment);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &original_shipment);
 
         // Create new shipment
         let new_shipment = Shipment {
@@ -23942,7 +24043,9 @@ impl ChainSettleContract {
             supplier_payout_address: original_shipment.supplier_payout_address.clone(),
         };
 
-        storage::set_shipment(env, &proposal.new_shipment_id, &new_shipment);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(proposal.new_shipment_id.clone()), &new_shipment);
 
         // Update indices
         storage::push_shipment_id(env, &proposal.new_shipment_id);
@@ -24041,8 +24144,7 @@ impl ChainSettleContract {
         caller.require_auth();
         Self::assert_not_paused(&env);
 
-        let shipment = storage::get_shipment(&env, &shipment_id)
-            .unwrap_or_else(|| panic!("shipment not found"));
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
 
         if shipment.status != ShipmentStatus::Active {
             panic!("shipment not active");
@@ -24090,8 +24192,7 @@ impl ChainSettleContract {
         caller.require_auth();
         Self::assert_not_paused(&env);
 
-        let mut shipment = storage::get_shipment(&env, &shipment_id)
-            .unwrap_or_else(|| panic!("shipment not found"));
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
 
         if shipment.status != ShipmentStatus::Active {
             panic!("shipment not active");
@@ -24119,7 +24220,9 @@ impl ChainSettleContract {
             let mut milestone = shipment.milestones.get(milestone_index).unwrap();
             milestone.not_before_ledger = proposal.not_before_ledger;
             shipment.milestones.set(milestone_index, milestone);
-            storage::set_shipment(&env, &shipment_id, &shipment);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
             storage::remove_milestone_not_before_proposal(&env, &shipment_id, milestone_index);
 
             env.events().publish(
@@ -24156,7 +24259,263 @@ impl ChainSettleContract {
 
         env.events().publish(
             (Symbol::new(&env, "not_before_cancelled"), shipment_id),
-            (milestone_index, caller),
+            caller,
+        );
+    }
+
+    pub fn create_organization(env: Env, org: Address) {
+        org.require_auth();
+        let key = DataKeyExt5::Organization(org.clone());
+        if env.storage().persistent().has(&key) {
+            panic!("organization already exists");
+        }
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        env.events()
+            .publish((Symbol::new(&env, "organization_created"),), org);
+    }
+
+    pub fn add_org_member(
+        env: Env,
+        org: Address,
+        member: Address,
+        role: OrgRole,
+        spend_cap: i128,
+    ) {
+        org.require_auth();
+        Self::assert_organization_exists(&env, &org);
+        if spend_cap < 0 {
+            panic!("invalid spend cap");
+        }
+        let key = DataKeyExt5::OrgMember(org.clone(), member.clone());
+        env.storage().persistent().set(
+            &key,
+            &OrgMember {
+                role,
+                spend_cap,
+            },
+        );
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "organization_member_added"), org),
+            (member, role),
+        );
+    }
+
+    pub fn remove_org_member(env: Env, org: Address, member: Address) {
+        org.require_auth();
+        Self::assert_organization_exists(&env, &org);
+        let key = DataKeyExt5::OrgMember(org.clone(), member.clone());
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (Symbol::new(&env, "organization_member_removed"), org),
+            member,
+        );
+    }
+
+    pub fn create_organization_shipment(
+        env: Env,
+        org: Address,
+        member: Address,
+        shipment_id: String,
+        supplier: Address,
+        logistics: Address,
+        arbiter: Address,
+        token: Address,
+        total_amount: i128,
+        milestones: Vec<Milestone>,
+        options: ShipmentOptions,
+    ) -> String {
+        org.require_auth();
+        member.require_auth();
+        let org_member = Self::get_org_member_required(&env, &org, &member);
+        if org_member.role != OrgRole::Creator {
+            panic!("unauthorized");
+        }
+        if org_member.spend_cap > 0 && total_amount > org_member.spend_cap {
+            panic!("spend cap exceeded");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKeyExt4::SkipBuyerAuth, &true);
+        Self::create_shipment(
+            env.clone(),
+            shipment_id.clone(),
+            Vec::from_array(&env, [org.clone()]),
+            supplier,
+            logistics,
+            arbiter,
+            token,
+            total_amount,
+            milestones,
+            options,
+        );
+
+        Self::store_org_shipment_links(&env, &shipment_id, &org, &member);
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            member.clone(),
+            Symbol::new(&env, "organization_shipment_created"),
+            Symbol::new(&env, "create_organization_shipment"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "organization_shipment_created"),
+                shipment_id.clone(),
+            ),
+            (org, member),
+        );
+        shipment_id
+    }
+
+    pub fn confirm_organization_milestone(
+        env: Env,
+        org: Address,
+        member: Address,
+        shipment_id: String,
+        milestone_index: u32,
+    ) {
+        org.require_auth();
+        member.require_auth();
+        let org_member = Self::get_org_member_required(&env, &org, &member);
+        if org_member.role != OrgRole::Creator && org_member.role != OrgRole::Confirmer {
+            panic!("unauthorized");
+        }
+        Self::assert_org_shipment(&env, &shipment_id, &org);
+
+        env.storage()
+            .instance()
+            .set(&DataKeyExt5::OrgBuyerAuthOverride(org.clone()), &true);
+        Self::confirm_milestone(env.clone(), org, shipment_id.clone(), milestone_index);
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            member.clone(),
+            Symbol::new(&env, "organization_milestone_confirmed"),
+            Symbol::new(&env, "confirm_organization_milestone"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+    }
+
+    pub fn raise_organization_dispute(
+        env: Env,
+        org: Address,
+        member: Address,
+        shipment_id: String,
+        milestone_index: u32,
+    ) {
+        org.require_auth();
+        member.require_auth();
+        let org_member = Self::get_org_member_required(&env, &org, &member);
+        if org_member.role != OrgRole::Creator && org_member.role != OrgRole::Disputer {
+            panic!("unauthorized");
+        }
+        Self::assert_org_shipment(&env, &shipment_id, &org);
+
+        env.storage()
+            .instance()
+            .set(&DataKeyExt5::OrgBuyerAuthOverride(org.clone()), &true);
+        Self::raise_dispute(env.clone(), org, shipment_id.clone(), milestone_index);
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            member.clone(),
+            Symbol::new(&env, "organization_dispute_raised"),
+            Symbol::new(&env, "raise_organization_dispute"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+    }
+
+    pub fn is_organization(env: Env, org: Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKeyExt5::Organization(org))
+    }
+
+    pub fn get_org_member(env: Env, org: Address, member: Address) -> Option<OrgMember> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::OrgMember(org, member))
+    }
+
+    pub fn get_org_shipment(env: Env, shipment_id: String) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::OrgShipment(shipment_id))
+    }
+
+    pub fn get_org_shipment_member(env: Env, shipment_id: String) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::OrgShipmentMember(shipment_id))
+    }
+
+    fn assert_organization_exists(env: &Env, org: &Address) {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKeyExt5::Organization(org.clone()))
+        {
+            panic!("organization not found");
+        }
+    }
+
+    fn get_org_member_required(env: &Env, org: &Address, member: &Address) -> OrgMember {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::OrgMember(org.clone(), member.clone()))
+            .unwrap_or_else(|| panic!("not an organization member"))
+    }
+
+    fn assert_org_shipment(env: &Env, shipment_id: &String, org: &Address) {
+        let stored: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt5::OrgShipment(shipment_id.clone()))
+            .unwrap_or_else(|| panic!("not an organization shipment"));
+        if stored != *org {
+            panic!("unauthorized");
+        }
+    }
+
+    fn store_org_shipment_links(env: &Env, shipment_id: &String, org: &Address, member: &Address) {
+        let org_key = DataKeyExt5::OrgShipment(shipment_id.clone());
+        let member_key = DataKeyExt5::OrgShipmentMember(shipment_id.clone());
+        env.storage().persistent().set(&org_key, org);
+        env.storage().persistent().set(&member_key, member);
+        env.storage().persistent().extend_ttl(
+            &org_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        env.storage().persistent().extend_ttl(
+            &member_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
         );
     }
 }
@@ -24240,6 +24599,9 @@ mod test_metadata_index;
 mod test_role_expiry;
 mod test_new_milestone;
 mod test_supplier_timeliness;
+mod test_auto_confirm_warning;
+mod test_buyer_organization;
+mod test_split_shipment;
 // Disabled: exercises milestone insurance holdback / oracle price-condition
 // APIs (see NEW_MILESTONE_FEATURES.md) that have not been implemented yet.
 // mod test_milestone_insurance_and_oracle;
