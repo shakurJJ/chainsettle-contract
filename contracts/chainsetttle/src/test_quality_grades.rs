@@ -83,6 +83,8 @@ fn test_grade_recorded_in_audit_log_and_events() {
     let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
     let id = create(&t, "GRADE-AUDIT", &graded_options(&t));
     submit(&t, &id, 0);
+    let supplier_before = balance(&t, &t.supplier);
+    let buyer_before = balance(&t, &t.buyer);
 
     client.confirm_milestone_graded(&t.buyer, &id, &0u32, &1u32);
     assert!(has_event(&t, "milestone_graded"));
@@ -96,6 +98,8 @@ fn test_grade_recorded_in_audit_log_and_events() {
     advance_past_review_window(&t, &id, 0);
     client.release_held_payment(&id, &0u32);
     assert!(has_event(&t, "grade_settled"));
+    assert_eq!(balance(&t, &t.supplier) - supplier_before, 225_000);
+    assert_eq!(balance(&t, &t.buyer) - buyer_before, 25_000);
 }
 
 #[test]
