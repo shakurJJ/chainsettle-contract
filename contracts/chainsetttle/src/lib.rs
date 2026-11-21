@@ -711,6 +711,35 @@ pub struct ArbiterStats {
     pub overturned_count: u32,
 }
 
+/// #742 – Read model returned by `get_arbiter_stats`: the stored
+/// `ArbiterStats` counters plus the arbiter's declared fee rate. Kept separate
+/// from the stored struct so existing `ArbiterStats` entries still decode.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ArbiterStatsView {
+    pub resolved_approved: u32,
+    pub resolved_rejected: u32,
+    pub total_resolution_ledgers: u64,
+    pub overturned_count: u32,
+    /// Declared fee rate in bps (0 = none declared; shipment rate applies).
+    pub fee_rate_bps: u32,
+}
+
+/// #740 – Consolidated proceeding over several open disputes between the same
+/// buyer and supplier, decided by one ruling.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct DisputeConsolidation {
+    pub id: u64,
+    pub arbiter: Address,
+    pub buyer: Address,
+    pub supplier: Address,
+    pub members: Vec<DisputeEntry>,
+    pub buyer_approved: bool,
+    pub supplier_approved: bool,
+    pub resolved: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct ShipmentRisk {
@@ -11660,6 +11689,9 @@ impl ChainSettleContract {
             let next_idx = (chosen_idx + 1) % pool.len() as u32;
             let old_arbiter = shipment.arbiter.clone();
             shipment.arbiter = pool.get(chosen_idx).unwrap();
+            // #742: Snapshot the assigned arbiter's declared rate onto the shipment
+            // so later rate changes do not apply to this in-flight dispute.
+            Self::snapshot_arbiter_fee_rate(&env, &mut shipment);
             Self::reindex_arbiter(&env, &shipment_id, &old_arbiter, &shipment.arbiter);
             env.storage().instance().set(&pool_idx_key, &next_idx);
             Self::record_supplier_arbiters(
@@ -12080,6 +12112,15 @@ impl ChainSettleContract {
         contested_amount: i128,
         default_bps: u32,
     ) -> u32 {
+        // #740: While a consolidated ruling is applied, every member uses the
+        // single rate computed on the combined contested amount.
+        if let Some(bps) = env
+            .storage()
+            .temporary()
+            .get::<DataKeyExt5, u32>(&DataKeyExt5::ConsolidationFeeBps)
+        {
+            return bps;
+        }
         let tiers: Vec<(i128, u32)> = env
             .storage()
             .persistent()
@@ -12124,7 +12165,19 @@ impl ChainSettleContract {
         if shipment.status != ShipmentStatus::Active {
             panic!("shipment is not active");
         }
-        Self::require_arbiter_auth(&shipment, &arbiter);
+        // #740: A consolidated ruling already authorized the arbiter once for
+        // this frame (Soroban rejects a second require_auth); check identity only.
+        if env
+            .storage()
+            .temporary()
+            .has(&DataKeyExt5::ConsolidationFeeBps)
+        {
+            if arbiter != shipment.arbiter {
+                panic!("unauthorized");
+            }
+        } else {
+            Self::require_arbiter_auth(&shipment, &arbiter);
+        }
 
         let mut milestone = shipment.milestones.get(milestone_index).unwrap();
         if milestone.status != MilestoneStatus::Disputed {
@@ -12132,6 +12185,9 @@ impl ChainSettleContract {
         }
         // #665: An escalated dispute is decided by its panel via cast_dispute_vote.
         Self::assert_not_panel_escalated(&env, &shipment_id, milestone_index);
+        // #740: A member of an approved consolidation is decided only by its
+        // consolidated ruling; an unapproved proposal is dropped instead.
+        Self::check_consolidation_membership(&env, &shipment_id, milestone_index);
         // #664: Any earlier split outcome is superseded by this resolution.
         env.storage()
             .persistent()
@@ -19254,11 +19310,19 @@ impl ChainSettleContract {
             })
     }
 
-    pub fn get_arbiter_stats(env: Env, arbiter: Address) -> ArbiterStats {
-        env.storage()
+    pub fn get_arbiter_stats(env: Env, arbiter: Address) -> ArbiterStatsView {
+        let stats: ArbiterStats = env
+            .storage()
             .persistent()
-            .get(&DataKeyExt::ArbiterStats(arbiter))
-            .unwrap_or_default()
+            .get(&DataKeyExt::ArbiterStats(arbiter.clone()))
+            .unwrap_or_default();
+        ArbiterStatsView {
+            resolved_approved: stats.resolved_approved,
+            resolved_rejected: stats.resolved_rejected,
+            total_resolution_ledgers: stats.total_resolution_ledgers,
+            overturned_count: stats.overturned_count,
+            fee_rate_bps: Self::get_arbiter_fee_rate(env, arbiter),
+        }
     }
 
     pub fn get_shipment_risk(env: Env, shipment_id: String) -> ShipmentRisk {
@@ -20200,6 +20264,8 @@ impl ChainSettleContract {
         if net_amount <= 0 {
             return;
         }
+        // #752: Carry the supplier's payout reference alongside every release.
+        Self::emit_payout_reference(env, shipment_id, milestone_index, net_amount);
         // Invoice factoring: an assigned receivable pays the financier directly,
         // overriding payee splits and supplier batching.
         if let Some(financier) = Self::payout_assignee(env, shipment_id) {
@@ -22146,6 +22212,377 @@ impl ChainSettleContract {
             milestones,
             options,
         )
+    }
+}
+
+// ============================================================
+// #740 CONSOLIDATED DISPUTES · #742 ARBITER FEE RATES · #752 PAYOUT REFERENCE
+// ============================================================
+
+/// Maximum member disputes in one consolidated proceeding.
+const MAX_CONSOLIDATION_MEMBERS: u32 = 20;
+/// Maximum payout reference length in bytes.
+const MAX_PAYOUT_REFERENCE_LEN: u32 = 64;
+
+#[contractimpl]
+impl ChainSettleContract {
+    // ── #740 Consolidated disputes ─────────────────────────────────────────
+
+    /// Arbiter proposes merging open disputes into one proceeding. Every member
+    /// must be a currently disputed milestone on a shipment this arbiter is
+    /// assigned to, with the same primary buyer, supplier and token. Takes
+    /// effect once both the buyer and the supplier approve.
+    pub fn propose_dispute_consolidation(
+        env: Env,
+        arbiter: Address,
+        dispute_refs: Vec<DisputeEntry>,
+    ) -> u64 {
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "dispute"));
+        arbiter.require_auth();
+        if dispute_refs.len() < 2 {
+            panic!("consolidation needs at least two disputes");
+        }
+        if dispute_refs.len() > MAX_CONSOLIDATION_MEMBERS {
+            panic!("too many disputes to consolidate");
+        }
+
+        let first_ref = dispute_refs.get(0).unwrap();
+        let first = Self::get_shipment_internal(&env, &first_ref.shipment_id);
+        let buyer = first.buyers.get(0).unwrap();
+        let supplier = first.supplier.clone();
+        let token = first.token.clone();
+
+        for i in 0..dispute_refs.len() {
+            let entry = dispute_refs.get(i).unwrap();
+            for j in 0..i {
+                if dispute_refs.get(j).unwrap() == entry {
+                    panic!("duplicate dispute in consolidation");
+                }
+            }
+            let shipment = Self::get_shipment_internal(&env, &entry.shipment_id);
+            if shipment.status != ShipmentStatus::Active {
+                panic!("shipment is not active");
+            }
+            if shipment.arbiter != arbiter {
+                panic!("unauthorized");
+            }
+            if shipment.buyers.get(0).unwrap() != buyer || shipment.supplier != supplier {
+                panic!("disputes must be between the same buyer and supplier");
+            }
+            if shipment.token != token {
+                panic!("disputes must use the same token");
+            }
+            let milestone = shipment
+                .milestones
+                .get(entry.milestone_index)
+                .unwrap_or_else(|| panic!("milestone not found"));
+            if milestone.status != MilestoneStatus::Disputed {
+                panic!("milestone is not in disputed status");
+            }
+            Self::assert_not_panel_escalated(&env, &entry.shipment_id, entry.milestone_index);
+            let member_key =
+                DataKeyExt5::ConsolidatedDispute(entry.shipment_id.clone(), entry.milestone_index);
+            if let Some(existing) = env.storage().persistent().get::<_, u64>(&member_key) {
+                if let Some(c) = Self::load_consolidation(&env, existing) {
+                    if !c.resolved {
+                        panic!("dispute already in a consolidation");
+                    }
+                }
+            }
+        }
+
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt5::NextConsolidationId)
+            .unwrap_or(1);
+        env.storage()
+            .persistent()
+            .set(&DataKeyExt5::NextConsolidationId, &(id + 1));
+
+        let consolidation = DisputeConsolidation {
+            id,
+            arbiter: arbiter.clone(),
+            buyer,
+            supplier,
+            members: dispute_refs.clone(),
+            buyer_approved: false,
+            supplier_approved: false,
+            resolved: false,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKeyExt5::DisputeConsolidation(id), &consolidation);
+        for i in 0..dispute_refs.len() {
+            let entry = dispute_refs.get(i).unwrap();
+            env.storage().persistent().set(
+                &DataKeyExt5::ConsolidatedDispute(entry.shipment_id, entry.milestone_index),
+                &id,
+            );
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "dispute_consolidation_proposed"), id),
+            (arbiter, dispute_refs.len()),
+        );
+        id
+    }
+
+    /// Buyer or supplier consents to a pending consolidation.
+    pub fn approve_dispute_consolidation(env: Env, caller: Address, consolidation_id: u64) {
+        caller.require_auth();
+        let mut c = Self::load_consolidation(&env, consolidation_id)
+            .unwrap_or_else(|| panic!("consolidation not found"));
+        if c.resolved {
+            panic!("consolidation already resolved");
+        }
+        if caller == c.buyer {
+            c.buyer_approved = true;
+        } else if caller == c.supplier {
+            c.supplier_approved = true;
+        } else {
+            panic!("unauthorized");
+        }
+        // Members must still be open and still belong to this proceeding.
+        Self::assert_consolidation_members_open(&env, &c);
+        env.storage()
+            .persistent()
+            .set(&DataKeyExt5::DisputeConsolidation(consolidation_id), &c);
+        env.events().publish(
+            (Symbol::new(&env, "dispute_consolidation_approved"), consolidation_id),
+            (caller, c.buyer_approved && c.supplier_approved),
+        );
+    }
+
+    /// One ruling for every member dispute of an approved consolidation. The
+    /// arbiter fee rate is chosen once from the combined contested amount
+    /// (fee tiers apply to the total, not per member) and charged at that rate.
+    pub fn resolve_consolidated_dispute(
+        env: Env,
+        arbiter: Address,
+        consolidation_id: u64,
+        approve: bool,
+    ) {
+        arbiter.require_auth();
+        let mut c = Self::load_consolidation(&env, consolidation_id)
+            .unwrap_or_else(|| panic!("consolidation not found"));
+        if c.arbiter != arbiter {
+            panic!("unauthorized");
+        }
+        if c.resolved {
+            panic!("consolidation already resolved");
+        }
+        if !(c.buyer_approved && c.supplier_approved) {
+            panic!("consolidation not approved by both parties");
+        }
+        Self::assert_consolidation_members_open(&env, &c);
+
+        let contested = Self::consolidated_contested_amount(&env, &c);
+        let first = Self::get_shipment_internal(&env, &c.members.get(0).unwrap().shipment_id);
+        let fee_bps = Self::applicable_arbiter_fee_bps(&env, contested, first.arbiter_fee_bps);
+
+        // Mark resolved first so member resolutions pass the membership check.
+        c.resolved = true;
+        env.storage()
+            .persistent()
+            .set(&DataKeyExt5::DisputeConsolidation(consolidation_id), &c);
+        env.storage()
+            .temporary()
+            .set(&DataKeyExt5::ConsolidationFeeBps, &fee_bps);
+        for i in 0..c.members.len() {
+            let entry = c.members.get(i).unwrap();
+            Self::resolve_dispute(
+                env.clone(),
+                arbiter.clone(),
+                entry.shipment_id,
+                entry.milestone_index,
+                approve,
+                None,
+            );
+        }
+        env.storage()
+            .temporary()
+            .remove(&DataKeyExt5::ConsolidationFeeBps);
+
+        env.events().publish(
+            (Symbol::new(&env, "dispute_consolidation_resolved"), consolidation_id),
+            (approve, c.members.len(), contested, fee_bps),
+        );
+    }
+
+    /// Read a consolidation proceeding.
+    pub fn get_dispute_consolidation(env: Env, consolidation_id: u64) -> Option<DisputeConsolidation> {
+        Self::load_consolidation(&env, consolidation_id)
+    }
+
+    // ── #742 Arbiter-declared fee rate ─────────────────────────────────────
+
+    /// Admin sets the ceiling for arbiter-declared fee rates (0 = none allowed).
+    pub fn set_max_arbiter_fee_bps(env: Env, admin: Address, max_bps: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        if max_bps > 10_000 {
+            panic!("max arbiter fee bps cannot exceed 10000");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKeyExt5::MaxArbiterFeeBps, &max_bps);
+        env.events()
+            .publish((Symbol::new(&env, "max_arbiter_fee_bps_set"),), max_bps);
+    }
+
+    pub fn get_max_arbiter_fee_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt5::MaxArbiterFeeBps)
+            .unwrap_or(0)
+    }
+
+    /// A pool arbiter publishes their fee rate. Applied (snapshotted) when they
+    /// are assigned to a pool shipment's dispute; 0 clears the declaration.
+    pub fn set_arbiter_fee_rate(env: Env, arbiter: Address, bps: u32) {
+        arbiter.require_auth();
+        let pool: Vec<Address> = env
+            .storage()
+            .instance()
+            .get::<Symbol, Vec<Address>>(&Symbol::new(&env, "arbiters_pool"))
+            .unwrap_or_else(|| Vec::new(&env));
+        if !pool.contains(&arbiter) {
+            panic!("arbiter is not in the pool");
+        }
+        let key = DataKeyExt5::ArbiterFeeRate(arbiter.clone());
+        if bps == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            if bps > Self::get_max_arbiter_fee_bps(env.clone()) {
+                panic!("arbiter fee rate exceeds cap");
+            }
+            env.storage().persistent().set(&key, &bps);
+        }
+        env.events()
+            .publish((Symbol::new(&env, "arbiter_fee_rate_set"), arbiter), bps);
+    }
+
+    pub fn get_arbiter_fee_rate(env: Env, arbiter: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::ArbiterFeeRate(arbiter))
+            .unwrap_or(0)
+    }
+
+    // ── #752 Payout reference memo ─────────────────────────────────────────
+
+    /// Supplier sets the reference carried on this shipment's payment-release
+    /// events (empty string clears it).
+    pub fn set_payout_reference(env: Env, supplier: Address, shipment_id: String, reference: String) {
+        supplier.require_auth();
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if supplier != shipment.supplier {
+            panic!("unauthorized");
+        }
+        if reference.len() > MAX_PAYOUT_REFERENCE_LEN {
+            panic!("payout reference too long");
+        }
+        let key = DataKeyExt5::PayoutReference(shipment_id.clone());
+        if reference.is_empty() {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &reference);
+        }
+        env.events().publish(
+            (Symbol::new(&env, "payout_reference_set"), shipment_id),
+            reference,
+        );
+    }
+
+    pub fn get_payout_reference(env: Env, shipment_id: String) -> Option<String> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::PayoutReference(shipment_id))
+    }
+}
+
+impl ChainSettleContract {
+    fn load_consolidation(env: &Env, id: u64) -> Option<DisputeConsolidation> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::DisputeConsolidation(id))
+    }
+
+    fn assert_consolidation_members_open(env: &Env, c: &DisputeConsolidation) {
+        for i in 0..c.members.len() {
+            let entry = c.members.get(i).unwrap();
+            let mapped: Option<u64> = env.storage().persistent().get(
+                &DataKeyExt5::ConsolidatedDispute(entry.shipment_id.clone(), entry.milestone_index),
+            );
+            if mapped != Some(c.id) {
+                panic!("consolidated dispute is no longer open");
+            }
+            let shipment = Self::get_shipment_internal(env, &entry.shipment_id);
+            let milestone = shipment.milestones.get(entry.milestone_index).unwrap();
+            if milestone.status != MilestoneStatus::Disputed {
+                panic!("consolidated dispute is no longer open");
+            }
+        }
+    }
+
+    fn consolidated_contested_amount(env: &Env, c: &DisputeConsolidation) -> i128 {
+        let mut total: i128 = 0;
+        for i in 0..c.members.len() {
+            let entry = c.members.get(i).unwrap();
+            let shipment = Self::get_shipment_internal(env, &entry.shipment_id);
+            let full = Self::milestone_gross_payment(env, &shipment, entry.milestone_index);
+            let pct: Option<u32> = env.storage().persistent().get(
+                &DataKey::DisputeContestedPercent(entry.shipment_id.clone(), entry.milestone_index),
+            );
+            total += match pct {
+                Some(p) => (full * p as i128) / 100,
+                None => full,
+            };
+        }
+        total
+    }
+
+    /// Called by `resolve_dispute`: blocks individual resolution of a member of
+    /// an approved, unresolved consolidation, and otherwise releases the
+    /// member's consolidation mapping.
+    fn check_consolidation_membership(env: &Env, shipment_id: &String, milestone_index: u32) {
+        let key = DataKeyExt5::ConsolidatedDispute(shipment_id.clone(), milestone_index);
+        let Some(id) = env.storage().persistent().get::<_, u64>(&key) else {
+            return;
+        };
+        if let Some(c) = Self::load_consolidation(env, id) {
+            if !c.resolved && c.buyer_approved && c.supplier_approved {
+                panic!("dispute is consolidated; use resolve_consolidated_dispute");
+            }
+        }
+        env.storage().persistent().remove(&key);
+    }
+
+    /// #742: Apply the assigned arbiter's declared rate (clamped to the current cap).
+    fn snapshot_arbiter_fee_rate(env: &Env, shipment: &mut Shipment) {
+        let rate: Option<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt5::ArbiterFeeRate(shipment.arbiter.clone()));
+        if let Some(rate) = rate {
+            let cap = Self::get_max_arbiter_fee_bps(env.clone());
+            shipment.arbiter_fee_bps = rate.min(cap);
+        }
+    }
+
+    /// #752: Emit the payout reference for a milestone release, when one is set.
+    fn emit_payout_reference(env: &Env, shipment_id: &String, milestone_index: u32, amount: i128) {
+        let reference: Option<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt5::PayoutReference(shipment_id.clone()));
+        if let Some(reference) = reference {
+            env.events().publish(
+                (Symbol::new(env, "payout_reference"), shipment_id.clone()),
+                (milestone_index, amount, reference),
+            );
+        }
     }
 }
 
