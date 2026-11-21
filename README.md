@@ -60,7 +60,7 @@ The core flow above is extended by optional, admin- or party-configured features
 - **Payments:** advances, payee splits, retainage, warranties, quality grades, partial quantities, payout batching and currency preference. See the [payment release reference](docs/payments.md).
 - **Risk controls:** supplier collateral and slashing, exposure and TVL caps, buyer spending limits, depeg guard, blacklist with appeals. See the [supplier collateral guide](docs/collateral.md).
 - **Fees:** fee tiers, VIP waivers, fee holidays, clean-completion rebates
-- **Admin:** granular roles, multisig, timelock, global and per-operation pause, upgrades with `migrate`
+- **Admin:** granular roles, multisig, timelock, global and per-operation pause, upgrades with `migrate`. See the [admin and governance guide](docs/admin.md).
 - **Queries:** shipment summaries, cost estimates, completion percentage, reputation counters, paginated lists
 - **Events:** every state change publishes an event. See [`docs/events.md`](docs/events.md) for each topic, its payload shape and the functions that emit it
 
