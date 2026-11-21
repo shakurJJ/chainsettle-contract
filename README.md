@@ -58,7 +58,7 @@ The core flow above is extended by optional, admin- or party-configured features
 
 - **Disputes:** partial disputes, evidence, mediation, arbiter pools and panels, appeals, arbiter slashing, finality delay
 - **Payments:** advances, payee splits, retainage, warranties, quality grades, partial quantities, payout batching and currency preference. See the [payment release reference](docs/payments.md).
-- **Risk controls:** supplier collateral and slashing, exposure and TVL caps, buyer spending limits, depeg guard, blacklist with appeals
+- **Risk controls:** supplier collateral and slashing, exposure and TVL caps, buyer spending limits, depeg guard, blacklist with appeals. See the [supplier collateral guide](docs/collateral.md).
 - **Fees:** fee tiers, VIP waivers, fee holidays, clean-completion rebates
 - **Admin:** granular roles, multisig, timelock, global and per-operation pause, upgrades with `migrate`
 - **Queries:** shipment summaries, cost estimates, completion percentage, reputation counters, paginated lists
