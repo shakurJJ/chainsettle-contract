@@ -118,6 +118,7 @@ and `cast_dispute_vote` (when a panel reaches a decision).
 | `milestone_index` | `u32` | Index of the resolved milestone. |
 | `resolution` | `Symbol` | `"supplier"` if the disputed funds were released to the supplier, `"buyer"` if refunded/withheld from the supplier, `"split"` if `resolve_dispute_split` divided them by percentage (see [dispute-split-resolution.md](dispute-split-resolution.md)). |
 | `resolver` | `Address` | The arbiter who resolved the dispute (for a timeout resolution, the shipment's designated arbiter). |
+| `to_vault` | `bool` | Additive (#746). `true` when buyer-side refunds for this shipment are credited to a vault balance instead of transferred (see `is_refund_to_vault`). |
 
 ### `shipment_cancelled`
 
@@ -132,6 +133,7 @@ recovery path (`emergency_recover`, `propose_emergency_recover`,
 | `shipment_id` | `String` | The shipment identifier. |
 | `refund_amount` | `i128` | Amount refunded: the unconfirmed escrow balance, net of any cancellation fee. Funds already released for confirmed milestones are never included. For `AdminEmergencyRecovery` it is the amount recovered to the admin. |
 | `reason` | `Symbol` | `"BuyerCancelled"`, `"SupplierCancelled"`, `"DeadlineRefund"`, `"AdminEmergencyRecovery"` or `"BlacklistedSupplier"`. Additive third field. The typed `CancellationReason` is also stored on `Shipment.cancellation_reason`. |
+| `to_vault` | `bool` | Additive (#746). `true` when the refund was credited to the refund recipient's vault instead of transferred. Always `false` for `AdminEmergencyRecovery` and for unclaimed refunds swept to the treasury. |
 
 ### `shipment_completed`
 
@@ -197,6 +199,7 @@ helper, "Emitted by" names the helper and the public functions that reach it.
 | `approved_buyer_added` | (`approved_buyer_added`, `supplier`) | `buyer` | `add_approved_buyer` |
 | `approved_buyer_removed` | (`approved_buyer_removed`, `supplier`) | `buyer` | `remove_approved_buyer` |
 | `arbiter_availability_set` | (`arbiter_availability_set`, `arbiter`) | `available` | `set_arbiter_availability` |
+| `arbiter_expedited_set` | (`arbiter_expedited_set`, `arbiter`) | `expedited` | `set_arbiter_expedited` |
 | `arbiter_failover` | (`arbiter_failover`, `shipment_id`) | `(old_arbiter, backup)` | `activate_backup_arbiter` |
 | `arbiter_fee_allocated` | (`arbiter_fee_allocated`, `shipment_id`) | `(milestone_index, arbiter_fee, cover, arbiter_fee - cover)` | `loser_pays_cover` (internal; via `cast_dispute_vote`, `finalize_dispute_resolution`, `resolve_dispute`) |
 | `arbiter_inactivity_threshold_set` | (`arbiter_inactivity_threshold_set`) | `threshold_ledgers` | `set_arbiter_inactivity_threshold` |
@@ -222,6 +225,7 @@ helper, "Emitted by" names the helper and the public functions that reach it.
 | `buyer_allowed_tokens_set` | (`buyer_allowed_tokens_set`, `buyer`) | `tokens` | `set_buyer_allowed_tokens` |
 | `buyer_dispute_cap_cleared` | (`buyer_dispute_cap_cleared`, `buyer`) | `()` | `clear_buyer_dispute_cap` |
 | `buyer_dispute_cap_set` | (`buyer_dispute_cap_set`, `buyer`) | `limit` | `set_buyer_dispute_cap` |
+| `buyer_profile_set` | (`buyer_profile_set`, `buyer`) | `profile.refund_to_vault` | `set_buyer_profile` |
 | `buyer_spending_limit_set` | (`buyer_spending_limit_set`, `buyer`) | `(limit, window_ledgers)` | `set_buyer_spending_limit` |
 | `buyer_transferred` | (`buyer_transferred`, `shipment_id`) | `(current_buyer, new_buyer)` | `transfer_buyer` |
 | `circuit_breaker_set` | (`circuit_breaker_set`) | `(limit, window_ledgers)` | `set_circuit_breaker` |
@@ -273,6 +277,8 @@ helper, "Emitted by" names the helper and the public functions that reach it.
 | `emergency_unfreeze_proposed` | (`emergency_unfreeze_proposed`, `proposal_id`) | `(admin, 1u32)` | `propose_emergency_unfreeze` |
 | `escalation_threshold_set` | (`escalation_threshold_set`) | `threshold_ledgers` | `set_escalation_threshold` |
 | `escrow_topped_up` | (`escrow_topped_up`, `shipment_id`) | `(additional_amount, new_total)` | `top_up_escrow` |
+| `expedited_config_cleared` | (`expedited_config_cleared`) | `()` | `clear_expedited_config` |
+| `expedited_config_set` | (`expedited_config_set`) | `(review_window_ledgers, evidence_window_ledgers, resolution_timeout_seconds, fallback_resolution)` | `set_expedited_config` |
 | `expiry_extended` | (`expiry_extended`, `shipment_id`) | `(old_expiry, proposal.new_expiry_ledger, counterparty)` | `approve_expiry_extension` |
 | `expiry_extension_proposed` | (`expiry_extension_proposed`, `shipment_id`) | `(caller, current, new_expiry_ledger)` | `propose_expiry_extension` |
 | `extension_approved` | (`extension_approved`, `shipment_id`) | `(milestone_index, new_deadline, buyer)` | `approve_extension` |
@@ -281,6 +287,9 @@ helper, "Emitted by" names the helper and the public functions that reach it.
 | `fee_holiday_scheduled` | (`fee_holiday_scheduled`) | `(start_ledger, end_ledger)` | `schedule_fee_holiday` |
 | `fee_recipients_set` | (`fee_recipients_set`) | `(recipients_len, ledger_seq)` | `set_fee_recipients` |
 | `fee_tiers_set` | (`fee_tiers_set`) | `tiers_len` | `set_fee_tiers` |
+| `fee_token_charged` | (`fee_token_charged`, `shipment_id`) | `(payer, fee_token, fee_token_amount, escrow_fee)` | `collect_fee_in_fee_token` (internal; via every fee-charging release path) |
+| `fee_token_cleared` | (`fee_token_cleared`) | `()` | `clear_fee_token` |
+| `fee_token_set` | (`fee_token_set`, `token`) | `rate_source` | `set_fee_token` |
 | `fee_waiver_approved` | (`fee_waiver_approved`, `proposal_id`) | `(admin, approvals_count)` | `approve_fee_waiver` |
 | `fee_waiver_granted` | (`fee_waiver_granted`, `proposal_id`) | `(proposal.partner, proposal.waiver_bps, proposal.expires_at)` | `execute_fee_waiver_proposal` (internal; via `approve_fee_waiver`, `propose_fee_waiver`) |
 | `fee_waiver_proposed` | (`fee_waiver_proposed`, `proposal_id`) | `(admin, partner, waiver_bps, 1u32)` | `propose_fee_waiver` |
@@ -380,6 +389,7 @@ helper, "Emitted by" names the helper and the public functions that reach it.
 | `shipment_fee_override_cleared` | (`shipment_fee_override_cleared`) | `shipment_id` | `clear_shipment_fee_override` |
 | `shipment_fee_override_set` | (`shipment_fee_override_set`, `shipment_id`) | `fee_bps` | `set_shipment_fee_override` |
 | `shipment_metadata_set` | (`shipment_metadata_set`, `shipment_id`) | `(caller, key, value)` | `set_shipment_metadata` |
+| `shipment_options_ext_set` | (`shipment_options_ext_set`, `shipment_id`) | `(perishable, po_reference, refund_to_vault, fee_bearer)` | `apply_shipment_options_ext` (internal; via `create_shipment_ext`) |
 | `shipment_oracle_purpose_set` | (`shipment_oracle_purpose_set`, `shipment_id`) | `purpose` | `set_shipment_oracle_purpose` |
 | `shipment_pause_requested` | (`shipment_pause_requested`, `shipment_id`) | `caller` | `request_shipment_pause` |
 | `shipment_paused` | (`shipment_paused`, `shipment_id`) | `(caller, now)` | `approve_shipment_pause` |
