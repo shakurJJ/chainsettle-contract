@@ -165,6 +165,7 @@ these first.
 | `emergency_freeze_activated`, `emergency_freeze_lifted` | **Shape differs by emitter** | Single-admin path (`propose_emergency_freeze` / `propose_emergency_unfreeze` with threshold 1) sends `(admin, ledger_seq)`. Multisig execution sends `proposal_id` (`u64`). |
 | `dispute_raised` | Additional emitter | Also published when an oracle breach opens a dispute (`report_condition_breach`). |
 | `arbiter_pool_updated` | Note | First data element is the symbol `"added"` or `"removed"`. |
+| `payout_reference` | **New** (additive, #752) | Emitted next to each payment release when the supplier has set a payout reference with `set_payout_reference` (max 64 bytes). Existing release payloads are unchanged; join on `shipment_id` + `milestone_index`. `claim_payout` (batched mode) aggregates across shipments, so the reference is emitted when the milestone is credited, not at claim time. |
 | `shipment_fee_override_cleared` | **Inconsistent** with `_set` | `shipment_id` is in data, not topics. |
 | `token_min_shipment_value_cleared`, `token_max_shipment_value_cleared` | **Inconsistent** with `_set` | `token` is in data, not topics. |
 | `contract_upgraded` / `upgrade_executed` | Two paths | `upgrade` emits `contract_upgraded`. Multisig upgrades emit `upgrade_executed`. |
@@ -199,6 +200,7 @@ helper, "Emitted by" names the helper and the public functions that reach it.
 | `arbiter_availability_set` | (`arbiter_availability_set`, `arbiter`) | `available` | `set_arbiter_availability` |
 | `arbiter_failover` | (`arbiter_failover`, `shipment_id`) | `(old_arbiter, backup)` | `activate_backup_arbiter` |
 | `arbiter_fee_allocated` | (`arbiter_fee_allocated`, `shipment_id`) | `(milestone_index, arbiter_fee, cover, arbiter_fee - cover)` | `loser_pays_cover` (internal; via `cast_dispute_vote`, `finalize_dispute_resolution`, `resolve_dispute`) |
+| `arbiter_fee_rate_set` | (`arbiter_fee_rate_set`, `arbiter`) | `bps` (0 = declaration cleared) | `set_arbiter_fee_rate` |
 | `arbiter_inactivity_threshold_set` | (`arbiter_inactivity_threshold_set`) | `threshold_ledgers` | `set_arbiter_inactivity_threshold` |
 | `arbiter_pool_updated` | (`arbiter_pool_updated`) | `("added", arbiter)` | `add_arbiter_to_pool` |
 | `arbiter_pool_updated` | (`arbiter_pool_updated`) | `("removed", arbiter)` | `remove_arbiter_from_pool` |
@@ -248,6 +250,9 @@ helper, "Emitted by" names the helper and the public functions that reach it.
 | `depeg_guard_removed` | (`depeg_guard_removed`, `token`) | `()` | `remove_depeg_guard` |
 | `depeg_guard_set` | (`depeg_guard_set`, `token`) | `(min_price, max_price)` | `set_depeg_guard` |
 | `dispute_appealed` | (`dispute_appealed`, `shipment_id`) | `(milestone_index, caller, new_arbiter)` | `appeal_dispute` |
+| `dispute_consolidation_approved` | (`dispute_consolidation_approved`, `consolidation_id`) | `(caller, fully_approved)` | `approve_dispute_consolidation` |
+| `dispute_consolidation_proposed` | (`dispute_consolidation_proposed`, `consolidation_id`) | `(arbiter, members_len)` | `propose_dispute_consolidation` |
+| `dispute_consolidation_resolved` | (`dispute_consolidation_resolved`, `consolidation_id`) | `(approve, members_len, combined_contested, fee_bps)` | `resolve_consolidated_dispute` (each member also emits its usual `dispute_resolved`) |
 | `dispute_auto_resolved` | (`dispute_auto_resolved`, `shipment_id`) | `(milestone_index, resolution_sym)` | `resolve_dispute_timeout` |
 | `dispute_escalated` | (`dispute_escalated`, `shipment_id`) | `(milestone_index, opened_ledger, current_ledger)` | `check_escalation` |
 | `dispute_evidence_submitted` | (`dispute_evidence_submitted`, `shipment_id`) | `(milestone_index, caller, evidence_hash, evidence_type)` | `submit_dispute_evidence` |
@@ -301,6 +306,7 @@ helper, "Emitted by" names the helper and the public functions that reach it.
 | `long_hold_rebate_set` | (`long_hold_rebate_set`) | `(threshold_ledgers, rebate_bps)` | `set_long_hold_rebate` |
 | `loser_pays_arbiter_fee_set` | (`loser_pays_arbiter_fee_set`, `shipment_id`) | `enabled` | `set_loser_pays_arbiter_fee` |
 | `max_allowed_tokens_set` | (`max_allowed_tokens_set`) | `max_allowed` | `set_max_allowed_tokens` |
+| `max_arbiter_fee_bps_set` | (`max_arbiter_fee_bps_set`) | `max_bps` | `set_max_arbiter_fee_bps` |
 | `max_dispute_bond_bps_set` | (`max_dispute_bond_bps_set`) | `max_bps` | `set_max_dispute_bond_bps` |
 | `max_evidence_updated` | (`max_evidence_updated`) | `(admin, max_count, ledger_seq)` | `set_max_evidence_per_milestone` |
 | `max_expiry_ext_set` | (`max_expiry_ext_set`) | `ledgers` | `set_max_expiry_extension_ledgers` |
@@ -352,6 +358,8 @@ helper, "Emitted by" names the helper and the public functions that reach it.
 | `payout_claimed` | (`payout_claimed`, `supplier`) | `(payout_amount, payout_token, rate_bps)` | `claim_payout` |
 | `payout_currency_preference_set` | (`payout_currency_preference_set`, `supplier`) | `preferred_token` | `set_payout_currency_preference` |
 | `payout_mode_set` | (`payout_mode_set`, `supplier`) | `batched` | `set_payout_mode` |
+| `payout_reference` | (`payout_reference`, `shipment_id`) | `(milestone_index, net_amount, reference)` | `pay_milestone_to_payees` (internal; every milestone payment release, including `claim_auto_confirmation`), only when a payout reference is set |
+| `payout_reference_set` | (`payout_reference_set`, `shipment_id`) | `reference` (empty = cleared) | `set_payout_reference` |
 | `proof_attested` | (`proof_attested`, `shipment_id`) | `(milestone_index, proof_hash, caller, current_ledger)` | `attest_proof` |
 | `proof_corrected` | (`proof_corrected`, `shipment_id`) | `(milestone_index, proof_hash_for_event)` | `correct_proof` |
 | `proof_hash_length_bounds_set` | (`proof_hash_length_bounds_set`) | `(min_len, max_len)` | `set_proof_hash_length_bounds` |
