@@ -1782,6 +1782,99 @@ pub enum DataKeyExt5 {
     // ── Milestone not-before ledger ───────────────────────────────────────
     /// Pending mutual-consent proposal to set a milestone's not-before ledger.
     MilestoneNotBeforeProposal(String, u32),
+
+    // ── Extended shipment options (ShipmentOptions is at the 40-field limit) ──
+    /// `ShipmentOptionsExt` a shipment was created with (absent = all disabled).
+    ShipmentOptionsExt(String),
+
+    // ── #734 Demurrage ────────────────────────────────────────────────────
+    /// Demurrage deposit, arrival and accrual state for a shipment.
+    DemurrageState(String),
+
+    // ── #738 Upfront deposit on supplier term acceptance ──────────────────
+    /// Set once the supplier accepts the shipment terms:
+    /// (accepted_at_ledger, upfront_deposit_released).
+    TermsAccepted(String),
+
+    // ── #751 Bilateral relationship summary ───────────────────────────────
+    /// Pair-level trading counters keyed by (primary buyer, supplier).
+    RelationshipSummary(Address, Address),
+}
+
+/// Shipment options added after `ShipmentOptions` reached the 40-field XDR
+/// struct limit. Passed to `create_shipment_ext`; every field defaults to
+/// disabled, and shipments created through `create_shipment` (or any other
+/// entry point) behave exactly as if created with `ShipmentOptionsExt::default()`.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct ShipmentOptionsExt {
+    /// #734: Ledgers the goods may sit at destination (after
+    /// `mark_arrived_at_destination`) before demurrage starts accruing.
+    pub demurrage_free_ledgers: u32,
+    /// #734: Demurrage charged per ledger beyond the free period, owed by the
+    /// buyer to the logistics provider (0 = demurrage disabled).
+    pub demurrage_rate_per_ledger: i128,
+    /// #734: Buyer-funded deposit, transferred at creation, from which the
+    /// demurrage charge is drawn. The charge can never exceed it; any unused
+    /// remainder is refunded to the primary buyer at settlement. Must be > 0
+    /// when the rate is > 0, and 0 when demurrage is disabled.
+    pub demurrage_deposit: i128,
+    /// #738: Non-refundable share of `total_amount` (basis points) released to
+    /// the supplier when they call `accept_shipment_terms` (0 = disabled).
+    /// Capped by `max_advance_percent` (expressed in bps). The deposit is
+    /// deducted pro rata from each milestone payout.
+    pub upfront_deposit_bps: u32,
+}
+
+/// #734 – Demurrage deposit and accrual state for a shipment.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct DemurrageState {
+    pub free_ledgers: u32,
+    pub rate_per_ledger: i128,
+    /// Buyer-funded deposit held by the contract; caps the total charge.
+    pub deposit: i128,
+    /// Ledger the logistics provider marked arrival at destination (None = in transit).
+    pub arrived_ledger: Option<u32>,
+    /// Ledger accrual stopped: the final milestone confirmation (even if its
+    /// payout is still held) or the shipment closing, whichever comes first.
+    /// None = still accruing.
+    pub stopped_ledger: Option<u32>,
+    /// Charge paid to the logistics provider at settlement.
+    pub charged: i128,
+    /// True once the deposit was settled (charge paid, remainder refunded).
+    pub settled: bool,
+}
+
+/// #751 – Pair-level trading history between a primary buyer and a supplier.
+///
+/// Counters are updated in O(1) when a shipment closes (completes, is
+/// cancelled or expires), when a dispute is resolved, and when a milestone is
+/// confirmed by the buyer. Derived fields are recomputed on every update.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct RelationshipSummary {
+    /// Closed shipments between the pair (completed + cancelled + expired).
+    pub shipment_count: u32,
+    pub completed_count: u32,
+    /// Cancelled or expired shipments.
+    pub cancelled_count: u32,
+    /// Closed shipments that had at least one dispute raised.
+    pub disputed_shipment_count: u32,
+    /// Disputes resolved with a buyer or supplier outcome.
+    pub disputes_resolved: u32,
+    pub buyer_dispute_wins: u32,
+    pub supplier_dispute_wins: u32,
+    /// `disputed_shipment_count / shipment_count` in basis points.
+    pub dispute_rate_bps: u32,
+    /// Buyer milestone confirmations with a recorded proof ledger.
+    pub confirmation_count: u32,
+    /// Sum of (confirmation ledger - proof submission ledger) over confirmations.
+    pub total_confirmation_ledgers: u64,
+    /// `total_confirmation_ledgers / confirmation_count` (0 when none).
+    pub avg_confirmation_ledgers: u64,
+    /// Settled escrow value (released + advanced) of closed shipments, per token.
+    pub volume_by_token: Map<Address, i128>,
 }
 
 /// #621 – Pending proposal to append a milestone to an active shipment.
@@ -9423,35 +9516,7 @@ impl ChainSettleContract {
         request.amount_advanced = advance_amount;
         env.storage().persistent().set(&advance_key, &request);
 
-        // #284: Batched vs immediate payout
-        let payout_mode: PayoutMode = env
-            .storage()
-            .persistent()
-            .get(&DataKeyExt::PayoutMode(shipment.supplier.clone()))
-            .unwrap_or(PayoutMode::Immediate);
-
-        if let Some(financier) = Self::payout_assignee(&env, &shipment_id) {
-            // Invoice factoring: the advance belongs to the receivable's holder.
-            let token_client = token::Client::new(&env, &shipment.token);
-            token_client.transfer(&env.current_contract_address(), &financier, &advance_amount);
-        } else if payout_mode == PayoutMode::Batched {
-            let pending: i128 = env
-                .storage()
-                .persistent()
-                .get(&DataKeyExt::PendingPayout(shipment.supplier.clone()))
-                .unwrap_or(0);
-            env.storage().persistent().set(
-                &DataKeyExt::PendingPayout(shipment.supplier.clone()),
-                &(pending + advance_amount),
-            );
-        } else {
-            let token_client = token::Client::new(&env, &shipment.token);
-            token_client.transfer(
-                &env.current_contract_address(),
-                &shipment.supplier,
-                &advance_amount,
-            );
-        }
+        Self::pay_advance_to_supplier(&env, &shipment, &shipment_id, advance_amount);
 
         // Track total advances for correct escrow accounting.
         shipment.total_advanced_amount += advance_amount;
@@ -10745,6 +10810,8 @@ impl ChainSettleContract {
             shipment.milestones.set(milestone_index, milestone.clone());
             // #631: Count this confirmation toward the supplier timeliness rate.
             Self::record_milestone_timeliness(&env, &shipment.supplier, &milestone);
+            // #751: Buyer confirmation latency for the pair summary.
+            Self::after_milestone_confirmed(&env, &shipment, milestone_index, &milestone, true);
 
             // Pay early bonus immediately even for held milestones (bonus is based on delivery time).
             let mut early_bonus_paid: i128 = 0;
@@ -10862,6 +10929,13 @@ impl ChainSettleContract {
             shipment.released_amount += payment;
             // #631: Count this confirmation toward the supplier timeliness rate.
             Self::record_milestone_timeliness(&env, &shipment.supplier, &shipment.milestones.get(milestone_index).unwrap());
+            Self::after_milestone_confirmed(
+                &env,
+                &shipment,
+                milestone_index,
+                &shipment.milestones.get(milestone_index).unwrap(),
+                true,
+            );
             // #162: Track last confirmed milestone for sequential enforcement queries.
             shipment.last_confirmed_milestone_index = Some(milestone_index);
             // #475: Release this milestone's collateral share if opted in.
@@ -11361,6 +11435,7 @@ impl ChainSettleContract {
             shipment.milestones.set(idx, milestone.clone());
             // #631: Count this confirmation toward the supplier timeliness rate.
             Self::record_milestone_timeliness(&env, &shipment.supplier, &milestone);
+            Self::after_milestone_confirmed(&env, &shipment, idx, &milestone, true);
             // #162: Track last confirmed milestone.
             shipment.last_confirmed_milestone_index = Some(idx);
             // #475: Release this milestone's collateral share if opted in.
@@ -11887,11 +11962,11 @@ impl ChainSettleContract {
 
             let token_client = token::Client::new(&env, &shipment.token);
             if net_uncontested > 0 {
-                token_client.transfer(
-                    &env.current_contract_address(),
-                    &shipment.supplier,
-                    &net_uncontested,
-                );
+                // Invoice factoring: the uncontested share belongs to the
+                // receivable's holder when the payout is assigned.
+                let payee = Self::payout_assignee(&env, &shipment_id)
+                    .unwrap_or_else(|| shipment.supplier.clone());
+                token_client.transfer(&env.current_contract_address(), &payee, &net_uncontested);
             }
 
             shipment.released_amount += uncontested_payment;
@@ -14372,6 +14447,8 @@ impl ChainSettleContract {
         milestone.status = MilestoneStatus::Confirmed;
         // #631: Count this auto-confirmation toward the supplier timeliness rate.
         Self::record_milestone_timeliness(&env, &shipment.supplier, &milestone);
+        // #734: Auto-confirmation can be the final confirmation (freezes demurrage).
+        Self::after_milestone_confirmed(&env, &shipment, milestone_index, &milestone, false);
 
         Self::append_audit_entry(
             &env,
@@ -14803,11 +14880,10 @@ impl ChainSettleContract {
             Self::check_circuit_breaker(&env, payment);
             Self::check_address_outflow(&env, &shipment.supplier, payment);
             if net_payment > 0 {
-                token_client.transfer(
-                    &env.current_contract_address(),
-                    &shipment.supplier,
-                    &net_payment,
-                );
+                // Invoice factoring: pay the receivable's holder when assigned.
+                let payee = Self::payout_assignee(&env, &shipment_id)
+                    .unwrap_or_else(|| shipment.supplier.clone());
+                token_client.transfer(&env.current_contract_address(), &payee, &net_payment);
             }
             shipment.released_amount += payment;
             // #576: Supplier timeout outcome releases funds to supplier.
@@ -19844,6 +19920,37 @@ impl ChainSettleContract {
         }
     }
 
+    /// Pays an advance-style amount (approved advance or #738 upfront deposit)
+    /// out of escrow: to the financier when the payout is assigned, into the
+    /// supplier's pending balance in batched payout mode, else to the supplier.
+    fn pay_advance_to_supplier(env: &Env, shipment: &Shipment, shipment_id: &String, amount: i128) {
+        // #284: Batched vs immediate payout
+        let payout_mode: PayoutMode = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt::PayoutMode(shipment.supplier.clone()))
+            .unwrap_or(PayoutMode::Immediate);
+
+        if let Some(financier) = Self::payout_assignee(env, shipment_id) {
+            // Invoice factoring: the advance belongs to the receivable's holder.
+            let token_client = token::Client::new(env, &shipment.token);
+            token_client.transfer(&env.current_contract_address(), &financier, &amount);
+        } else if payout_mode == PayoutMode::Batched {
+            let pending: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKeyExt::PendingPayout(shipment.supplier.clone()))
+                .unwrap_or(0);
+            env.storage().persistent().set(
+                &DataKeyExt::PendingPayout(shipment.supplier.clone()),
+                &(pending + amount),
+            );
+        } else {
+            let token_client = token::Client::new(env, &shipment.token);
+            token_client.transfer(&env.current_contract_address(), &shipment.supplier, &amount);
+        }
+    }
+
     /// Consumes an approved advance for a milestone, removing it from storage and
     /// adjusting total_advanced_amount. Returns the advance amount (or 0 if none).
     fn consume_advance_for_milestone(
@@ -20921,6 +21028,8 @@ impl ChainSettleContract {
     fn append_dispute_history(env: &Env, buyer: &Address, supplier: &Address, record: DisputeRecord) {
         Self::append_dispute_history_for(env, buyer, &record);
         Self::append_dispute_history_for(env, supplier, &record);
+        // #751: Every terminal dispute outcome flows through here.
+        Self::record_relationship_dispute(env, buyer, supplier, &record.outcome);
     }
 
     /// #578: Accumulate a star rating into an address's running `(count, sum)`
@@ -22384,6 +22493,14 @@ impl ChainSettleContract {
             &shipment.supplier,
             &shipment.milestones.get(milestone_index).unwrap(),
         );
+        // #751: Buyer confirmation latency for the pair summary.
+        Self::after_milestone_confirmed(
+            &env,
+            &shipment,
+            milestone_index,
+            &shipment.milestones.get(milestone_index).unwrap(),
+            true,
+        );
 
         env.storage().persistent().set(
             &DataKeyExt3::PendingGrade(shipment_id.clone(), milestone_index),
@@ -23466,6 +23583,11 @@ impl ChainSettleContract {
             constants::TTL_MAX_LEDGERS,
         );
 
+        // #734: Final confirmation stops demurrage accrual and settles the deposit.
+        Self::settle_demurrage(env, shipment_id, shipment);
+        // #751: Count the completion toward the buyer/supplier pair summary.
+        Self::record_relationship_close(env, shipment_id, shipment, true);
+
         let retainage_key = DataKeyExt3::RetainageBalance(shipment_id.clone());
         let retainage: i128 = env.storage().persistent().get(&retainage_key).unwrap_or(0);
         if retainage > 0 {
@@ -23526,6 +23648,13 @@ impl ChainSettleContract {
         shipment: &mut Shipment,
         caller: Address,
     ) {
+        // This runs exactly once on every cancel / expiry path (just before the
+        // status leaves Active), so it doubles as the shipment-closed hook.
+        // #734: Closing the shipment stops demurrage accrual and settles the deposit.
+        Self::settle_demurrage(env, shipment_id, shipment);
+        // #751: Count the cancellation / expiry toward the pair summary.
+        Self::record_relationship_close(env, shipment_id, shipment, false);
+
         let retainage_key = DataKeyExt3::RetainageBalance(shipment_id.clone());
         let warranty_key = DataKeyExt3::WarrantyBalance(shipment_id.clone());
         let retainage: i128 = env.storage().persistent().get(&retainage_key).unwrap_or(0);
@@ -23635,6 +23764,9 @@ impl ChainSettleContract {
 
         bump_key!(DataKeyExt4::ShipmentFeesPaid(shipment_id.clone()));
         bump_key!(DataKeyExt4::ShipmentHadDispute(shipment_id.clone()));
+        bump_key!(DataKeyExt5::ShipmentOptionsExt(shipment_id.clone()));
+        bump_key!(DataKeyExt5::DemurrageState(shipment_id.clone()));
+        bump_key!(DataKeyExt5::TermsAccepted(shipment_id.clone()));
         bump_key!(DataKeyExt4::PendingExpiryExtension(shipment_id.clone()));
         bump_key!(DataKeyExt4::TotalExpiryExtended(shipment_id.clone()));
         bump_key!(DataKeyExt4::NewMilestoneProposal(shipment_id.clone()));
@@ -24161,6 +24293,518 @@ impl ChainSettleContract {
     }
 }
 
+// ============================================================
+// EXTENDED SHIPMENT OPTIONS
+//   #734 Demurrage after free days at destination
+//   #738 Upfront buyer deposit released on supplier term acceptance
+//   #751 Bilateral trading relationship summary
+// ============================================================
+
+#[contractimpl]
+impl ChainSettleContract {
+    /// Create a shipment with `ShipmentOptionsExt` on top of the regular
+    /// `ShipmentOptions` (which is at the 40-field contracttype limit).
+    ///
+    /// Behaves exactly like `create_shipment`, then applies `ext`. When
+    /// demurrage is enabled the primary buyer also funds `demurrage_deposit`
+    /// in the same transaction. Passing `ShipmentOptionsExt::default()` is
+    /// equivalent to calling `create_shipment`.
+    pub fn create_shipment_ext(
+        env: Env,
+        shipment_id: String,
+        buyers: Vec<Address>,
+        supplier: Address,
+        logistics: Address,
+        arbiter: Address,
+        token: Address,
+        total_amount: i128,
+        milestones: Vec<Milestone>,
+        options: ShipmentOptions,
+        ext: ShipmentOptionsExt,
+    ) -> String {
+        Self::validate_shipment_options_ext(&env, &options, &ext);
+        let id = Self::create_shipment(
+            env.clone(),
+            shipment_id,
+            buyers,
+            supplier,
+            logistics,
+            arbiter,
+            token,
+            total_amount,
+            milestones,
+            options,
+        );
+        Self::apply_shipment_options_ext(&env, &id, &ext);
+        id
+    }
+
+    /// Extended options a shipment was created with (all disabled when the
+    /// shipment was created through any entry point other than `create_shipment_ext`).
+    pub fn get_shipment_options_ext(env: Env, shipment_id: String) -> ShipmentOptionsExt {
+        Self::shipment_options_ext(&env, &shipment_id)
+    }
+
+    // ----------------------------------------------------------
+    // #734 DEMURRAGE
+    // ----------------------------------------------------------
+
+    /// Logistics provider records that the goods arrived at destination.
+    /// Demurrage accrues at `demurrage_rate_per_ledger` for every ledger beyond
+    /// `demurrage_free_ledgers` after this point, until the final milestone is
+    /// confirmed (or the shipment otherwise closes). Callable once.
+    pub fn mark_arrived_at_destination(env: Env, logistics: Address, shipment_id: String) {
+        Self::assert_not_paused(&env);
+        logistics.require_auth();
+
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if shipment.logistics != logistics {
+            panic!("only logistics can mark arrival");
+        }
+        let key = DataKeyExt5::DemurrageState(shipment_id.clone());
+        let mut state: DemurrageState = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("demurrage not enabled"));
+        if state.arrived_ledger.is_some() {
+            panic!("arrival already marked");
+        }
+        if state.stopped_ledger.is_some() {
+            panic!("demurrage accrual already stopped");
+        }
+
+        let now = env.ledger().sequence();
+        state.arrived_ledger = Some(now);
+        Self::set_persistent5(&env, &key, &state);
+
+        env.events().publish(
+            (Symbol::new(&env, "arrived_at_destination"), shipment_id),
+            (logistics, now, now.saturating_add(state.free_ledgers)),
+        );
+    }
+
+    /// Demurrage deposit / accrual state (None when demurrage is disabled).
+    pub fn get_demurrage_state(env: Env, shipment_id: String) -> Option<DemurrageState> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::DemurrageState(shipment_id))
+    }
+
+    /// Demurrage owed so far (or the final charge once settled). Never exceeds
+    /// the deposit; 0 when demurrage is disabled or goods have not arrived.
+    pub fn get_demurrage_accrued(env: Env, shipment_id: String) -> i128 {
+        match env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt5, DemurrageState>(&DataKeyExt5::DemurrageState(shipment_id))
+        {
+            Some(state) if state.settled => state.charged,
+            Some(state) => Self::demurrage_accrued_at(&state, env.ledger().sequence()),
+            None => 0,
+        }
+    }
+
+    // ----------------------------------------------------------
+    // #738 UPFRONT DEPOSIT ON SUPPLIER TERM ACCEPTANCE
+    // ----------------------------------------------------------
+
+    /// Supplier accepts the shipment terms. Callable once per shipment.
+    ///
+    /// When the shipment was created with `upfront_deposit_bps > 0`, the
+    /// non-refundable deposit is released to the supplier immediately (to the
+    /// financier if the payout is assigned). It is recorded as an approved
+    /// advance on each milestone, pro rata to that milestone's weight, so it is
+    /// deducted from each milestone payout and excluded from buyer refunds.
+    /// The deposit can only be released before any milestone progresses.
+    /// Returns the deposit released (0 when disabled).
+    pub fn accept_shipment_terms(env: Env, supplier: Address, shipment_id: String) -> i128 {
+        Self::assert_not_paused(&env);
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::require_supplier_auth(&shipment, &supplier);
+
+        let accepted_key = DataKeyExt5::TermsAccepted(shipment_id.clone());
+        if env.storage().persistent().has(&accepted_key) {
+            panic!("terms already accepted");
+        }
+
+        let ext = Self::shipment_options_ext(&env, &shipment_id);
+        let mut deposit: i128 = 0;
+        if ext.upfront_deposit_bps > 0 {
+            if shipment.released_amount > 0 || shipment.total_advanced_amount > 0 {
+                panic!("upfront deposit must be released before the shipment progresses");
+            }
+            let bps = ext.upfront_deposit_bps as i128;
+            for i in 0..shipment.milestones.len() {
+                if shipment.milestones.get(i).unwrap().status != MilestoneStatus::Pending {
+                    panic!("upfront deposit must be released before the shipment progresses");
+                }
+                let advance_key = DataKey::AdvanceRequest(shipment_id.clone(), i);
+                if env.storage().persistent().has(&advance_key) {
+                    panic!("upfront deposit conflicts with an existing advance request");
+                }
+                // Each milestone carries its own share so that, after the
+                // per-milestone deductions, deposit + payouts == total_amount.
+                let portion = (Self::milestone_gross_payment(&env, &shipment, i) * bps) / 10_000;
+                if portion > 0 {
+                    let request = AdvanceRequest {
+                        requested_percent: ext.upfront_deposit_bps / 100,
+                        approved: true,
+                        amount_advanced: portion,
+                    };
+                    env.storage().persistent().set(&advance_key, &request);
+                    env.storage().persistent().extend_ttl(
+                        &advance_key,
+                        constants::TTL_INITIAL_LEDGERS,
+                        constants::TTL_MAX_LEDGERS,
+                    );
+                    deposit += portion;
+                }
+            }
+
+            if deposit > 0 {
+                Self::check_circuit_breaker(&env, deposit);
+                Self::check_address_outflow(&env, &shipment.supplier, deposit);
+                Self::pay_advance_to_supplier(&env, &shipment, &shipment_id, deposit);
+                shipment.total_advanced_amount += deposit;
+                Self::decrease_total_escrowed(&env, &shipment.token, deposit);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+                env.events().publish(
+                    (Symbol::new(&env, "upfront_deposit_released"), shipment_id.clone()),
+                    (supplier.clone(), deposit),
+                );
+            }
+        }
+
+        Self::set_persistent5(&env, &accepted_key, &(env.ledger().sequence(), deposit));
+        env.events().publish(
+            (Symbol::new(&env, "terms_accepted"), shipment_id),
+            (supplier, deposit),
+        );
+        deposit
+    }
+
+    /// `(accepted_at_ledger, upfront_deposit_released)` once the supplier has
+    /// accepted the terms; None before.
+    pub fn get_terms_acceptance(env: Env, shipment_id: String) -> Option<(u32, i128)> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::TermsAccepted(shipment_id))
+    }
+
+    // ----------------------------------------------------------
+    // #751 BILATERAL RELATIONSHIP SUMMARY
+    // ----------------------------------------------------------
+
+    /// Pair-level trading history between `buyer` (a shipment's primary buyer)
+    /// and `supplier`. Read-only; all zeros for a pair that never traded.
+    pub fn get_relationship_summary(
+        env: Env,
+        buyer: Address,
+        supplier: Address,
+    ) -> RelationshipSummary {
+        Self::load_relationship(&env, &buyer, &supplier)
+    }
+}
+
+impl ChainSettleContract {
+    fn shipment_options_ext(env: &Env, shipment_id: &String) -> ShipmentOptionsExt {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::ShipmentOptionsExt(shipment_id.clone()))
+            .unwrap_or_default()
+    }
+
+    fn validate_shipment_options_ext(
+        env: &Env,
+        options: &ShipmentOptions,
+        ext: &ShipmentOptionsExt,
+    ) {
+        if ext.demurrage_rate_per_ledger < 0 || ext.demurrage_deposit < 0 {
+            panic!("invalid demurrage terms");
+        }
+        if ext.demurrage_rate_per_ledger > 0 && ext.demurrage_deposit == 0 {
+            panic!("demurrage requires a deposit");
+        }
+        if ext.demurrage_rate_per_ledger == 0 && ext.demurrage_deposit > 0 {
+            panic!("demurrage deposit requires a rate");
+        }
+        if ext.upfront_deposit_bps > 0 {
+            let max_advance_percent: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::MaxAdvancePercent)
+                .unwrap_or(30);
+            if ext.upfront_deposit_bps > max_advance_percent.saturating_mul(100) {
+                panic!("UpfrontDepositExceedsMax");
+            }
+            // Consortium milestones pay different suppliers, so a single
+            // supplier deposit cannot be deducted pro rata from them.
+            if !options.milestone_suppliers.is_empty() {
+                panic!("upfront deposit not supported for consortium shipments");
+            }
+        }
+    }
+
+    fn apply_shipment_options_ext(env: &Env, shipment_id: &String, ext: &ShipmentOptionsExt) {
+        if *ext == ShipmentOptionsExt::default() {
+            return;
+        }
+        Self::set_persistent5(env, &DataKeyExt5::ShipmentOptionsExt(shipment_id.clone()), ext);
+
+        if ext.demurrage_rate_per_ledger > 0 {
+            let shipment = Self::get_shipment_internal(env, shipment_id);
+            let primary_buyer = shipment.buyers.get(0).unwrap();
+            token::Client::new(env, &shipment.token).transfer(
+                &primary_buyer,
+                &env.current_contract_address(),
+                &ext.demurrage_deposit,
+            );
+            let state = DemurrageState {
+                free_ledgers: ext.demurrage_free_ledgers,
+                rate_per_ledger: ext.demurrage_rate_per_ledger,
+                deposit: ext.demurrage_deposit,
+                arrived_ledger: None,
+                stopped_ledger: None,
+                charged: 0,
+                settled: false,
+            };
+            Self::set_persistent5(env, &DataKeyExt5::DemurrageState(shipment_id.clone()), &state);
+            env.events().publish(
+                (Symbol::new(env, "demurrage_deposit_funded"), shipment_id.clone()),
+                (primary_buyer, ext.demurrage_deposit),
+            );
+        }
+    }
+
+    /// #734: Charge accrued by ledger `at` (or by the stop ledger once accrual
+    /// stopped). Zero until the free period after arrival has fully elapsed;
+    /// capped by the deposit.
+    fn demurrage_accrued_at(state: &DemurrageState, at: u32) -> i128 {
+        let arrived = match state.arrived_ledger {
+            Some(ledger) => ledger,
+            None => return 0,
+        };
+        let end = state.stopped_ledger.unwrap_or(at);
+        let accrual_start = arrived.saturating_add(state.free_ledgers);
+        if end <= accrual_start {
+            return 0;
+        }
+        let chargeable = (end - accrual_start) as i128;
+        chargeable
+            .checked_mul(state.rate_per_ledger)
+            .unwrap_or(state.deposit)
+            .min(state.deposit)
+    }
+
+    /// #734: Stop demurrage accrual at the current ledger (idempotent).
+    fn stop_demurrage_accrual(env: &Env, shipment_id: &String) {
+        let key = DataKeyExt5::DemurrageState(shipment_id.clone());
+        if let Some(mut state) = env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt5, DemurrageState>(&key)
+        {
+            if state.stopped_ledger.is_none() {
+                let now = env.ledger().sequence();
+                state.stopped_ledger = Some(now);
+                Self::set_persistent5(env, &key, &state);
+                env.events().publish(
+                    (Symbol::new(env, "demurrage_stopped"), shipment_id.clone()),
+                    (now, Self::demurrage_accrued_at(&state, now)),
+                );
+            }
+        }
+    }
+
+    /// #734: Called when the shipment closes (completion, cancellation or
+    /// expiry). Stops accrual if still running, pays the accrued charge to the
+    /// logistics provider and refunds the unused deposit to the primary buyer.
+    /// Marks the state settled, so this pays out at most once.
+    fn settle_demurrage(env: &Env, shipment_id: &String, shipment: &Shipment) {
+        let key = DataKeyExt5::DemurrageState(shipment_id.clone());
+        let mut state: DemurrageState = match env.storage().persistent().get(&key) {
+            Some(state) => state,
+            None => return,
+        };
+        if state.settled {
+            return;
+        }
+        let now = env.ledger().sequence();
+        if state.stopped_ledger.is_none() {
+            state.stopped_ledger = Some(now);
+        }
+        let charge = Self::demurrage_accrued_at(&state, now);
+        let refund = state.deposit - charge;
+
+        let token_client = token::Client::new(env, &shipment.token);
+        if charge > 0 {
+            token_client.transfer(&env.current_contract_address(), &shipment.logistics, &charge);
+        }
+        if refund > 0 {
+            let primary_buyer = shipment.buyers.get(0).unwrap();
+            token_client.transfer(&env.current_contract_address(), &primary_buyer, &refund);
+        }
+
+        state.charged = charge;
+        state.settled = true;
+        Self::set_persistent5(env, &key, &state);
+        env.events().publish(
+            (Symbol::new(env, "demurrage_settled"), shipment_id.clone()),
+            (shipment.logistics.clone(), charge, refund),
+        );
+    }
+
+    /// Bookkeeping after a milestone becomes confirmed (`milestone` is its new
+    /// state, which may not be written back into `shipment` yet).
+    /// - #751: buyer confirmations feed the pair's average confirmation time.
+    /// - #734: once every milestone is confirmed, demurrage stops accruing even
+    ///   if the payout itself is still held.
+    fn after_milestone_confirmed(
+        env: &Env,
+        shipment: &Shipment,
+        milestone_index: u32,
+        milestone: &Milestone,
+        by_buyer: bool,
+    ) {
+        if by_buyer {
+            if let Some(proof_ledger) = milestone.proof_submitted_ledger {
+                let latency = env.ledger().sequence().saturating_sub(proof_ledger) as u64;
+                let buyer = shipment.buyers.get(0).unwrap();
+                let mut summary = Self::load_relationship(env, &buyer, &shipment.supplier);
+                summary.confirmation_count = summary.confirmation_count.saturating_add(1);
+                summary.total_confirmation_ledgers =
+                    summary.total_confirmation_ledgers.saturating_add(latency);
+                Self::store_relationship(env, &buyer, &shipment.supplier, summary);
+            }
+        }
+
+        let fully_confirmed = (0..shipment.milestones.len()).all(|i| {
+            let status = if i == milestone_index {
+                milestone.status.clone()
+            } else {
+                shipment.milestones.get(i).unwrap().status
+            };
+            matches!(
+                status,
+                MilestoneStatus::Confirmed
+                    | MilestoneStatus::ConfirmedHeld
+                    | MilestoneStatus::Resolved
+            )
+        });
+        if fully_confirmed {
+            Self::stop_demurrage_accrual(env, &shipment.id);
+        }
+    }
+
+    fn load_relationship(env: &Env, buyer: &Address, supplier: &Address) -> RelationshipSummary {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::RelationshipSummary(buyer.clone(), supplier.clone()))
+            .unwrap_or_else(|| RelationshipSummary {
+                shipment_count: 0,
+                completed_count: 0,
+                cancelled_count: 0,
+                disputed_shipment_count: 0,
+                disputes_resolved: 0,
+                buyer_dispute_wins: 0,
+                supplier_dispute_wins: 0,
+                dispute_rate_bps: 0,
+                confirmation_count: 0,
+                total_confirmation_ledgers: 0,
+                avg_confirmation_ledgers: 0,
+                volume_by_token: Map::new(env),
+            })
+    }
+
+    fn store_relationship(
+        env: &Env,
+        buyer: &Address,
+        supplier: &Address,
+        mut summary: RelationshipSummary,
+    ) {
+        summary.dispute_rate_bps = if summary.shipment_count > 0 {
+            ((summary.disputed_shipment_count as u64 * 10_000) / summary.shipment_count as u64)
+                as u32
+        } else {
+            0
+        };
+        summary.avg_confirmation_ledgers = if summary.confirmation_count > 0 {
+            summary.total_confirmation_ledgers / summary.confirmation_count as u64
+        } else {
+            0
+        };
+        Self::set_persistent5(
+            env,
+            &DataKeyExt5::RelationshipSummary(buyer.clone(), supplier.clone()),
+            &summary,
+        );
+    }
+
+    /// #751: A shipment between the pair closed (completed, cancelled or expired).
+    fn record_relationship_close(
+        env: &Env,
+        shipment_id: &String,
+        shipment: &Shipment,
+        completed: bool,
+    ) {
+        let buyer = shipment.buyers.get(0).unwrap();
+        let mut summary = Self::load_relationship(env, &buyer, &shipment.supplier);
+        summary.shipment_count = summary.shipment_count.saturating_add(1);
+        if completed {
+            summary.completed_count = summary.completed_count.saturating_add(1);
+        } else {
+            summary.cancelled_count = summary.cancelled_count.saturating_add(1);
+        }
+        let had_dispute: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt4::ShipmentHadDispute(shipment_id.clone()))
+            .unwrap_or(false);
+        if had_dispute {
+            summary.disputed_shipment_count = summary.disputed_shipment_count.saturating_add(1);
+        }
+        let settled = shipment.released_amount + shipment.total_advanced_amount;
+        if settled > 0 {
+            let prev = summary.volume_by_token.get(shipment.token.clone()).unwrap_or(0);
+            summary
+                .volume_by_token
+                .set(shipment.token.clone(), prev.saturating_add(settled));
+        }
+        Self::store_relationship(env, &buyer, &shipment.supplier, summary);
+    }
+
+    /// #751: A dispute between the pair reached a terminal outcome.
+    fn record_relationship_dispute(
+        env: &Env,
+        buyer: &Address,
+        supplier: &Address,
+        outcome: &DisputeOutcome,
+    ) {
+        let mut summary = Self::load_relationship(env, buyer, supplier);
+        match outcome {
+            DisputeOutcome::Buyer => {
+                summary.buyer_dispute_wins = summary.buyer_dispute_wins.saturating_add(1);
+            }
+            DisputeOutcome::Supplier => {
+                summary.supplier_dispute_wins = summary.supplier_dispute_wins.saturating_add(1);
+            }
+            DisputeOutcome::Withdrawn => return,
+        }
+        summary.disputes_resolved = summary.disputes_resolved.saturating_add(1);
+        Self::store_relationship(env, buyer, supplier, summary);
+    }
+}
+
 pub mod constants;
 mod storage;
 mod test_arbiter_pool;
@@ -24243,6 +24887,14 @@ mod test_supplier_timeliness;
 // Disabled: exercises milestone insurance holdback / oracle price-condition
 // APIs (see NEW_MILESTONE_FEATURES.md) that have not been implemented yet.
 // mod test_milestone_insurance_and_oracle;
+#[cfg(test)]
+mod test_demurrage;
+#[cfg(test)]
+mod test_upfront_deposit;
+#[cfg(test)]
+mod test_relationship_summary;
+#[cfg(test)]
+mod test_payout_assignment;
 /// Minimum TTL ledgers for persistent storage entries (~1 day at 5s/ledger).
 pub const TTL_INITIAL_LEDGERS: u32 = 100_000;
 
