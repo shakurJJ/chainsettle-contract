@@ -10,7 +10,10 @@ extern crate std;
 
 use super::*;
 use crate::test_common::{build_milestones, default_options, setup, single_buyer_vec};
-use soroban_sdk::{testutils::Address as _, String};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger as _},
+    vec, String,
+};
 
 #[test]
 fn test_preview_matches_gross_with_no_fees_configured() {
@@ -125,6 +128,70 @@ fn test_preview_reflects_platform_fee_config() {
     assert_eq!(preview.applied_fee_bps, 1000);
     assert_eq!(preview.platform_fee, 25_000);
     assert_eq!(preview.supplier_net_amount, 225_000);
+}
+
+#[test]
+fn test_preview_matches_combined_fee_waterfall_example() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    client.set_fee_config(&t.buyer, &1000u32, &t.treasury);
+    client.set_fee_tiers(
+        &t.buyer,
+        &vec![
+            &t.env,
+            FeeTier {
+                min_lifetime_volume: 0,
+                fee_bps: 800,
+            },
+        ],
+    );
+    client.initialize_multisig_admin(&t.buyer, &vec![&t.env, t.buyer.clone()], &1u32);
+    client.propose_fee_waiver(&t.buyer, &t.buyer, &2500u32, &0u64);
+
+    let shipment_id = String::from_str(&t.env, "PREV-FEE-WATERFALL");
+    let mut milestones = build_milestones(&t.env);
+    let mut first_milestone = milestones.get(0).unwrap();
+    first_milestone.deadline_ledger = 100;
+    first_milestone.penalty_bps_per_ledger = 100;
+    milestones.set(0, first_milestone);
+
+    let mut options = default_options(&t.env);
+    options.logistics_fee_bps = 500;
+    client.create_shipment(
+        &shipment_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000i128,
+        &milestones,
+        &options,
+    );
+    client.set_shipment_fee_override(&t.buyer, &shipment_id, &700u32);
+    client.request_advance(&t.supplier, &shipment_id, &0u32, &4u32);
+    client.approve_advance(&t.buyer, &shipment_id, &0u32);
+
+    t.env.ledger().set_sequence_number(102);
+    client.submit_proof(
+        &t.supplier,
+        &shipment_id,
+        &0u32,
+        &String::from_str(&t.env, "proof"),
+        &soroban_sdk::Symbol::new(&t.env, "ipfs"),
+    );
+
+    let preview = client.preview_milestone_payout(&shipment_id, &0u32);
+    assert_eq!(preview.gross_amount, 250_000);
+    assert_eq!(preview.advance_deducted, 10_000);
+    assert_eq!(preview.late_penalty_deducted, 5_000);
+    assert_eq!(preview.applied_fee_bps, 525);
+    assert_eq!(preview.platform_fee, 12_862);
+    assert_eq!(preview.logistics_fee, 12_250);
+    assert_eq!(preview.supplier_net_amount, 209_888);
+    assert!(!preview.would_be_held);
+    assert!(!preview.is_final_milestone);
 }
 
 #[test]
