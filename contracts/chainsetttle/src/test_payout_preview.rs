@@ -10,7 +10,10 @@ extern crate std;
 
 use super::*;
 use crate::test_common::{build_milestones, default_options, setup, single_buyer_vec};
-use soroban_sdk::{testutils::Address as _, String};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger as _},
+    vec, String,
+};
 
 #[test]
 fn test_preview_matches_gross_with_no_fees_configured() {
@@ -128,6 +131,120 @@ fn test_preview_reflects_platform_fee_config() {
 }
 
 #[test]
+fn test_milestone_payment_is_split_between_configured_payees() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let first_payee = soroban_sdk::Address::generate(&t.env);
+    let second_payee = soroban_sdk::Address::generate(&t.env);
+    let shipment_id = String::from_str(&t.env, "PREV-PAYEE-SPLIT");
+
+    client.create_shipment(
+        &shipment_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000i128,
+        &build_milestones(&t.env),
+        &default_options(&t.env),
+    );
+    client.set_milestone_payees(
+        &t.buyer,
+        &shipment_id,
+        &0u32,
+        &vec![
+            &t.env,
+            MilestonePayee {
+                payee: first_payee.clone(),
+                percent: 30,
+            },
+            MilestonePayee {
+                payee: second_payee.clone(),
+                percent: 70,
+            },
+        ],
+    );
+    client.submit_proof(
+        &t.supplier,
+        &shipment_id,
+        &0u32,
+        &String::from_str(&t.env, "proof"),
+        &soroban_sdk::Symbol::new(&t.env, "ipfs"),
+    );
+
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_id);
+    client.confirm_milestone(&t.buyer, &shipment_id, &0u32);
+
+    assert_eq!(token_client.balance(&first_payee), 75_000);
+    assert_eq!(token_client.balance(&second_payee), 175_000);
+}
+
+#[test]
+fn test_preview_matches_combined_fee_waterfall_example() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    client.set_fee_config(&t.buyer, &1000u32, &t.treasury);
+    client.set_fee_tiers(
+        &t.buyer,
+        &vec![
+            &t.env,
+            FeeTier {
+                min_lifetime_volume: 0,
+                fee_bps: 800,
+            },
+        ],
+    );
+    client.initialize_multisig_admin(&t.buyer, &vec![&t.env, t.buyer.clone()], &1u32);
+    client.propose_fee_waiver(&t.buyer, &t.buyer, &2500u32, &0u64);
+
+    let shipment_id = String::from_str(&t.env, "PREV-FEE-WATERFALL");
+    let mut milestones = build_milestones(&t.env);
+    let mut first_milestone = milestones.get(0).unwrap();
+    first_milestone.deadline_ledger = 100;
+    first_milestone.penalty_bps_per_ledger = 100;
+    milestones.set(0, first_milestone);
+
+    let mut options = default_options(&t.env);
+    options.logistics_fee_bps = 500;
+    client.create_shipment(
+        &shipment_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000i128,
+        &milestones,
+        &options,
+    );
+    client.set_shipment_fee_override(&t.buyer, &shipment_id, &700u32);
+    client.request_advance(&t.supplier, &shipment_id, &0u32, &4u32);
+    client.approve_advance(&t.buyer, &shipment_id, &0u32);
+
+    t.env.ledger().set_sequence_number(102);
+    client.submit_proof(
+        &t.supplier,
+        &shipment_id,
+        &0u32,
+        &String::from_str(&t.env, "proof"),
+        &soroban_sdk::Symbol::new(&t.env, "ipfs"),
+    );
+
+    let preview = client.preview_milestone_payout(&shipment_id, &0u32);
+    assert_eq!(preview.gross_amount, 250_000);
+    assert_eq!(preview.advance_deducted, 10_000);
+    assert_eq!(preview.late_penalty_deducted, 5_000);
+    assert_eq!(preview.applied_fee_bps, 525);
+    assert_eq!(preview.platform_fee, 12_862);
+    assert_eq!(preview.logistics_fee, 12_250);
+    assert_eq!(preview.supplier_net_amount, 209_888);
+    assert!(!preview.would_be_held);
+    assert!(!preview.is_final_milestone);
+}
+
+#[test]
 fn test_preview_marks_final_milestone_correctly() {
     let t = setup();
     let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
@@ -186,6 +303,26 @@ fn test_preview_reports_held_when_holdback_configured() {
     let preview = client.preview_milestone_payout(&shipment_id, &0u32);
     assert!(preview.would_be_held);
     assert_eq!(preview.platform_fee, 0);
+
+    client.submit_proof(
+        &t.supplier,
+        &shipment_id,
+        &0u32,
+        &String::from_str(&t.env, "proof"),
+        &soroban_sdk::Symbol::new(&t.env, "ipfs"),
+    );
+    client.confirm_milestone(&t.buyer, &shipment_id, &0u32);
+    let release_after = client
+        .get_milestone(&shipment_id, &0u32)
+        .release_after_ledger;
+    t.env.ledger().set_sequence_number(release_after);
+
+    let supplier_before = soroban_sdk::token::Client::new(&t.env, &t.token_id).balance(&t.supplier);
+    client.release_held_payment(&shipment_id, &0u32);
+    assert_eq!(
+        soroban_sdk::token::Client::new(&t.env, &t.token_id).balance(&t.supplier) - supplier_before,
+        250_000
+    );
 }
 
 #[test]
