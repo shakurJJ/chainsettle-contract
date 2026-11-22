@@ -1823,6 +1823,11 @@ pub enum DataKeyExt5 {
     FixedLogisticsAmounts(String),
     /// Configuration staged before create_shipment (instance storage).
     PendingFixedLogistics,
+    // ── #754 Duties escrow sub-account ──────────────────────────────────────
+    /// Duties configuration staged before create_shipment.
+    PendingDuties,
+    /// (customs broker, remaining duties) held separately from the goods escrow.
+    DutiesEscrow(String),
 }
 
 /// #621 – Pending proposal to append a milestone to an active shipment.
@@ -4118,7 +4123,6 @@ impl ChainSettleContract {
             milestone_suppliers: Vec::new(env),
             refund_recipient: None,
             require_encrypted_evidence: false,
-            logistics_amounts: Vec::new(&env),
         }
     }
 
@@ -7992,6 +7996,20 @@ impl ChainSettleContract {
 
         let min_pct = ctx.min_pct;
 
+        // #754: staged duties are funded in addition to the goods escrow and
+        // excluded from all fee / percentage calculations.
+        let duties_config: Option<(Address, i128)> = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt5::PendingDuties);
+        env.storage().instance().remove(&DataKeyExt5::PendingDuties);
+        if let Some((broker, duties_amount)) = duties_config.clone() {
+            env.storage().persistent().set(
+                &DataKeyExt5::DutiesEscrow(shipment_id.clone()),
+                &(broker, duties_amount),
+            );
+        }
+
         // #755: A staged fixed logistics schedule replaces the percentage fee.
         let logistics_amounts: soroban_sdk::Vec<i128> = env
             .storage()
@@ -8108,7 +8126,11 @@ impl ChainSettleContract {
                 early_bonus_pool
             } else {
                 0
-            };
+            }
+            + duties_config
+                .as_ref()
+                .map(|(_, amount)| *amount)
+                .unwrap_or(0);
 
         let pending_allowance: Option<(Address, Address)> = env
             .storage()
@@ -8152,6 +8174,15 @@ impl ChainSettleContract {
                     &env.current_contract_address(),
                     &early_bonus_pool,
                 );
+            }
+            if let Some((_, duties_amount)) = duties_config.as_ref() {
+                if *duties_amount > 0 {
+                    token_client.transfer(
+                        &primary_buyer,
+                        &env.current_contract_address(),
+                        duties_amount,
+                    );
+                }
             }
         }
 
@@ -10676,6 +10707,86 @@ impl ChainSettleContract {
     // CONFIRM MILESTONE (multi-sig)
     // ----------------------------------------------------------
 
+    /// #754: Stage a separate duties component for the next shipment.
+    /// Disabled (no effect) unless called before create_shipment.
+    pub fn set_duties_config(env: Env, broker: Address, amount: i128) {
+        if amount < 0 {
+            panic!("duties amount cannot be negative");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKeyExt5::PendingDuties, &(broker, amount));
+    }
+
+    /// #754: Return the remaining duties escrow for a shipment, if configured.
+    pub fn get_duties_escrow(env: Env, shipment_id: String) -> Option<(Address, i128)> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::DutiesEscrow(shipment_id))
+    }
+
+    /// #754: Pay the full (or remaining) duties amount to the customs broker once.
+    fn release_duties_internal(env: &Env, shipment_id: &String, token: &Address) {
+        if let Some((broker, remaining)) = env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt5, (Address, i128)>(&DataKeyExt5::DutiesEscrow(shipment_id.clone()))
+        {
+            if remaining > 0 {
+                token::Client::new(env, token).transfer(
+                    &env.current_contract_address(),
+                    &broker,
+                    &remaining,
+                );
+                env.storage().persistent().set(
+                    &DataKeyExt5::DutiesEscrow(shipment_id.clone()),
+                    &(broker.clone(), 0i128),
+                );
+                env.events().publish(
+                    (Symbol::new(env, "duties_released"), shipment_id.clone()),
+                    (broker.clone(), remaining),
+                );
+            }
+        }
+    }
+
+    /// #754: Any unused duties are returned to the buyer on completion.
+    fn refund_unused_duties(env: &Env, shipment_id: &String, shipment: &Shipment) {
+        if let Some((_broker, remaining)) = env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt5, (Address, i128)>(&DataKeyExt5::DutiesEscrow(shipment_id.clone()))
+        {
+            if remaining > 0 {
+                let buyer = shipment.buyers.get(0).unwrap();
+                token::Client::new(env, &shipment.token).transfer(
+                    &env.current_contract_address(),
+                    &buyer,
+                    &remaining,
+                );
+                env.storage().persistent().set(
+                    &DataKeyExt5::DutiesEscrow(shipment_id.clone()),
+                    &(_broker, 0i128),
+                );
+                env.events().publish(
+                    (Symbol::new(env, "duties_refunded"), shipment_id.clone()),
+                    (buyer, remaining),
+                );
+            }
+        }
+    }
+
+    /// #754: Anyone may trigger the one-time duties payment once the customs
+    /// milestone has cleared; repeated calls are no-ops.
+    pub fn release_duties(env: Env, shipment_id: String) {
+        let shipment: Shipment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Shipment(shipment_id.clone()))
+            .unwrap_or_else(|| panic!("shipment not found"));
+        Self::release_duties_internal(&env, &shipment_id, &shipment.token);
+    }
+
     /// #755: Stage a flat logistics schedule for the next shipment created by
     /// this caller. Empty schedule (the default) leaves `logistics_fee_bps` in use.
     pub fn set_fixed_logistics_amounts(env: Env, amounts: soroban_sdk::Vec<i128>) {
@@ -10829,6 +10940,16 @@ impl ChainSettleContract {
 
         let gross_payment = Self::milestone_gross_payment(&env, &shipment, milestone_index);
         let mut payment = gross_payment;
+
+        // #754: clearing a customs milestone releases duties to the broker exactly once.
+        let milestone_name = milestone.name.clone();
+        if milestone_name == String::from_str(&env, "customs")
+            || milestone_name == String::from_str(&env, "Customs")
+            || milestone_name == String::from_str(&env, "Customs Hold")
+            || milestone_name == String::from_str(&env, "Customs Clearance")
+        {
+            Self::release_duties_internal(&env, &shipment_id, &shipment.token);
+        }
 
         // #755: Pay the flat logistics amount for this milestone at confirmation.
         Self::pay_fixed_logistics(&env, &shipment_id, milestone_index, &shipment.token, &mut payment);
@@ -11102,6 +11223,7 @@ impl ChainSettleContract {
 
             if Self::all_milestones_done(&shipment) {
                 shipment.status = ShipmentStatus::Completed;
+                Self::refund_unused_duties(&env, &shipment_id, &shipment);
 
                 Self::append_audit_entry(
                     &env,
@@ -25798,3 +25920,6 @@ pub const MAX_COMPLIANCE_PARTIES: u32 = 8;
 
 #[cfg(test)]
 mod test_issue_755;
+
+#[cfg(test)]
+mod test_issue_754;
