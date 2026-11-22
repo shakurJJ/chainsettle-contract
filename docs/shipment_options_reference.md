@@ -22,6 +22,7 @@ This document provides a comprehensive reference for all fields in the `Shipment
   - [Multi-Supplier Consortium](#multi-supplier-consortium)
   - [Buyer Vault Funding](#buyer-vault-funding)
   - [Refund Recipient Override](#refund-recipient-override)
+- [Extended Options (`ShipmentOptionsExt`)](#extended-options-shipmentoptionsext)
 
 ---
 
@@ -564,6 +565,99 @@ Alternative address to receive refunds in place of the buyer.
 Bonus pool funded by the buyer, distributed to the supplier for early completion.
 
 **Use case:** Incentivize ahead-of-schedule delivery.
+
+---
+
+## Extended Options (`ShipmentOptionsExt`)
+
+`ShipmentOptions` is at the 40-field limit of a Soroban `#[contracttype]`
+struct, so newer creation options live in `ShipmentOptionsExt` and are passed
+to `create_shipment_ext`, which takes the same arguments as `create_shipment`
+plus `ext`. `ShipmentOptionsExt::default()` turns every option off, and the
+call then behaves exactly like `create_shipment`.
+
+### `perishable: bool` (#744)
+
+**Default:** `false`
+
+Marks the shipment as perishable. When the admin has set windows with
+`set_expedited_config`, its disputes run on the expedited track:
+
+- **Review window:** the proof review (auto-confirm) window is the shorter of
+  the standard window and `review_window_ledgers`. An explicit
+  `review_window_ledgers: Some(0)` opt-out still disables auto-confirmation.
+- **Evidence window:** `submit_dispute_evidence` is rejected with
+  `"evidence window closed"` once `evidence_window_ledgers` ledgers have passed
+  since the dispute opened.
+- **Resolution window:** `resolve_dispute_timeout` may run after the shorter of
+  the shipment's `dispute_timeout_seconds` and `resolution_timeout_seconds`.
+  If the shipment set no timeout, the expedited timeout applies with
+  `fallback_resolution` as the outcome.
+
+Pool-assigned arbiters (the pool sentinel, appeals and dispute panels) are
+drawn from arbiters who called `set_arbiter_expedited(arbiter, true)` first.
+Seats no expedited arbiter can fill fall back to the rest of the pool, so a
+dispute never goes unassigned. Without an expedited config, perishable
+shipments use the standard windows and only the routing applies.
+Non-perishable shipments are unaffected.
+
+### `po_reference: Option<String>` (#745)
+
+**Default:** `None`
+
+The buyer's purchase-order number, at most `MAX_PO_REFERENCE_LEN` (64) bytes
+and not empty. It must be unique for the primary buyer: a second shipment with
+the same PO for the same buyer is rejected with
+`"duplicate po_reference for buyer"`. Different buyers may reuse a PO.
+
+- `get_shipment_by_po(buyer, po_reference)` returns the shipment, or `None`
+  for an unknown PO.
+- `get_shipment_po_reference(shipment_id)` returns the PO attached to a
+  shipment.
+
+A PO stays bound to its shipment after cancellation or completion.
+
+### `refund_to_vault: bool` (#746)
+
+**Default:** `false`
+
+Credits refunds to the refund recipient's vault balance (see
+`fund_from_vault`) instead of transferring tokens. Buyers can opt in for all
+their shipments with `set_buyer_profile(buyer, BuyerProfile { refund_to_vault:
+true })`. Vault-funded shipments are routed the same way.
+
+It applies to every buyer refund: buyer and supplier cancellation, deadline
+refunds, blacklisted-supplier cancellation, holdback refunds on cancellation,
+and the buyer side of dispute outcomes (arbiter, split, panel, mediation and
+timeout resolutions, returned dispute bonds, grade refunds and warranty
+claims). Late-penalty and early-bonus returns on normal completion are not
+refunds and are still transferred. The `shipment_cancelled` and
+`dispute_resolved` events carry a `to_vault` flag. The tokens stay in the
+contract and are counted in `TotalVaulted`, so they remain withdrawable with
+`vault_withdraw`.
+
+### `fee_bearer: FeeBearer` (#750)
+
+**Default:** `FeeBearer::Supplier`
+
+Who pays the protocol fee when the shipment uses a fee token. When the admin
+has called `set_fee_token(token, rate_source)`, every shipment created
+afterwards locks those terms in (`get_shipment_fee_token`). At each release
+the escrow-token fee is converted, either with the `set_conversion_rate`
+route (`FeeRateSource::ConversionRate`) or with oracle prices
+(`FeeRateSource::Oracle`), and pulled from the bearer with `transfer_from`.
+The supplier then gets the gross escrow payout.
+
+- The bearer must `approve` the contract for the fee token. A missing
+  allowance or balance fails with `"insufficient fee token allowance"` /
+  `"insufficient fee token balance"` before any payout.
+- With `ConversionRate`, creation fails with
+  `"fee token conversion rate not configured"` if no route exists from the
+  escrow token.
+- Shipments created before `set_fee_token`, or after `clear_fee_token`, keep
+  deducting fees from the escrow token. The fee goes to the `FeeConfig`
+  treasury. Fee-recipient splits and the clean-completion rebate apply only
+  to escrow-token fees.
 
 ---
 

@@ -279,6 +279,7 @@ mod contract_prop_tests {
             env,
             Milestone {
                 name: String::from_str(env, "M0"),
+                token: None,
                 payment_percent: 50,
                 proof_hash: String::from_str(env, ""),
                 status: MilestoneStatus::Pending,
@@ -291,6 +292,7 @@ mod contract_prop_tests {
             },
             Milestone {
                 name: String::from_str(env, "M1"),
+                token: None,
                 payment_percent: 50,
                 proof_hash: String::from_str(env, ""),
                 status: MilestoneStatus::Pending,
@@ -679,6 +681,7 @@ mod milestone_percent_fuzz {
         fn milestone(env: &Env, name: &str, pct: u32) -> Milestone {
             Milestone {
                 name: String::from_str(env, name),
+                token: None,
                 payment_percent: pct,
                 proof_hash: String::from_str(env, ""),
                 status: MilestoneStatus::Pending,

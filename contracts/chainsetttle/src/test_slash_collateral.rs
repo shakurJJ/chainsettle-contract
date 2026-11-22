@@ -24,6 +24,7 @@ fn milestone_with_deadline(env: &soroban_sdk::Env, deadline: u32) -> Vec<Milesto
         env,
         Milestone {
             name: String::from_str(env, "Dispatch"),
+            token: None,
             payment_percent: 100,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,

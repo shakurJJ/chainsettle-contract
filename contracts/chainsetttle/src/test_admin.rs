@@ -160,6 +160,7 @@ fn test_min_milestone_percent_accepts_threshold() {
         &t.env,
         Milestone {
             name: String::from_str(&t.env, "Goods Dispatched"),
+            token: None,
             payment_percent: 5,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
@@ -171,6 +172,7 @@ fn test_min_milestone_percent_accepts_threshold() {
         },
         Milestone {
             name: String::from_str(&t.env, "In Transit"),
+            token: None,
             payment_percent: 45,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
@@ -182,6 +184,7 @@ fn test_min_milestone_percent_accepts_threshold() {
         },
         Milestone {
             name: String::from_str(&t.env, "Delivered"),
+            token: None,
             payment_percent: 50,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
@@ -222,6 +225,7 @@ fn test_min_milestone_percent_rejects_below_threshold() {
         &t.env,
         Milestone {
             name: String::from_str(&t.env, "Goods Dispatched"),
+            token: None,
             payment_percent: 4,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
@@ -233,6 +237,7 @@ fn test_min_milestone_percent_rejects_below_threshold() {
         },
         Milestone {
             name: String::from_str(&t.env, "In Transit"),
+            token: None,
             payment_percent: 46,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
@@ -244,6 +249,7 @@ fn test_min_milestone_percent_rejects_below_threshold() {
         },
         Milestone {
             name: String::from_str(&t.env, "Delivered"),
+            token: None,
             payment_percent: 50,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
@@ -281,6 +287,7 @@ fn test_min_milestone_percent_updates_via_admin() {
         &t.env,
         Milestone {
             name: String::from_str(&t.env, "Goods Dispatched"),
+            token: None,
             payment_percent: 10,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
@@ -292,6 +299,7 @@ fn test_min_milestone_percent_updates_via_admin() {
         },
         Milestone {
             name: String::from_str(&t.env, "In Transit"),
+            token: None,
             payment_percent: 40,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
@@ -303,6 +311,7 @@ fn test_min_milestone_percent_updates_via_admin() {
         },
         Milestone {
             name: String::from_str(&t.env, "Delivered"),
+            token: None,
             payment_percent: 50,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
