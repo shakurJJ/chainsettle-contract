@@ -573,6 +573,14 @@ pub struct ReturnRequest {
     pub proof_hash: Option<BytesN<32>>,
 }
 
+/// #736 – A retried `create_shipment_auto_id` maps back to its original ID.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct IdempotencyRecord {
+    pub shipment_id: String,
+    pub params_hash: BytesN<32>,
+}
+
 /// #744: Admin-configured windows for perishable shipments. A window only
 /// shortens the standard one: it applies when the shipment's own window is
 /// disabled or longer.
@@ -1988,6 +1996,12 @@ pub enum DataKeyExt6 {
     // ── #735 Goods return (RMA) flow ───────────────────────────────────────
     /// Return request for (shipment_id, milestone_index).
     ReturnRequest(String, u32),
+
+    // -- #736 Idempotent auto-ID shipment creation --
+    /// (buyer, idempotency key) -> original record.
+    IdempotencyKey(Address, String),
+    /// Ledger window before an idempotency key expires.
+    IdempotencyTtlLedgers,
 }
 
 /// #743 – Review state of a self-submitted arbiter application.
@@ -2297,6 +2311,8 @@ pub enum ChainSettleError {
     ReturnNotAccepted = 24,
     /// Return proof has not been submitted yet.
     ReturnProofMissing = 25,
+    /// Same idempotency key reused with different creation parameters.
+    IdempotencyParamsMismatch = 26,
 }
 
 // ============================================================
@@ -18658,7 +18674,33 @@ impl ChainSettleContract {
         total_amount: i128,
         milestones: Vec<Milestone>,
         options: ShipmentOptions,
+        idempotency_key: Option<String>,
     ) -> String {
+        // A retried call with the same key and identical parameters returns the
+        // original shipment instead of funding a duplicate.
+        let idem = if let Some(ref key) = idempotency_key {
+            let buyer = buyers.get(0).unwrap_or_else(|| panic!("no buyer supplied"));
+            let fingerprint = Self::idempotency_fingerprint(
+                &env, &buyers, &supplier, &logistics, &arbiter, &token,
+                total_amount, &milestones, &options,
+            );
+            let ikey = DataKeyExt6::IdempotencyKey(buyer, key.clone());
+            if let Some(record) =
+                env.storage().persistent().get::<DataKeyExt6, IdempotencyRecord>(&ikey)
+            {
+                if record.params_hash != fingerprint {
+                    soroban_sdk::panic_with_error!(
+                        &env,
+                        ChainSettleError::IdempotencyParamsMismatch
+                    );
+                }
+                return record.shipment_id;
+            }
+            Some((ikey, fingerprint, key.clone()))
+        } else {
+            None
+        };
+
         let count: u64 = env
             .storage()
             .instance()
@@ -18671,7 +18713,7 @@ impl ChainSettleContract {
 
         let auto_id = Self::format_auto_id(&env, next_count);
         Self::create_shipment(
-            env,
+            env.clone(),
             auto_id.clone(),
             buyers,
             supplier,
@@ -18682,7 +18724,69 @@ impl ChainSettleContract {
             milestones,
             options,
         );
+
+        if let Some((ikey, fingerprint, key)) = idem {
+            let ttl: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKeyExt6::IdempotencyTtlLedgers)
+                .unwrap_or(constants::TTL_INITIAL_LEDGERS);
+            env.storage().persistent().set(
+                &ikey,
+                &IdempotencyRecord {
+                    shipment_id: auto_id.clone(),
+                    params_hash: fingerprint,
+                },
+            );
+            env.storage().persistent().extend_ttl(&ikey, ttl, ttl);
+            env.events().publish(
+                (Symbol::new(&env, "shipment_idempotency_recorded"), auto_id.clone()),
+                key,
+            );
+        }
         auto_id
+    }
+
+    /// Stable hash of all creation parameters, used to detect key reuse with
+    /// different parameters.
+    fn idempotency_fingerprint(
+        env: &Env,
+        buyers: &Vec<Address>,
+        supplier: &Address,
+        logistics: &Address,
+        arbiter: &Address,
+        token: &Address,
+        total_amount: i128,
+        milestones: &Vec<Milestone>,
+        options: &ShipmentOptions,
+    ) -> BytesN<32> {
+        let params: Val = (
+            buyers.clone(),
+            supplier.clone(),
+            logistics.clone(),
+            arbiter.clone(),
+            token.clone(),
+            total_amount,
+            milestones.clone(),
+            options.clone(),
+        )
+            .into_val(env);
+        let xdr = soroban_sdk::xdr::ToXdr::to_xdr(&params, env);
+        env.crypto().sha256(&xdr)
+    }
+
+    /// Admin configures the ledger window for which idempotency keys live.
+    pub fn set_idempotency_ttl(env: Env, admin: Address, ledgers: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        if ledgers == 0 {
+            panic!("idempotency ttl must be positive");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKeyExt6::IdempotencyTtlLedgers, &ledgers);
+        env.events()
+            .publish((Symbol::new(&env, "idempotency_ttl_set"),), ledgers);
     }
 
     // ----------------------------------------------------------
@@ -27753,3 +27857,6 @@ mod test_issue_749;
 
 #[cfg(test)]
 mod test_issue_735;
+
+#[cfg(test)]
+mod test_issue_736;
