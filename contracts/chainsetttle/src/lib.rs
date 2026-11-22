@@ -605,6 +605,16 @@ pub struct InspectionRecord {
     pub signed_ledger: u32,
 }
 
+// ── #757 Payout-time compliance registry ─────────────────────────────────────
+mod compliance_registry {
+    use soroban_sdk::{contractclient, Address, Env};
+    #[contractclient(name = "ComplianceRegistryClient")]
+    pub trait ComplianceRegistry {
+        fn is_flagged(env: Env, party: Address) -> bool;
+    }
+}
+pub use compliance_registry::ComplianceRegistryClient;
+
 // ── #558 Price Oracle Client & Depeg Guard Config ────────────────────────────
 mod price_oracle {
     use soroban_sdk::{contractclient, Address, Env};
@@ -1936,7 +1946,14 @@ pub enum DataKeyExt5 {
     /// Current BOL holder for a shipment.
     BolHolder(String),
     /// Append-only endorsement history for a shipment.
-    BolEndorsements(String),}
+    BolEndorsements(String),
+
+    // ── #757 Payout-time compliance re-check ──────────────────────────────
+    /// Admin toggle for payout-time compliance checks.
+    PayoutComplianceEnabled,
+    /// External compliance registry contract address.
+    PayoutComplianceRegistry,
+}
 
 /// #758 – A single negotiable BOL endorsement record.
 #[contracttype]
@@ -12191,6 +12208,8 @@ impl ChainSettleContract {
         };
         let grade_refund = gross - payment;
 
+        // #757: re-check compliance before releasing funds.
+        Self::check_payout_compliance(&env, &mut shipment, &shipment_id, milestone_index);
 
         // Deduct any approved advance for this milestone.
         let advance_deducted =
@@ -15540,6 +15559,8 @@ impl ChainSettleContract {
         let mut fee_amount: i128 = 0;
         let net_payment = Self::deduct_fee(&env, payment, &shipment.token, &shipment_id, &mut fee_amount);
 
+        // #757: re-check compliance before releasing funds.
+        Self::check_payout_compliance(&env, &mut shipment, &shipment_id, milestone_index);
         // Check circuit breaker before transferring payment
         Self::check_circuit_breaker(&env, payment);
         Self::check_address_outflow(&env, &shipment.supplier, payment);
@@ -19417,6 +19438,23 @@ impl ChainSettleContract {
             .has(&DataKeyExt2::ComplianceHold(shipment_id))
     }
 
+    /// #757: Enable or disable payout-time compliance re-checks.
+    pub fn set_payout_compliance_enabled(env: Env, admin: Address, enabled: bool) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKeyExt5::PayoutComplianceEnabled, &enabled);
+    }
+
+    /// #757: Set the external compliance registry used for payout-time checks.
+    pub fn set_payout_compliance_registry(env: Env, admin: Address, registry: Address) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKeyExt5::PayoutComplianceRegistry, &registry);
+    }
 
     fn assert_shipment_not_on_hold(env: &Env, shipment_id: &String) {
         if env
@@ -19425,6 +19463,70 @@ impl ChainSettleContract {
             .has(&DataKeyExt2::ComplianceHold(shipment_id.clone()))
         {
             panic!("shipment is on compliance hold pending review");
+        }
+    }
+
+    fn check_payout_compliance(
+        env: &Env,
+        shipment: &mut Shipment,
+        shipment_id: &String,
+        milestone_index: u32,
+    ) {
+        let enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt5::PayoutComplianceEnabled)
+            .unwrap_or(false);
+        if !enabled {
+            return;
+        }
+        let registry: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt5::PayoutComplianceRegistry);
+        let Some(registry) = registry else {
+            return;
+        };
+        let client = ComplianceRegistryClient::new(env, &registry);
+        let mut parties: Vec<Address> = Vec::new(env);
+        parties.push_back(shipment.supplier.clone());
+        parties.push_back(shipment.logistics.clone());
+        for b in shipment.buyers.iter() {
+            parties.push_back(b);
+        }
+        for party in parties.iter() {
+            if client.is_flagged(&party) {
+                // Apply compliance hold and move milestone to held state.
+                let hold_key = DataKeyExt2::ComplianceHold(shipment_id.clone());
+                let reason = BytesN::from_array(env, &[0u8; 32]);
+                env.storage().persistent().set(&hold_key, &reason);
+                env.storage().persistent().extend_ttl(
+                    &hold_key,
+                    constants::TTL_INITIAL_LEDGERS,
+                    constants::TTL_MAX_LEDGERS,
+                );
+
+                let mut milestone = shipment.milestones.get(milestone_index).unwrap();
+                milestone.status = MilestoneStatus::ConfirmedHeld;
+                if milestone.release_after_ledger < env.ledger().sequence() {
+                    milestone.release_after_ledger = env.ledger().sequence();
+                }
+                shipment.milestones.set(milestone_index, milestone);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Shipment(shipment_id.clone()), shipment);
+                env.storage().persistent().extend_ttl(
+                    &DataKey::Shipment(shipment_id.clone()),
+                    constants::TTL_INITIAL_LEDGERS,
+                    constants::TTL_MAX_LEDGERS,
+                );
+
+                env.events().publish(
+                    (Symbol::new(env, "payout_blocked"), shipment_id.clone()),
+                    (milestone_index, party),
+                );
+                panic!("payout blocked: compliance check failed");
+            }
         }
     }
 
@@ -27035,3 +27137,6 @@ mod test_issue_749;
 
 #[cfg(test)]
 mod test_bol_endorsement;
+
+#[cfg(test)]
+mod test_payout_compliance;
