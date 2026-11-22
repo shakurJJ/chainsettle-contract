@@ -1829,6 +1829,9 @@ pub enum DataKeyExt5 {
     AwardHashThreshold,
     /// Immutable content hash of the written award for a resolved dispute.
     DisputeAwardHash(String, u32),
+    // ── #739 Quantity tolerance band ─────────────────────────────────────
+    /// Optional +/- tolerance in basis points for a shipment's quantity band.
+    QuantityToleranceBps(String),
 }
 
 /// #743 – Review state of a self-submitted arbiter application.
@@ -23354,7 +23357,87 @@ impl ChainSettleContract {
     ///
     /// Only a registered buyer may confirm quantities. Unavailable for shipments
     /// with a holdback, joint confirmation, or an approved advance on the milestone.
+    /// #739: Configure the +/- tolerance band (basis points) for quantity
+    /// confirmations on an active shipment. 0 (the default) keeps the exact
+    /// pro-rata behaviour of #518.
+    pub fn set_quantity_tolerance_bps(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        tolerance_bps: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if !Self::is_buyer(&shipment, &buyer) {
+            panic!("unauthorized");
+        }
+        if tolerance_bps > 1_000 {
+            panic!("tolerance exceeds maximum");
+        }
+        if env.storage().persistent().has(
+            &DataKeyExt3::PartialQtyReleased(shipment_id.clone(), 0),
+        ) {
+            panic!("tolerance cannot change after quantity confirmation");
+        }
+        buyer.require_auth();
+        let key = DataKeyExt5::QuantityToleranceBps(shipment_id.clone());
+        if tolerance_bps == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            Self::set_persistent5(&env, &key, &tolerance_bps);
+        }
+        env.events().publish(
+            (Symbol::new(&env, "quantity_tolerance_set"), shipment_id),
+            tolerance_bps,
+        );
+    }
+
+    /// Read the shipment's quantity tolerance (0 = disabled).
+    pub fn get_quantity_tolerance_bps(env: Env, shipment_id: String) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::QuantityToleranceBps(shipment_id))
+            .unwrap_or(0)
+    }
+
     pub fn confirm_partial_quantity(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        delivered_qty: u32,
+    ) {
+        Self::confirm_partial_quantity_internal(
+            env,
+            buyer,
+            shipment_id,
+            milestone_index,
+            delivered_qty,
+        );
+    }
+
+    /// Quantity confirmation variant for a shipment whose buyer has topped up
+    /// escrow to cover an over-delivery within the tolerance band.
+    pub fn confirm_qty_with_top_up(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        delivered_qty: u32,
+    ) {
+        Self::confirm_partial_quantity_internal(
+            env,
+            buyer,
+            shipment_id,
+            milestone_index,
+            delivered_qty,
+        );
+    }
+
+    fn confirm_partial_quantity_internal(
         env: Env,
         buyer: Address,
         shipment_id: String,
@@ -23408,24 +23491,37 @@ impl ChainSettleContract {
 
         let qty_key = DataKeyExt3::DeliveredQuantity(shipment_id.clone(), milestone_index);
         let previous: u32 = env.storage().persistent().get(&qty_key).unwrap_or(0);
-        if delivered_qty > expected - previous {
+        let tolerance_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt5::QuantityToleranceBps(shipment_id.clone()))
+            .unwrap_or(0);
+        let band = ((expected as u64 * tolerance_bps as u64) / 10_000) as u32;
+        let lower = expected.saturating_sub(band);
+        let upper = expected.saturating_add(band);
+        if delivered_qty > upper.saturating_sub(previous) {
             panic!("delivered quantity exceeds remaining quantity");
         }
         let cumulative = previous + delivered_qty;
+        // Within the band counts as a full delivery. Any over-delivery is
+        // covered by the buyer's escrow top-up (top_up_escrow) when used.
+        let within_band = tolerance_bps > 0 && cumulative >= lower && cumulative <= upper;
+        let recorded_qty = if within_band { expected } else { cumulative };
 
         let full_gross = Self::milestone_full_gross_payment(&env, &shipment, milestone_index);
         let released_key = DataKeyExt3::PartialQtyReleased(shipment_id.clone(), milestone_index);
         let released_before: i128 = env.storage().persistent().get(&released_key).unwrap_or(0);
 
-        env.storage().persistent().set(&qty_key, &cumulative);
+        env.storage().persistent().set(&qty_key, &recorded_qty);
         env.storage().persistent().extend_ttl(
             &qty_key,
             constants::TTL_INITIAL_LEDGERS,
             constants::TTL_MAX_LEDGERS,
         );
 
-        if cumulative == expected {
-            // Final unit: `milestone_gross_payment` now returns exactly the unreleased
+        if within_band || cumulative == expected {
+            // Full delivery (including a near-complete one inside the band):
+            // `milestone_gross_payment` returns exactly the unreleased
             // remainder, so confirm_milestone pays it (with fees) and completes the milestone.
             let release = full_gross - released_before;
             Self::confirm_milestone(
@@ -23449,7 +23545,7 @@ impl ChainSettleContract {
                 &env,
                 &shipment_id,
                 milestone_index,
-                (delivered_qty, cumulative, expected),
+                (delivered_qty, recorded_qty, expected),
                 release,
                 0,
             );
@@ -25875,6 +25971,7 @@ impl ChainSettleContract {
 
 pub mod constants;
 mod storage;
+mod test_quantity_tolerance;
 mod test_dispute_award;
 mod test_arbiter_application;
 mod test_arbiter_pool;
