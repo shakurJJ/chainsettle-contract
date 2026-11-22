@@ -1,7 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, IntoVal, Map,
+    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
+    IntoVal, Map,
     String, Symbol, Val, Vec,
 };
 
@@ -1898,12 +1899,31 @@ pub enum DataKeyExt5 {
     /// Pending mutual-consent proposal to set a milestone's not-before ledger.
     MilestoneNotBeforeProposal(String, u32),
     AutoConfirmWarningFired(String, u32),
+
     Organization(Address),
     OrgMember(Address, Address),
     OrgShipment(String),
     OrgShipmentMember(String),
     OrgBuyerAuthOverride(Address),
 
+    // ── #743 Arbiter self-application queue ──────────────────────────────
+    /// Stake required from self-applicants: (token, amount). Absent = disabled.
+    ArbiterApplicationStake,
+    /// Application record keyed by applicant address.
+    ArbiterApplication(Address),
+    // ── #741 Written arbitration award hashes ────────────────────────────
+    /// Minimum disputed value (token units) requiring a written award hash.
+    AwardHashThreshold,
+    /// Immutable content hash of the written award for a resolved dispute.
+    DisputeAwardHash(String, u32),
+    // ── #739 Quantity tolerance band ─────────────────────────────────────
+    /// Optional +/- tolerance in basis points for a shipment's quantity band.
+    QuantityToleranceBps(String),
+    // ── #737 Relayer-submitted signed confirmations ──────────────────────
+    /// Buyer's registered ed25519 public key for confirmation payloads.
+    ConfirmationKey(Address),
+    /// Consumed confirmation nonce (buyer, nonce).
+    ConfirmationNonce(Address, u64),
     // ── #744 Expedited dispute track for perishable shipments ─────────────
     /// Admin-configured expedited windows (`ExpeditedConfig`).
     ExpeditedConfig,
@@ -1931,6 +1951,25 @@ pub enum DataKeyExt5 {
     ShipmentFeeToken(String),
     /// Fee bearer for the shipment (absent = `FeeBearer::Supplier`).
     ShipmentFeeBearer(String),
+}
+
+/// #743 – Review state of a self-submitted arbiter application.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub enum ApplicationStatus {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+/// #743 – On-chain record of a prospective arbiter's application.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct ArbiterApplication {
+    pub applicant: Address,
+    pub profile_hash: BytesN<32>,
+    pub status: ApplicationStatus,
+    pub submitted_ledger: u32,
 }
 
 /// #621 – Pending proposal to append a milestone to an active shipment.
@@ -7292,6 +7331,287 @@ impl ChainSettleContract {
             .instance()
             .get::<Symbol, Vec<Address>>(&pool_key)
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // ----------------------------------------------------------
+    // #737 RELAYER-SUBMITTED SIGNED CONFIRMATIONS
+    // ----------------------------------------------------------
+
+    /// Register (or replace) the ed25519 public key used to authorize
+    /// relayer-submitted milestone confirmations.
+    pub fn register_confirmation_key(env: Env, buyer: Address, pubkey: BytesN<32>) {
+        buyer.require_auth();
+        let key = DataKeyExt5::ConfirmationKey(buyer.clone());
+        Self::set_persistent5(&env, &key, &pubkey);
+        env.events().publish(
+            (Symbol::new(&env, "confirmation_key_registered"), buyer),
+            pubkey,
+        );
+    }
+
+    /// Revoke the confirmation key. Has no effect if none is registered.
+    pub fn revoke_confirmation_key(env: Env, buyer: Address) {
+        buyer.require_auth();
+        let key = DataKeyExt5::ConfirmationKey(buyer.clone());
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (Symbol::new(&env, "confirmation_key_revoked"), buyer),
+            (),
+        );
+    }
+
+    /// Deterministic payload: domain prefix, shipment id, milestone index,
+    /// nonce and expiry ledger.
+    fn confirmation_payload(
+        env: &Env,
+        shipment_id: &String,
+        milestone_index: u32,
+        nonce: u64,
+        expiry_ledger: u32,
+    ) -> Bytes {
+        let mut payload = Bytes::new(env);
+        payload.extend_from_array(b"chainsettle-confirm-v1");
+        let mut id_bytes = [0u8; 64];
+        shipment_id.copy_into_slice(&mut id_bytes[..shipment_id.len() as usize]);
+        payload.extend_from_array(&shipment_id.len().to_be_bytes());
+        payload.append(&Bytes::from_array(env, &id_bytes));
+        payload.extend_from_array(&milestone_index.to_be_bytes());
+        payload.extend_from_array(&nonce.to_be_bytes());
+        payload.extend_from_array(&expiry_ledger.to_be_bytes());
+        payload
+    }
+
+    /// Submit a buyer-signed confirmation from any relayer. The buyer's
+    /// ed25519 signature replaces an on-ledger buyer authorization for this
+    /// one call; nonces and expiry ledgers prevent replay.
+    pub fn confirm_milestone_signed(
+        env: Env,
+        relayer: Address,
+        buyer: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        nonce: u64,
+        expiry_ledger: u32,
+        signature: BytesN<64>,
+    ) {
+        relayer.require_auth();
+        if env.ledger().sequence() > expiry_ledger {
+            panic!("signature expired");
+        }
+        let pubkey: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt5::ConfirmationKey(buyer.clone()))
+            .unwrap_or_else(|| panic!("confirmation key not registered"));
+        let payload = Self::confirmation_payload(
+            &env,
+            &shipment_id,
+            milestone_index,
+            nonce,
+            expiry_ledger,
+        );
+        env.crypto().ed25519_verify(&pubkey, &payload, &signature);
+
+        let nonce_key = DataKeyExt5::ConfirmationNonce(buyer.clone(), nonce);
+        if env.storage().persistent().has(&nonce_key) {
+            panic!("nonce already used");
+        }
+        Self::set_persistent5(&env, &nonce_key, &true);
+
+        // One-shot override consumed by confirm_milestone's buyer auth check.
+        env.storage().instance().set(
+            &DataKeyExt5::OrgBuyerAuthOverride(buyer.clone()),
+            &true,
+        );
+        Self::confirm_milestone(env.clone(), buyer.clone(), shipment_id.clone(), milestone_index);
+        env.events().publish(
+            (Symbol::new(&env, "milestone_confirmation_relayed"), shipment_id),
+            (relayer, buyer, milestone_index, nonce),
+        );
+    }
+
+    // ----------------------------------------------------------
+    // #743 SELF-APPLICATION QUEUE WITH ADMIN APPROVAL
+    // ----------------------------------------------------------
+
+    /// Configure the stake an applicant must lock when applying. A zero
+    /// amount disables the lock (backwards-compatible default).
+    pub fn set_arbiter_application_stake(env: Env, admin: Address, token: Address, amount: i128) {
+        admin.require_auth();
+        Self::assert_role(&env, &admin, Role::ArbiterManager);
+        if amount < 0 {
+            panic!("amount must not be negative");
+        }
+        env.storage().instance().set(
+            &DataKeyExt5::ArbiterApplicationStake,
+            &(token.clone(), amount),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "arbiter_application_stake_set"),),
+            (token, amount),
+        );
+    }
+
+    /// Apply to join the arbiter pool. The required stake is locked in the
+    /// contract using the existing arbiter-stake account; approval leaves it
+    /// locked, rejection refunds it.
+    pub fn apply_to_arbiter_pool(env: Env, applicant: Address, profile_hash: BytesN<32>) {
+        applicant.require_auth();
+        if Self::is_arbiter_slashed(env.clone(), applicant.clone())
+            || Self::is_blacklisted(env.clone(), applicant.clone())
+        {
+            panic!("arbiter is not eligible to apply");
+        }
+        if Self::get_arbiter_pool(env.clone()).contains(&applicant) {
+            panic!("arbiter already in pool");
+        }
+        let key = DataKeyExt5::ArbiterApplication(applicant.clone());
+        if env.storage().persistent().has(&key) {
+            panic!("application already exists");
+        }
+
+        let (token, amount): (Address, i128) = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt5::ArbiterApplicationStake)
+            .unwrap_or_else(|| (env.current_contract_address(), 0));
+        if amount > 0 {
+            token::Client::new(&env, &token).transfer(
+                &applicant,
+                &env.current_contract_address(),
+                &amount,
+            );
+            Self::deposit_arbiter_stake_internal(&env, &applicant, &token, amount);
+        }
+
+        let application = ArbiterApplication {
+            applicant: applicant.clone(),
+            profile_hash,
+            status: ApplicationStatus::Pending,
+            submitted_ledger: env.ledger().sequence(),
+        };
+        Self::set_persistent5(&env, &key, &application);
+        let list_key = Symbol::new(&env, "arbiter_applications");
+        let mut list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get::<Symbol, Vec<Address>>(&list_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        list.push_back(applicant.clone());
+        env.storage().instance().set(&list_key, &list);
+        env.events().publish(
+            (Symbol::new(&env, "arbiter_application_submitted"), applicant),
+            (application.submitted_ledger, amount),
+        );
+    }
+
+    /// Admin decision on a pending application. Approval adds the applicant
+    /// to the pool; rejection refunds the locked application stake.
+    pub fn review_arbiter_application(env: Env, admin: Address, applicant: Address, approve: bool) {
+        admin.require_auth();
+        Self::assert_role(&env, &admin, Role::ArbiterManager);
+        let key = DataKeyExt5::ArbiterApplication(applicant.clone());
+        let mut application: ArbiterApplication = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("application not found"));
+        if application.status != ApplicationStatus::Pending {
+            panic!("application already reviewed");
+        }
+
+        let (token, amount): (Address, i128) = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt5::ArbiterApplicationStake)
+            .unwrap_or_else(|| (env.current_contract_address(), 0));
+        if approve {
+            let pool_key = Symbol::new(&env, "arbiters_pool");
+            let mut pool: Vec<Address> = env
+                .storage()
+                .instance()
+                .get::<Symbol, Vec<Address>>(&pool_key)
+                .unwrap_or_else(|| Vec::new(&env));
+            if !pool.contains(&applicant) {
+                pool.push_back(applicant.clone());
+                env.storage().instance().set(&pool_key, &pool);
+            }
+            application.status = ApplicationStatus::Approved;
+            env.events().publish(
+                (Symbol::new(&env, "arbiter_application_reviewed"), applicant.clone()),
+                (true, amount),
+            );
+        } else {
+            if amount > 0 {
+                let stake_key = DataKeyExt4::ArbiterStake(applicant.clone());
+                let (stake_token, staked): (Address, i128) = env
+                    .storage()
+                    .persistent()
+                    .get(&stake_key)
+                    .unwrap_or((token.clone(), 0));
+                if staked < amount {
+                    panic!("insufficient locked stake");
+                }
+                let refund = if stake_token == token { amount } else { staked };
+                token::Client::new(&env, &token)
+                    .transfer(&env.current_contract_address(), &applicant, &refund);
+                env.storage()
+                    .persistent()
+                    .set(&stake_key, &(stake_token, staked - refund));
+            }
+            application.status = ApplicationStatus::Rejected;
+            env.events().publish(
+                (Symbol::new(&env, "arbiter_application_reviewed"), applicant.clone()),
+                (false, amount),
+            );
+        }
+        Self::set_persistent5(&env, &key, &application);
+        Self::append_admin_action(
+            &env,
+            Symbol::new(&env, "review_arbiter_application"),
+            Symbol::new(&env, "arbiter_application_reviewed"),
+        );
+    }
+
+    /// Read one application, if the address has applied.
+    pub fn get_arbiter_application(env: Env, applicant: Address) -> Option<ArbiterApplication> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::ArbiterApplication(applicant))
+    }
+
+    /// Cursor/limit page over applications in submission order.
+    pub fn get_arbiter_applications(
+        env: Env,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> Vec<ArbiterApplication> {
+        let list_key = Symbol::new(&env, "arbiter_applications");
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get::<Symbol, Vec<Address>>(&list_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let clamped_limit = if limit > constants::LIST_SHIPMENTS_MAX_PAGE {
+            constants::LIST_SHIPMENTS_MAX_PAGE
+        } else {
+            limit
+        };
+        let start = cursor.unwrap_or(0);
+        let mut idx = start;
+        let mut result: Vec<ArbiterApplication> = Vec::new(&env);
+        while idx < list.len() && (result.len() as u32) < clamped_limit {
+            let applicant = list.get(idx).unwrap();
+            idx += 1;
+            if let Some(application) = env
+                .storage()
+                .persistent()
+                .get::<DataKeyExt5, ArbiterApplication>(&DataKeyExt5::ArbiterApplication(applicant))
+            {
+                result.push_back(application);
+            }
+        }
+        result
     }
 
     // ----------------------------------------------------------
@@ -13067,6 +13387,68 @@ impl ChainSettleContract {
         }
         applicable_bps
     }
+    /// #741: Set the disputed-value threshold above which a written award
+    /// hash is mandatory. Zero (the default) keeps the feature disabled.
+    pub fn set_award_hash_threshold(env: Env, admin: Address, threshold: i128) {
+        admin.require_auth();
+        Self::assert_role(&env, &admin, Role::ArbiterManager);
+        if threshold < 0 {
+            panic!("threshold must not be negative");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKeyExt5::AwardHashThreshold, &threshold);
+        env.events().publish(
+            (Symbol::new(&env, "award_hash_threshold_set"),),
+            threshold,
+        );
+    }
+
+    /// Attach an award hash after resolution. Once set it cannot be changed.
+    pub fn attach_dispute_award_hash(
+        env: Env,
+        arbiter: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        hash: BytesN<32>,
+    ) {
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        Self::require_arbiter_auth(&shipment, &arbiter);
+        if !env.storage().persistent().has(
+            &DataKeyExt2::DisputeResolvedAtLedger(shipment_id.clone(), milestone_index),
+        ) {
+            panic!("dispute is not resolved");
+        }
+        let key = DataKeyExt5::DisputeAwardHash(shipment_id.clone(), milestone_index);
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt5, BytesN<32>>(&key)
+        {
+            if existing != hash {
+                panic!("award hash is immutable after resolution");
+            }
+            return;
+        }
+        Self::set_persistent5(&env, &key, &hash);
+        env.events().publish(
+            (Symbol::new(&env, "dispute_award_attached"), shipment_id),
+            (milestone_index, hash),
+        );
+    }
+
+    /// #741: Written award hash for a resolved dispute, if any.
+    pub fn get_dispute_award(
+        env: Env,
+        shipment_id: String,
+        milestone_index: u32,
+    ) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::DisputeAwardHash(shipment_id, milestone_index))
+    }
+
+    /// Resolve a dispute without a written award (allowed below the configured threshold).
     pub fn resolve_dispute(
         env: Env,
         arbiter: Address,
@@ -13074,6 +13456,47 @@ impl ChainSettleContract {
         milestone_index: u32,
         approve: bool,
         reason: Option<ResolutionReason>,
+    ) {
+        Self::resolve_dispute_internal(
+            env,
+            arbiter,
+            shipment_id,
+            milestone_index,
+            approve,
+            reason,
+            None,
+        );
+    }
+
+    /// #741: Resolve a dispute with an optional content hash of the written award.
+    pub fn resolve_dispute_with_award(
+        env: Env,
+        arbiter: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        approve: bool,
+        reason: Option<ResolutionReason>,
+        award_hash: Option<BytesN<32>>,
+    ) {
+        Self::resolve_dispute_internal(
+            env,
+            arbiter,
+            shipment_id,
+            milestone_index,
+            approve,
+            reason,
+            award_hash,
+        );
+    }
+
+    fn resolve_dispute_internal(
+        env: Env,
+        arbiter: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        approve: bool,
+        reason: Option<ResolutionReason>,
+        award_hash: Option<BytesN<32>>,
     ) {
         Self::assert_operation_not_paused(&env, Symbol::new(&env, "dispute"));
 
@@ -13089,6 +13512,19 @@ impl ChainSettleContract {
 
         if shipment.status != ShipmentStatus::Active {
             panic!("shipment is not active");
+        }
+        // #741: High-value disputes must carry a written award hash.
+        let award_threshold: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt5::AwardHashThreshold)
+            .unwrap_or(0);
+        if award_threshold > 0
+            && Self::milestone_full_gross_payment(&env, &shipment, milestone_index)
+                >= award_threshold
+            && award_hash.is_none()
+        {
+            panic!("award hash required for high-value dispute");
         }
         // #740: A consolidated ruling already authorized the arbiter once for
         // this frame (Soroban rejects a second require_auth); check identity only.
@@ -13414,6 +13850,20 @@ impl ChainSettleContract {
             &DataKeyExt2::DisputeResolutionReason(shipment_id.clone(), milestone_index),
             &reason,
         );
+        if let Some(hash) = award_hash.clone() {
+            let award_key = DataKeyExt5::DisputeAwardHash(shipment_id.clone(), milestone_index);
+            if let Some(existing) = env
+                .storage()
+                .persistent()
+                .get::<DataKeyExt5, BytesN<32>>(&award_key)
+            {
+                if existing != hash {
+                    panic!("award hash is immutable after resolution");
+                }
+            } else {
+                Self::set_persistent5(&env, &award_key, &hash);
+            }
+        }
 
         // Appeal fee: refund if the appeal ruled for the appellant, else pay the appeal arbiter.
         Self::settle_appeal_fee(&env, &shipment, &shipment_id, milestone_index, approve);
@@ -17806,6 +18256,26 @@ impl ChainSettleContract {
         env.events().publish(
             (Symbol::new(&env, "arbiter_stake_deposited"), arbiter),
             (token, amount, new_amt),
+        );
+    }
+
+    fn deposit_arbiter_stake_internal(env: &Env, arbiter: &Address, token: &Address, amount: i128) {
+        let key = DataKeyExt4::ArbiterStake(arbiter.clone());
+        let (existing_token, existing_amt): (Address, i128) = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or((token.clone(), 0i128));
+        if existing_amt > 0 && existing_token != *token {
+            panic!("arbiter stake token mismatch");
+        }
+        env.storage()
+            .persistent()
+            .set(&key, &(token.clone(), existing_amt + amount));
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
         );
     }
 
@@ -24194,7 +24664,87 @@ impl ChainSettleContract {
     ///
     /// Only a registered buyer may confirm quantities. Unavailable for shipments
     /// with a holdback, joint confirmation, or an approved advance on the milestone.
+    /// #739: Configure the +/- tolerance band (basis points) for quantity
+    /// confirmations on an active shipment. 0 (the default) keeps the exact
+    /// pro-rata behaviour of #518.
+    pub fn set_quantity_tolerance_bps(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        tolerance_bps: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if !Self::is_buyer(&shipment, &buyer) {
+            panic!("unauthorized");
+        }
+        if tolerance_bps > 1_000 {
+            panic!("tolerance exceeds maximum");
+        }
+        if env.storage().persistent().has(
+            &DataKeyExt3::PartialQtyReleased(shipment_id.clone(), 0),
+        ) {
+            panic!("tolerance cannot change after quantity confirmation");
+        }
+        buyer.require_auth();
+        let key = DataKeyExt5::QuantityToleranceBps(shipment_id.clone());
+        if tolerance_bps == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            Self::set_persistent5(&env, &key, &tolerance_bps);
+        }
+        env.events().publish(
+            (Symbol::new(&env, "quantity_tolerance_set"), shipment_id),
+            tolerance_bps,
+        );
+    }
+
+    /// Read the shipment's quantity tolerance (0 = disabled).
+    pub fn get_quantity_tolerance_bps(env: Env, shipment_id: String) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::QuantityToleranceBps(shipment_id))
+            .unwrap_or(0)
+    }
+
     pub fn confirm_partial_quantity(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        delivered_qty: u32,
+    ) {
+        Self::confirm_partial_quantity_internal(
+            env,
+            buyer,
+            shipment_id,
+            milestone_index,
+            delivered_qty,
+        );
+    }
+
+    /// Quantity confirmation variant for a shipment whose buyer has topped up
+    /// escrow to cover an over-delivery within the tolerance band.
+    pub fn confirm_qty_with_top_up(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        delivered_qty: u32,
+    ) {
+        Self::confirm_partial_quantity_internal(
+            env,
+            buyer,
+            shipment_id,
+            milestone_index,
+            delivered_qty,
+        );
+    }
+
+    fn confirm_partial_quantity_internal(
         env: Env,
         buyer: Address,
         shipment_id: String,
@@ -24248,24 +24798,37 @@ impl ChainSettleContract {
 
         let qty_key = DataKeyExt3::DeliveredQuantity(shipment_id.clone(), milestone_index);
         let previous: u32 = env.storage().persistent().get(&qty_key).unwrap_or(0);
-        if delivered_qty > expected - previous {
+        let tolerance_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt5::QuantityToleranceBps(shipment_id.clone()))
+            .unwrap_or(0);
+        let band = ((expected as u64 * tolerance_bps as u64) / 10_000) as u32;
+        let lower = expected.saturating_sub(band);
+        let upper = expected.saturating_add(band);
+        if delivered_qty > upper.saturating_sub(previous) {
             panic!("delivered quantity exceeds remaining quantity");
         }
         let cumulative = previous + delivered_qty;
+        // Within the band counts as a full delivery. Any over-delivery is
+        // covered by the buyer's escrow top-up (top_up_escrow) when used.
+        let within_band = tolerance_bps > 0 && cumulative >= lower && cumulative <= upper;
+        let recorded_qty = if within_band { expected } else { cumulative };
 
         let full_gross = Self::milestone_full_gross_payment(&env, &shipment, milestone_index);
         let released_key = DataKeyExt3::PartialQtyReleased(shipment_id.clone(), milestone_index);
         let released_before: i128 = env.storage().persistent().get(&released_key).unwrap_or(0);
 
-        env.storage().persistent().set(&qty_key, &cumulative);
+        env.storage().persistent().set(&qty_key, &recorded_qty);
         env.storage().persistent().extend_ttl(
             &qty_key,
             constants::TTL_INITIAL_LEDGERS,
             constants::TTL_MAX_LEDGERS,
         );
 
-        if cumulative == expected {
-            // Final unit: `milestone_gross_payment` now returns exactly the unreleased
+        if within_band || cumulative == expected {
+            // Full delivery (including a near-complete one inside the band):
+            // `milestone_gross_payment` returns exactly the unreleased
             // remainder, so confirm_milestone pays it (with fees) and completes the milestone.
             let release = full_gross - released_before;
             Self::confirm_milestone(
@@ -24289,7 +24852,7 @@ impl ChainSettleContract {
                 &env,
                 &shipment_id,
                 milestone_index,
-                (delivered_qty, cumulative, expected),
+                (delivered_qty, recorded_qty, expected),
                 release,
                 0,
             );
@@ -26732,6 +27295,10 @@ impl ChainSettleContract {
 
 pub mod constants;
 mod storage;
+mod test_signed_confirmation;
+mod test_quantity_tolerance;
+mod test_dispute_award;
+mod test_arbiter_application;
 mod test_arbiter_pool;
 mod test_arbiter_slashing;
 mod test_cancellation_reason;
