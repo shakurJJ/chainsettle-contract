@@ -1,7 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, IntoVal, Map,
+    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
+    IntoVal, Map,
     String, Symbol, Val, Vec,
 };
 
@@ -1832,6 +1833,11 @@ pub enum DataKeyExt5 {
     // ── #739 Quantity tolerance band ─────────────────────────────────────
     /// Optional +/- tolerance in basis points for a shipment's quantity band.
     QuantityToleranceBps(String),
+    // ── #737 Relayer-submitted signed confirmations ──────────────────────
+    /// Buyer's registered ed25519 public key for confirmation payloads.
+    ConfirmationKey(Address),
+    /// Consumed confirmation nonce (buyer, nonce).
+    ConfirmationNonce(Address, u64),
 }
 
 /// #743 – Review state of a self-submitted arbiter application.
@@ -7140,6 +7146,103 @@ impl ChainSettleContract {
             .instance()
             .get::<Symbol, Vec<Address>>(&pool_key)
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // ----------------------------------------------------------
+    // #737 RELAYER-SUBMITTED SIGNED CONFIRMATIONS
+    // ----------------------------------------------------------
+
+    /// Register (or replace) the ed25519 public key used to authorize
+    /// relayer-submitted milestone confirmations.
+    pub fn register_confirmation_key(env: Env, buyer: Address, pubkey: BytesN<32>) {
+        buyer.require_auth();
+        let key = DataKeyExt5::ConfirmationKey(buyer.clone());
+        Self::set_persistent5(&env, &key, &pubkey);
+        env.events().publish(
+            (Symbol::new(&env, "confirmation_key_registered"), buyer),
+            pubkey,
+        );
+    }
+
+    /// Revoke the confirmation key. Has no effect if none is registered.
+    pub fn revoke_confirmation_key(env: Env, buyer: Address) {
+        buyer.require_auth();
+        let key = DataKeyExt5::ConfirmationKey(buyer.clone());
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (Symbol::new(&env, "confirmation_key_revoked"), buyer),
+            (),
+        );
+    }
+
+    /// Deterministic payload: domain prefix, shipment id, milestone index,
+    /// nonce and expiry ledger.
+    fn confirmation_payload(
+        env: &Env,
+        shipment_id: &String,
+        milestone_index: u32,
+        nonce: u64,
+        expiry_ledger: u32,
+    ) -> Bytes {
+        let mut payload = Bytes::new(env);
+        payload.extend_from_array(b"chainsettle-confirm-v1");
+        let mut id_bytes = [0u8; 64];
+        shipment_id.copy_into_slice(&mut id_bytes[..shipment_id.len() as usize]);
+        payload.extend_from_array(&shipment_id.len().to_be_bytes());
+        payload.append(&Bytes::from_array(env, &id_bytes));
+        payload.extend_from_array(&milestone_index.to_be_bytes());
+        payload.extend_from_array(&nonce.to_be_bytes());
+        payload.extend_from_array(&expiry_ledger.to_be_bytes());
+        payload
+    }
+
+    /// Submit a buyer-signed confirmation from any relayer. The buyer's
+    /// ed25519 signature replaces an on-ledger buyer authorization for this
+    /// one call; nonces and expiry ledgers prevent replay.
+    pub fn confirm_milestone_signed(
+        env: Env,
+        relayer: Address,
+        buyer: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        nonce: u64,
+        expiry_ledger: u32,
+        signature: BytesN<64>,
+    ) {
+        relayer.require_auth();
+        if env.ledger().sequence() > expiry_ledger {
+            panic!("signature expired");
+        }
+        let pubkey: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt5::ConfirmationKey(buyer.clone()))
+            .unwrap_or_else(|| panic!("confirmation key not registered"));
+        let payload = Self::confirmation_payload(
+            &env,
+            &shipment_id,
+            milestone_index,
+            nonce,
+            expiry_ledger,
+        );
+        env.crypto().ed25519_verify(&pubkey, &payload, &signature);
+
+        let nonce_key = DataKeyExt5::ConfirmationNonce(buyer.clone(), nonce);
+        if env.storage().persistent().has(&nonce_key) {
+            panic!("nonce already used");
+        }
+        Self::set_persistent5(&env, &nonce_key, &true);
+
+        // One-shot override consumed by confirm_milestone's buyer auth check.
+        env.storage().instance().set(
+            &DataKeyExt5::OrgBuyerAuthOverride(buyer.clone()),
+            &true,
+        );
+        Self::confirm_milestone(env.clone(), buyer.clone(), shipment_id.clone(), milestone_index);
+        env.events().publish(
+            (Symbol::new(&env, "milestone_confirmation_relayed"), shipment_id),
+            (relayer, buyer, milestone_index, nonce),
+        );
     }
 
     // ----------------------------------------------------------
@@ -25971,6 +26074,7 @@ impl ChainSettleContract {
 
 pub mod constants;
 mod storage;
+mod test_signed_confirmation;
 mod test_quantity_tolerance;
 mod test_dispute_award;
 mod test_arbiter_application;
