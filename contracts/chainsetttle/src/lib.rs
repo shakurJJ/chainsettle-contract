@@ -538,6 +538,11 @@ pub struct ShipmentOptionsExt {
     /// Optional price escalator applied when a milestone is confirmed.
     /// None keeps fixed escrow amounts (backwards compatible).
     pub price_adjustment: Option<PriceAdjustmentClause>,
+
+    // -- #733 Required trade-document sets --
+    /// Per-milestone checklist that must be satisfied before confirmation.
+    /// None keeps the existing hash-only behaviour.
+    pub required_documents: Option<Vec<DocumentRequirement>>,
 }
 
 impl Default for ShipmentOptionsExt {
@@ -548,6 +553,7 @@ impl Default for ShipmentOptionsExt {
             refund_to_vault: false,
             fee_bearer: FeeBearer::Supplier,
             price_adjustment: None,
+            required_documents: None,
         }
     }
 }
@@ -577,6 +583,24 @@ pub struct ReturnRequest {
     pub status: ReturnStatus,
     pub created_ledger: u32,
     pub proof_hash: Option<BytesN<32>>,
+}
+
+/// #733 – Typed trade documents that can gate milestone confirmation.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DocumentType {
+    Invoice,
+    BillOfLading,
+    PackingList,
+    CertificateOfOrigin,
+}
+
+/// #733 – Documents required for one milestone of a shipment.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct DocumentRequirement {
+    pub milestone_index: u32,
+    pub doc_types: Vec<DocumentType>,
 }
 
 /// #732 – Optional commodity price escalator for unpaid milestones.
@@ -2028,6 +2052,12 @@ pub enum DataKeyExt6 {
     PriceAdjustment(String),
     /// Unused buyer top-up for (shipment_id, milestone_index).
     PriceTopUp(String, u32),
+
+    // -- #733 Required trade-document sets --
+    /// Required document types for (shipment_id, milestone_index).
+    RequiredDocuments(String, u32),
+    /// Attached document hash for (shipment_id, milestone_index, doc_type).
+    AttachedDocument(String, u32, DocumentType),
 }
 
 /// #743 – Review state of a self-submitted arbiter application.
@@ -2345,6 +2375,8 @@ pub enum ChainSettleError {
     PriceAdjustmentOutOfBand = 28,
     /// Upward adjustment is blocked until the buyer tops up the escrow.
     PriceAdjustmentUnderfunded = 29,
+    /// A required trade document has not been attached yet.
+    RequiredDocumentsMissing = 30,
 }
 
 // ============================================================
@@ -8369,6 +8401,18 @@ impl ChainSettleContract {
     }
 
     fn apply_shipment_options_ext(env: &Env, shipment_id: &String, ext: &ShipmentOptionsExt) {
+        if let Some(ref requirements) = ext.required_documents {
+            for requirement in requirements.iter() {
+                Self::set_persistent6(
+                    env,
+                    &DataKeyExt6::RequiredDocuments(
+                        shipment_id.clone(),
+                        requirement.milestone_index,
+                    ),
+                    &requirement.doc_types,
+                );
+            }
+        }
         if let Some(ref clause) = ext.price_adjustment {
             if clause.base_price <= 0 || clause.max_down_bps >= 10_000 {
                 soroban_sdk::panic_with_error!(env, ChainSettleError::InvalidPriceAdjustmentClause);
@@ -8410,6 +8454,7 @@ impl ChainSettleContract {
                 ext.refund_to_vault,
                 ext.fee_bearer,
                 ext.price_adjustment.clone(),
+                ext.required_documents.clone(),
             ),
         );
     }
@@ -12023,6 +12068,9 @@ impl ChainSettleContract {
         if milestone.status != MilestoneStatus::ProofSubmitted {
             panic!("milestone proof not yet submitted");
         }
+
+        // #733: Letter-of-credit style document checklist gating confirmation.
+        Self::assert_required_documents(&env, &shipment_id, milestone_index);
 
         // #543: Inspected milestones require inspector sign-off before confirmation.
         Self::assert_inspection_complete(&env, &shipment_id, milestone_index);
@@ -18833,6 +18881,56 @@ impl ChainSettleContract {
             .set(&DataKeyExt6::IdempotencyTtlLedgers, &ledgers);
         env.events()
             .publish((Symbol::new(&env, "idempotency_ttl_set"),), ledgers);
+    }
+
+    // ----------------------------------------------------------
+    // #733 REQUIRED TRADE-DOCUMENT SETS
+    // ----------------------------------------------------------
+
+    /// Attach one typed trade document hash to a milestone. The existing
+    /// `attach_invoice_hash` / `attach_bol_hash` helpers remain unchanged.
+    pub fn attach_document(
+        env: Env,
+        caller: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        doc_type: DocumentType,
+        hash: BytesN<32>,
+    ) {
+        caller.require_auth();
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if milestone_index >= shipment.milestones.len() {
+            panic!("invalid milestone index");
+        }
+        let key = DataKeyExt6::AttachedDocument(
+            shipment_id.clone(),
+            milestone_index,
+            doc_type.clone(),
+        );
+        Self::set_persistent6(&env, &key, &hash);
+        env.events().publish(
+            (Symbol::new(&env, "document_attached"), shipment_id),
+            (milestone_index, doc_type, hash),
+        );
+    }
+
+    /// Panics with a typed error while any required document is missing.
+    fn assert_required_documents(env: &Env, shipment_id: &String, milestone_index: u32) {
+        let required: Option<Vec<DocumentType>> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt6::RequiredDocuments(shipment_id.clone(), milestone_index));
+        let Some(required) = required else { return; };
+        for doc_type in required.iter() {
+            let key = DataKeyExt6::AttachedDocument(
+                shipment_id.clone(),
+                milestone_index,
+                doc_type,
+            );
+            if !env.storage().persistent().has(&key) {
+                soroban_sdk::panic_with_error!(env, ChainSettleError::RequiredDocumentsMissing);
+            }
+        }
     }
 
     // ----------------------------------------------------------
@@ -27530,6 +27628,18 @@ impl ChainSettleContract {
     }
 
     fn apply_shipment_options_ext(env: &Env, shipment_id: &String, ext: &ShipmentOptionsExt) {
+        if let Some(ref requirements) = ext.required_documents {
+            for requirement in requirements.iter() {
+                Self::set_persistent6(
+                    env,
+                    &DataKeyExt6::RequiredDocuments(
+                        shipment_id.clone(),
+                        requirement.milestone_index,
+                    ),
+                    &requirement.doc_types,
+                );
+            }
+        }
         if let Some(ref clause) = ext.price_adjustment {
             if clause.base_price <= 0 || clause.max_down_bps >= 10_000 {
                 soroban_sdk::panic_with_error!(env, ChainSettleError::InvalidPriceAdjustmentClause);
@@ -28014,3 +28124,6 @@ mod test_issue_736;
 
 #[cfg(test)]
 mod test_issue_732;
+
+#[cfg(test)]
+mod test_issue_733;
