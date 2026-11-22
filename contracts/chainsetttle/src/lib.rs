@@ -1812,11 +1812,37 @@ pub enum DataKeyExt5 {
     /// Pending mutual-consent proposal to set a milestone's not-before ledger.
     MilestoneNotBeforeProposal(String, u32),
     AutoConfirmWarningFired(String, u32),
+
     Organization(Address),
     OrgMember(Address, Address),
     OrgShipment(String),
     OrgShipmentMember(String),
     OrgBuyerAuthOverride(Address),
+
+    // ── #743 Arbiter self-application queue ──────────────────────────────
+    /// Stake required from self-applicants: (token, amount). Absent = disabled.
+    ArbiterApplicationStake,
+    /// Application record keyed by applicant address.
+    ArbiterApplication(Address),
+}
+
+/// #743 – Review state of a self-submitted arbiter application.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub enum ApplicationStatus {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+/// #743 – On-chain record of a prospective arbiter's application.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct ArbiterApplication {
+    pub applicant: Address,
+    pub profile_hash: BytesN<32>,
+    pub status: ApplicationStatus,
+    pub submitted_ledger: u32,
 }
 
 /// #621 – Pending proposal to append a milestone to an active shipment.
@@ -7106,6 +7132,190 @@ impl ChainSettleContract {
             .instance()
             .get::<Symbol, Vec<Address>>(&pool_key)
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // ----------------------------------------------------------
+    // #743 SELF-APPLICATION QUEUE WITH ADMIN APPROVAL
+    // ----------------------------------------------------------
+
+    /// Configure the stake an applicant must lock when applying. A zero
+    /// amount disables the lock (backwards-compatible default).
+    pub fn set_arbiter_application_stake(env: Env, admin: Address, token: Address, amount: i128) {
+        admin.require_auth();
+        Self::assert_role(&env, &admin, Role::ArbiterManager);
+        if amount < 0 {
+            panic!("amount must not be negative");
+        }
+        env.storage().instance().set(
+            &DataKeyExt5::ArbiterApplicationStake,
+            &(token.clone(), amount),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "arbiter_application_stake_set"),),
+            (token, amount),
+        );
+    }
+
+    /// Apply to join the arbiter pool. The required stake is locked in the
+    /// contract using the existing arbiter-stake account; approval leaves it
+    /// locked, rejection refunds it.
+    pub fn apply_to_arbiter_pool(env: Env, applicant: Address, profile_hash: BytesN<32>) {
+        applicant.require_auth();
+        if Self::is_arbiter_slashed(env.clone(), applicant.clone())
+            || Self::is_blacklisted(env.clone(), applicant.clone())
+        {
+            panic!("arbiter is not eligible to apply");
+        }
+        if Self::get_arbiter_pool(env.clone()).contains(&applicant) {
+            panic!("arbiter already in pool");
+        }
+        let key = DataKeyExt5::ArbiterApplication(applicant.clone());
+        if env.storage().persistent().has(&key) {
+            panic!("application already exists");
+        }
+
+        let (token, amount): (Address, i128) = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt5::ArbiterApplicationStake)
+            .unwrap_or_else(|| (env.current_contract_address(), 0));
+        if amount > 0 {
+            token::Client::new(&env, &token).transfer(
+                &applicant,
+                &env.current_contract_address(),
+                &amount,
+            );
+            Self::deposit_arbiter_stake_internal(&env, &applicant, &token, amount);
+        }
+
+        let application = ArbiterApplication {
+            applicant: applicant.clone(),
+            profile_hash,
+            status: ApplicationStatus::Pending,
+            submitted_ledger: env.ledger().sequence(),
+        };
+        Self::set_persistent5(&env, &key, &application);
+        let list_key = Symbol::new(&env, "arbiter_applications");
+        let mut list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get::<Symbol, Vec<Address>>(&list_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        list.push_back(applicant.clone());
+        env.storage().instance().set(&list_key, &list);
+        env.events().publish(
+            (Symbol::new(&env, "arbiter_application_submitted"), applicant),
+            (application.submitted_ledger, amount),
+        );
+    }
+
+    /// Admin decision on a pending application. Approval adds the applicant
+    /// to the pool; rejection refunds the locked application stake.
+    pub fn review_arbiter_application(env: Env, admin: Address, applicant: Address, approve: bool) {
+        admin.require_auth();
+        Self::assert_role(&env, &admin, Role::ArbiterManager);
+        let key = DataKeyExt5::ArbiterApplication(applicant.clone());
+        let mut application: ArbiterApplication = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("application not found"));
+        if application.status != ApplicationStatus::Pending {
+            panic!("application already reviewed");
+        }
+
+        let (token, amount): (Address, i128) = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt5::ArbiterApplicationStake)
+            .unwrap_or_else(|| (env.current_contract_address(), 0));
+        if approve {
+            let pool_key = Symbol::new(&env, "arbiters_pool");
+            let mut pool: Vec<Address> = env
+                .storage()
+                .instance()
+                .get::<Symbol, Vec<Address>>(&pool_key)
+                .unwrap_or_else(|| Vec::new(&env));
+            if !pool.contains(&applicant) {
+                pool.push_back(applicant.clone());
+                env.storage().instance().set(&pool_key, &pool);
+            }
+            application.status = ApplicationStatus::Approved;
+            env.events().publish(
+                (Symbol::new(&env, "arbiter_application_reviewed"), applicant.clone()),
+                (true, amount),
+            );
+        } else {
+            if amount > 0 {
+                let stake_key = DataKeyExt4::ArbiterStake(applicant.clone());
+                let (stake_token, staked): (Address, i128) = env
+                    .storage()
+                    .persistent()
+                    .get(&stake_key)
+                    .unwrap_or((token.clone(), 0));
+                if staked < amount {
+                    panic!("insufficient locked stake");
+                }
+                let refund = if stake_token == token { amount } else { staked };
+                token::Client::new(&env, &token)
+                    .transfer(&env.current_contract_address(), &applicant, &refund);
+                env.storage()
+                    .persistent()
+                    .set(&stake_key, &(stake_token, staked - refund));
+            }
+            application.status = ApplicationStatus::Rejected;
+            env.events().publish(
+                (Symbol::new(&env, "arbiter_application_reviewed"), applicant.clone()),
+                (false, amount),
+            );
+        }
+        Self::set_persistent5(&env, &key, &application);
+        Self::append_admin_action(
+            &env,
+            Symbol::new(&env, "review_arbiter_application"),
+            Symbol::new(&env, "arbiter_application_reviewed"),
+        );
+    }
+
+    /// Read one application, if the address has applied.
+    pub fn get_arbiter_application(env: Env, applicant: Address) -> Option<ArbiterApplication> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::ArbiterApplication(applicant))
+    }
+
+    /// Cursor/limit page over applications in submission order.
+    pub fn get_arbiter_applications(
+        env: Env,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> Vec<ArbiterApplication> {
+        let list_key = Symbol::new(&env, "arbiter_applications");
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get::<Symbol, Vec<Address>>(&list_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let clamped_limit = if limit > constants::LIST_SHIPMENTS_MAX_PAGE {
+            constants::LIST_SHIPMENTS_MAX_PAGE
+        } else {
+            limit
+        };
+        let start = cursor.unwrap_or(0);
+        let mut idx = start;
+        let mut result: Vec<ArbiterApplication> = Vec::new(&env);
+        while idx < list.len() && (result.len() as u32) < clamped_limit {
+            let applicant = list.get(idx).unwrap();
+            idx += 1;
+            if let Some(application) = env
+                .storage()
+                .persistent()
+                .get::<DataKeyExt5, ArbiterApplication>(&DataKeyExt5::ArbiterApplication(applicant))
+            {
+                result.push_back(application);
+            }
+        }
+        result
     }
 
     // ----------------------------------------------------------
@@ -16822,6 +17032,26 @@ impl ChainSettleContract {
         );
     }
 
+    fn deposit_arbiter_stake_internal(env: &Env, arbiter: &Address, token: &Address, amount: i128) {
+        let key = DataKeyExt4::ArbiterStake(arbiter.clone());
+        let (existing_token, existing_amt): (Address, i128) = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or((token.clone(), 0i128));
+        if existing_amt > 0 && existing_token != *token {
+            panic!("arbiter stake token mismatch");
+        }
+        env.storage()
+            .persistent()
+            .set(&key, &(token.clone(), existing_amt + amount));
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
     /// Read the locked stake amount for `arbiter` (0 if none).
     pub fn get_arbiter_stake(env: Env, arbiter: Address) -> i128 {
         env.storage()
@@ -25510,6 +25740,7 @@ impl ChainSettleContract {
 
 pub mod constants;
 mod storage;
+mod test_arbiter_application;
 mod test_arbiter_pool;
 mod test_arbiter_slashing;
 mod test_cancellation_reason;
