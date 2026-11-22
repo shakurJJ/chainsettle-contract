@@ -1824,6 +1824,11 @@ pub enum DataKeyExt5 {
     ArbiterApplicationStake,
     /// Application record keyed by applicant address.
     ArbiterApplication(Address),
+    // ── #741 Written arbitration award hashes ────────────────────────────
+    /// Minimum disputed value (token units) requiring a written award hash.
+    AwardHashThreshold,
+    /// Immutable content hash of the written award for a resolved dispute.
+    DisputeAwardHash(String, u32),
 }
 
 /// #743 – Review state of a self-submitted arbiter application.
@@ -12334,6 +12339,68 @@ impl ChainSettleContract {
         }
         applicable_bps
     }
+    /// #741: Set the disputed-value threshold above which a written award
+    /// hash is mandatory. Zero (the default) keeps the feature disabled.
+    pub fn set_award_hash_threshold(env: Env, admin: Address, threshold: i128) {
+        admin.require_auth();
+        Self::assert_role(&env, &admin, Role::ArbiterManager);
+        if threshold < 0 {
+            panic!("threshold must not be negative");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKeyExt5::AwardHashThreshold, &threshold);
+        env.events().publish(
+            (Symbol::new(&env, "award_hash_threshold_set"),),
+            threshold,
+        );
+    }
+
+    /// Attach an award hash after resolution. Once set it cannot be changed.
+    pub fn attach_dispute_award_hash(
+        env: Env,
+        arbiter: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        hash: BytesN<32>,
+    ) {
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        Self::require_arbiter_auth(&shipment, &arbiter);
+        if !env.storage().persistent().has(
+            &DataKeyExt2::DisputeResolvedAtLedger(shipment_id.clone(), milestone_index),
+        ) {
+            panic!("dispute is not resolved");
+        }
+        let key = DataKeyExt5::DisputeAwardHash(shipment_id.clone(), milestone_index);
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt5, BytesN<32>>(&key)
+        {
+            if existing != hash {
+                panic!("award hash is immutable after resolution");
+            }
+            return;
+        }
+        Self::set_persistent5(&env, &key, &hash);
+        env.events().publish(
+            (Symbol::new(&env, "dispute_award_attached"), shipment_id),
+            (milestone_index, hash),
+        );
+    }
+
+    /// #741: Written award hash for a resolved dispute, if any.
+    pub fn get_dispute_award(
+        env: Env,
+        shipment_id: String,
+        milestone_index: u32,
+    ) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::DisputeAwardHash(shipment_id, milestone_index))
+    }
+
+    /// Resolve a dispute without a written award (allowed below the configured threshold).
     pub fn resolve_dispute(
         env: Env,
         arbiter: Address,
@@ -12341,6 +12408,47 @@ impl ChainSettleContract {
         milestone_index: u32,
         approve: bool,
         reason: Option<ResolutionReason>,
+    ) {
+        Self::resolve_dispute_internal(
+            env,
+            arbiter,
+            shipment_id,
+            milestone_index,
+            approve,
+            reason,
+            None,
+        );
+    }
+
+    /// #741: Resolve a dispute with an optional content hash of the written award.
+    pub fn resolve_dispute_with_award(
+        env: Env,
+        arbiter: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        approve: bool,
+        reason: Option<ResolutionReason>,
+        award_hash: Option<BytesN<32>>,
+    ) {
+        Self::resolve_dispute_internal(
+            env,
+            arbiter,
+            shipment_id,
+            milestone_index,
+            approve,
+            reason,
+            award_hash,
+        );
+    }
+
+    fn resolve_dispute_internal(
+        env: Env,
+        arbiter: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        approve: bool,
+        reason: Option<ResolutionReason>,
+        award_hash: Option<BytesN<32>>,
     ) {
         Self::assert_operation_not_paused(&env, Symbol::new(&env, "dispute"));
 
@@ -12356,6 +12464,19 @@ impl ChainSettleContract {
 
         if shipment.status != ShipmentStatus::Active {
             panic!("shipment is not active");
+        }
+        // #741: High-value disputes must carry a written award hash.
+        let award_threshold: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt5::AwardHashThreshold)
+            .unwrap_or(0);
+        if award_threshold > 0
+            && Self::milestone_full_gross_payment(&env, &shipment, milestone_index)
+                >= award_threshold
+            && award_hash.is_none()
+        {
+            panic!("award hash required for high-value dispute");
         }
         // #740: A consolidated ruling already authorized the arbiter once for
         // this frame (Soroban rejects a second require_auth); check identity only.
@@ -12689,6 +12810,20 @@ impl ChainSettleContract {
             &DataKeyExt2::DisputeResolutionReason(shipment_id.clone(), milestone_index),
             &reason,
         );
+        if let Some(hash) = award_hash.clone() {
+            let award_key = DataKeyExt5::DisputeAwardHash(shipment_id.clone(), milestone_index);
+            if let Some(existing) = env
+                .storage()
+                .persistent()
+                .get::<DataKeyExt5, BytesN<32>>(&award_key)
+            {
+                if existing != hash {
+                    panic!("award hash is immutable after resolution");
+                }
+            } else {
+                Self::set_persistent5(&env, &award_key, &hash);
+            }
+        }
 
         // Appeal fee: refund if the appeal ruled for the appellant, else pay the appeal arbiter.
         Self::settle_appeal_fee(&env, &shipment, &shipment_id, milestone_index, approve);
@@ -25740,6 +25875,7 @@ impl ChainSettleContract {
 
 pub mod constants;
 mod storage;
+mod test_dispute_award;
 mod test_arbiter_application;
 mod test_arbiter_pool;
 mod test_arbiter_slashing;
