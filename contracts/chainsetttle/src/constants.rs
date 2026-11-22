@@ -108,3 +108,6 @@ pub const MAX_METADATA_INDEX_VALUE_LEN: u32 = 128;
 
 /// Maximum shipment IDs held in a single (metadata key, value) index bucket (#662).
 pub const MAX_METADATA_INDEX_ENTRIES: u32 = 100;
+
+/// #745: Maximum byte length of a buyer purchase-order reference.
+pub const MAX_PO_REFERENCE_LEN: u32 = 64;
