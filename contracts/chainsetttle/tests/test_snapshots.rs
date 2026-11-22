@@ -57,6 +57,7 @@ struct SnapshotAuditEntry {
 #[derive(Serialize)]
 struct SnapshotMilestone {
     name: String,
+    token: None,
     payment_percent: u32,
     proof_hash: String,
     status: SnapshotMilestoneStatus,
@@ -119,6 +120,7 @@ impl SnapshotShipment {
                 .iter()
                 .map(|milestone| SnapshotMilestone {
                     name: milestone.name.to_string(),
+                    token: None,
                     payment_percent: milestone.payment_percent,
                     proof_hash: milestone.proof_hash.to_string(),
                     status: match milestone.status {
@@ -228,6 +230,7 @@ fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
         env,
         Milestone {
             name: SorobanString::from_str(env, "Goods Dispatched"),
+            token: None,
             payment_percent: 25,
             proof_hash: SorobanString::from_str(env, ""),
             status: MilestoneStatus::Pending,
@@ -240,6 +243,7 @@ fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
         },
         Milestone {
             name: SorobanString::from_str(env, "In Transit"),
+            token: None,
             payment_percent: 50,
             proof_hash: SorobanString::from_str(env, ""),
             status: MilestoneStatus::Pending,
@@ -252,6 +256,7 @@ fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
         },
         Milestone {
             name: SorobanString::from_str(env, "Delivered"),
+            token: None,
             payment_percent: 25,
             proof_hash: SorobanString::from_str(env, ""),
             status: MilestoneStatus::Pending,

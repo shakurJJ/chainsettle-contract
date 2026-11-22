@@ -18,6 +18,7 @@ const DEADLINE: u32 = 100;
 fn milestone(env: &Env, name: &str, deadline_ledger: u32) -> Milestone {
     Milestone {
         name: String::from_str(env, name),
+        token: None,
         payment_percent: 50,
         proof_hash: String::from_str(env, ""),
         status: MilestoneStatus::Pending,

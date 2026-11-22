@@ -65,6 +65,7 @@ fn build_single_milestone(env: &Env) -> Vec<Milestone> {
     let mut v = Vec::new(&env);
     v.push_back(Milestone {
         name: String::from_str(&env, "Delivery"),
+        token: None,
         payment_percent: 100,
         proof_hash: String::from_str(&env, ""),
         status: MilestoneStatus::Pending,
@@ -82,6 +83,7 @@ fn build_three_milestones(env: &Env) -> Vec<Milestone> {
     let mut v = Vec::new(&env);
     v.push_back(Milestone {
         name: String::from_str(&env, "Dispatch"),
+        token: None,
         payment_percent: 33,
         proof_hash: String::from_str(&env, ""),
         status: MilestoneStatus::Pending,
@@ -94,6 +96,7 @@ fn build_three_milestones(env: &Env) -> Vec<Milestone> {
     });
     v.push_back(Milestone {
         name: String::from_str(&env, "Transit"),
+        token: None,
         payment_percent: 33,
         proof_hash: String::from_str(&env, ""),
         status: MilestoneStatus::Pending,
@@ -106,6 +109,7 @@ fn build_three_milestones(env: &Env) -> Vec<Milestone> {
     });
     v.push_back(Milestone {
         name: String::from_str(&env, "Delivery"),
+        token: None,
         payment_percent: 34,
         proof_hash: String::from_str(&env, ""),
         status: MilestoneStatus::Pending,

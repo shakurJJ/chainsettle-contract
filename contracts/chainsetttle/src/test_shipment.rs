@@ -56,6 +56,7 @@ fn test_create_shipment_invalid_percentages() {
         &t.env,
         Milestone {
             name: String::from_str(&t.env, "Step 1"),
+            token: None,
             payment_percent: 30,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
@@ -68,6 +69,7 @@ fn test_create_shipment_invalid_percentages() {
         },
         Milestone {
             name: String::from_str(&t.env, "Step 2"),
+            token: None,
             payment_percent: 30,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
@@ -80,6 +82,7 @@ fn test_create_shipment_invalid_percentages() {
         },
         Milestone {
             name: String::from_str(&t.env, "Step 3"),
+            token: None,
             payment_percent: 30,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,

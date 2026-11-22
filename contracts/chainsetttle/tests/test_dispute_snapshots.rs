@@ -54,6 +54,7 @@ struct SnapshotShipment {
 #[derive(Serialize)]
 struct SnapshotMilestone {
     name: String,
+    token: None,
     payment_percent: u32,
     proof_hash: String,
     status: SnapshotMilestoneStatus,

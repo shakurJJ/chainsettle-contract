@@ -111,6 +111,7 @@ fn one_hundred_percent_milestone(env: &Env) -> soroban_sdk::Vec<Milestone> {
         env,
         Milestone {
             name: String::from_str(env, "Only"),
+            token: None,
             payment_percent: 100,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
@@ -155,6 +156,7 @@ fn build_ten_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
         };
         ms.push_back(Milestone {
             name,
+            token: None,
             payment_percent: 10,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,

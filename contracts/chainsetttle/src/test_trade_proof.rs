@@ -28,6 +28,7 @@ fn single_milestone(env: &soroban_sdk::Env) -> Vec<Milestone> {
         env,
         Milestone {
             name: String::from_str(env, "All"),
+            token: None,
             payment_percent: 100,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
@@ -46,6 +47,7 @@ fn two_milestones(env: &soroban_sdk::Env) -> Vec<Milestone> {
         env,
         Milestone {
             name: String::from_str(env, "A"),
+            token: None,
             payment_percent: 50,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
@@ -58,6 +60,7 @@ fn two_milestones(env: &soroban_sdk::Env) -> Vec<Milestone> {
         },
         Milestone {
             name: String::from_str(env, "B"),
+            token: None,
             payment_percent: 50,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,

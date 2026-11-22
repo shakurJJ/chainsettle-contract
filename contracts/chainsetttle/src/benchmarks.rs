@@ -82,6 +82,7 @@ fn build_milestones_n(env: &Env, count: u32) -> soroban_sdk::Vec<Milestone> {
 
         milestones.push_back(Milestone {
             name: SorobanString::from_str(env, &std::format!("Milestone {}", i + 1)),
+            token: None,
             payment_percent: percent,
             proof_hash: SorobanString::from_str(env, ""),
             status: MilestoneStatus::Pending,

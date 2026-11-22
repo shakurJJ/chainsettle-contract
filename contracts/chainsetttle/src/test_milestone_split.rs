@@ -19,6 +19,7 @@ fn split_parts(env: &Env, entries: &[(&str, u32)]) -> Vec<MilestoneSplitPart> {
     for (name, payment_percent) in entries {
         parts.push_back(MilestoneSplitPart {
             name: String::from_str(env, name),
+            token: None,
             payment_percent: *payment_percent,
         });
     }
