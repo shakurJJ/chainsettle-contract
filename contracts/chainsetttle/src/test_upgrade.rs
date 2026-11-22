@@ -33,6 +33,8 @@ fn two_milestone_vec(env: &Env) -> soroban_sdk::Vec<Milestone> {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+        
+            logistics: None,
         },
         Milestone {
             name: String::from_str(env, "Phase 2"),
@@ -45,6 +47,8 @@ fn two_milestone_vec(env: &Env) -> soroban_sdk::Vec<Milestone> {
             dispute_opened_ledger: None,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+        
+            logistics: None,
         },
     ]
 }

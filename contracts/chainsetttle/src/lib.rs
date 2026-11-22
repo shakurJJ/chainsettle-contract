@@ -156,6 +156,8 @@ pub struct Milestone {
     pub penalty_bps_per_ledger: u32,
     /// #749: Optional escrow token for this milestone; None = shipment token.
     pub token: Option<Address>,
+    /// #756: Optional logistics provider for this milestone; None = shipment logistics.
+    pub logistics: Option<Address>,
 }
 
 #[contracttype]
@@ -9172,6 +9174,18 @@ impl ChainSettleContract {
             DataKeyExt4::LogisticsShipments(logistics.clone()),
             &shipment_id,
         );
+        // #756: index per-milestone logistics carriers.
+        for i in 0..milestones.len() {
+            if let Some(ml) = milestones.get(i).unwrap().logistics.clone() {
+                if ml != logistics {
+                    Self::add_to_party_index(
+                        &env,
+                        DataKeyExt4::LogisticsShipments(ml),
+                        &shipment_id,
+                    );
+                }
+            }
+        }
 
         // Add to AllShipments list for pagination.
         let mut all_shipments: Vec<String> = env
@@ -9466,6 +9480,8 @@ impl ChainSettleContract {
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
             not_before_ledger: 0,
+        
+            logistics: None,
         });
         shipment.milestones = milestones;
         shipment.total_amount += amount;
@@ -10710,7 +10726,8 @@ impl ChainSettleContract {
         // pending proof; the milestone stays Pending until the other party attests.
         let dual_required = Self::requires_dual_attestation(&env, &shipment_id);
         if dual_required {
-            if caller != shipment.supplier && caller != shipment.logistics {
+            let milestone_logistics = Self::milestone_logistics(&shipment, milestone_index);
+            if caller != shipment.supplier && caller != milestone_logistics {
                 panic!("dual attestation requires supplier or logistics");
             }
             let pending_key = DataKeyExt3::PendingDualProof(shipment_id.clone(), milestone_index);
@@ -11948,7 +11965,7 @@ impl ChainSettleContract {
                     actual_transfer -= logistics_fee;
                     token_client.transfer(
                         &env.current_contract_address(),
-                        &shipment.logistics,
+                        &Self::milestone_logistics(&shipment, milestone_index),
                         &logistics_fee,
                     );
                 }
@@ -12242,7 +12259,7 @@ impl ChainSettleContract {
                 actual_transfer -= logistics_fee;
                 token_client.transfer(
                     &env.current_contract_address(),
-                    &shipment.logistics,
+                    &Self::milestone_logistics(&shipment, milestone_index),
                     &logistics_fee,
                 );
             }
@@ -15597,7 +15614,7 @@ impl ChainSettleContract {
                 actual_transfer -= logistics_fee;
                 token_client.transfer(
                     &env.current_contract_address(),
-                    &shipment.logistics,
+                    &Self::milestone_logistics(&shipment, milestone_index),
                     &logistics_fee,
                 );
             }
@@ -16909,7 +16926,8 @@ impl ChainSettleContract {
         if !Self::requires_dual_attestation(&env, &shipment_id) {
             panic!("dual attestation not required for this shipment");
         }
-        if caller != shipment.supplier && caller != shipment.logistics {
+        let milestone_logistics = Self::milestone_logistics(&shipment, milestone_index);
+        if caller != shipment.supplier && caller != milestone_logistics {
             panic!("unauthorized");
         }
 
@@ -24522,7 +24540,7 @@ impl ChainSettleContract {
                     actual_transfer -= logistics_fee;
                     token_client.transfer(
                         &env.current_contract_address(),
-                        &shipment.logistics,
+                        &Self::milestone_logistics(&shipment, milestone_index),
                         &logistics_fee,
                     );
                 }
@@ -24973,6 +24991,15 @@ impl ChainSettleContract {
 
     /// Designated-submitter check of `require_proof_submitter_auth`, without
     /// requiring auth (for callers that already authorized `caller`).
+    fn milestone_logistics(shipment: &Shipment, milestone_index: u32) -> Address {
+        if let Some(m) = shipment.milestones.get(milestone_index) {
+            if let Some(l) = m.logistics.clone() {
+                return l;
+            }
+        }
+        shipment.logistics.clone()
+    }
+
     fn assert_proof_submitter(
         env: &Env,
         shipment: &Shipment,
@@ -24993,8 +25020,11 @@ impl ChainSettleContract {
             .get::<_, Vec<Address>>(&DataKeyExt3::ProofSubmitters(shipment_id.clone()))
             .map(|s| !s.is_empty())
             .unwrap_or(false);
-        if !has_explicit_submitters && *caller == shipment.logistics {
-            return;
+        if !has_explicit_submitters {
+            let milestone_logistics = Self::milestone_logistics(shipment, milestone_index);
+            if *caller == milestone_logistics {
+                return;
+            }
         }
         panic!("unauthorized");
     }
@@ -27140,3 +27170,6 @@ mod test_bol_endorsement;
 
 #[cfg(test)]
 mod test_payout_compliance;
+
+#[cfg(test)]
+mod test_milestone_logistics;

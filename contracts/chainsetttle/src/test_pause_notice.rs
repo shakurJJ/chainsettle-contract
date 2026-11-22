@@ -21,6 +21,8 @@ fn milestone(env: &Env, pct: u32, deadline_ledger: u32) -> Milestone {
         penalty_bps_per_ledger: 0,
         not_before_ledger: 0,
     }
+
+        logistics: None,
 }
 
 /// Creates a two-milestone shipment whose milestones are due `first_in` and

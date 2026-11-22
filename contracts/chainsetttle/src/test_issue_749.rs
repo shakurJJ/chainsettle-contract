@@ -20,6 +20,8 @@ fn milestones(env: &Env) -> Vec<Milestone> {
             penalty_bps_per_ledger: 0,
             not_before_ledger: 0,
             token: None,
+        
+            logistics: None,
         },
         Milestone {
             name: String::from_str(env, "local freight"),
@@ -33,6 +35,8 @@ fn milestones(env: &Env) -> Vec<Milestone> {
             penalty_bps_per_ledger: 0,
             not_before_ledger: 0,
             token: None,
+        
+            logistics: None,
         },
     ]
 }

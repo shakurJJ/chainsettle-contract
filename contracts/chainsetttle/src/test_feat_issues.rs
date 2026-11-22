@@ -57,6 +57,8 @@ fn milestone_with_deadline(env: &Env, pct: u32, deadline_ledger: u32) -> Milesto
         penalty_bps_per_ledger: 0,
         not_before_ledger: 0,
     }
+
+        logistics: None,
 }
 
 fn open_resolve_appeal_overturn(

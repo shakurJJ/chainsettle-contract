@@ -45,6 +45,8 @@ fn test_min_shipment_value_default_zero_allows_any_amount() {
                 deadline_ledger: 0,
                 penalty_bps_per_ledger: 0,
                 not_before_ledger: 0,
+            
+                logistics: None,
             },
         ],
         &default_options(&t.env),
@@ -81,6 +83,8 @@ fn test_min_shipment_value_below_floor_panics() {
                 deadline_ledger: 0,
                 penalty_bps_per_ledger: 0,
                 not_before_ledger: 0,
+            
+                logistics: None,
             },
         ],
         &default_options(&t.env),

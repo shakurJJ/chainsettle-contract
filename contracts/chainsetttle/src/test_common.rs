@@ -77,6 +77,8 @@ pub fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
             not_before_ledger: 0,
+        
+            logistics: None,
         },
         Milestone {
             name: String::from_str(env, "In Transit"),
@@ -90,6 +92,8 @@ pub fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
             not_before_ledger: 0,
+        
+            logistics: None,
         },
         Milestone {
             name: String::from_str(env, "Delivered"),
@@ -103,6 +107,8 @@ pub fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
             not_before_ledger: 0,
+        
+            logistics: None,
         },
     ]
 }

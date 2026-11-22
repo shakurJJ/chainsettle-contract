@@ -74,6 +74,8 @@ fn milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
             penalty_bps_per_ledger: 0,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+        
+            logistics: None,
         },
         Milestone {
             name: String::from_str(env, "M1"),
@@ -88,6 +90,8 @@ fn milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
             penalty_bps_per_ledger: 0,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+        
+            logistics: None,
         },
     ]
 }
@@ -522,6 +526,8 @@ fn test_err_invalid_percentages_sum_not_100() {
             penalty_bps_per_ledger: 0,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+        
+            logistics: None,
         },
         Milestone {
             name: String::from_str(&t.env, "B"),
@@ -536,6 +542,8 @@ fn test_err_invalid_percentages_sum_not_100() {
             penalty_bps_per_ledger: 0,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+        
+            logistics: None,
         },
     ];
 
@@ -578,6 +586,8 @@ fn test_err_invalid_percentages_sum_over_100() {
             penalty_bps_per_ledger: 0,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+        
+            logistics: None,
         },
         Milestone {
             name: String::from_str(&t.env, "B"),
@@ -592,6 +602,8 @@ fn test_err_invalid_percentages_sum_over_100() {
             penalty_bps_per_ledger: 0,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+        
+            logistics: None,
         },
     ];
 
@@ -631,6 +643,8 @@ fn test_err_invalid_percentages_below_min_threshold() {
             penalty_bps_per_ledger: 0,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+        
+            logistics: None,
         },
         Milestone {
             name: String::from_str(&t.env, "Big"),
@@ -645,6 +659,8 @@ fn test_err_invalid_percentages_below_min_threshold() {
             penalty_bps_per_ledger: 0,
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
+        
+            logistics: None,
         },
     ];
 
