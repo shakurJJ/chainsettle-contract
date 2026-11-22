@@ -1817,6 +1817,12 @@ pub enum DataKeyExt5 {
     OrgShipment(String),
     OrgShipmentMember(String),
     OrgBuyerAuthOverride(Address),
+
+    // ── #755 Fixed-amount logistics payment schedule ──────────────────────
+    /// Per-milestone flat logistics amounts for a shipment.
+    FixedLogisticsAmounts(String),
+    /// Configuration staged before create_shipment (instance storage).
+    PendingFixedLogistics,
 }
 
 /// #621 – Pending proposal to append a milestone to an active shipment.
@@ -4112,6 +4118,7 @@ impl ChainSettleContract {
             milestone_suppliers: Vec::new(env),
             refund_recipient: None,
             require_encrypted_evidence: false,
+            logistics_amounts: Vec::new(&env),
         }
     }
 
@@ -7985,6 +7992,39 @@ impl ChainSettleContract {
 
         let min_pct = ctx.min_pct;
 
+        // #755: A staged fixed logistics schedule replaces the percentage fee.
+        let logistics_amounts: soroban_sdk::Vec<i128> = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt5::PendingFixedLogistics)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        env.storage()
+            .instance()
+            .remove(&DataKeyExt5::PendingFixedLogistics);
+        if !logistics_amounts.is_empty() {
+            if final_logistics_fee_bps > 0 || logistics_fee_bps > 0 {
+                panic!("cannot combine fixed logistics amounts with logistics_fee_bps");
+            }
+            if logistics_amounts.len() != milestones.len() {
+                panic!("logistics_amounts length must match milestones");
+            }
+            let mut logistics_total: i128 = 0;
+            for i in 0..logistics_amounts.len() {
+                let amount = logistics_amounts.get(i).unwrap();
+                if amount < 0 {
+                    panic!("logistics amounts cannot be negative");
+                }
+                logistics_total += amount;
+            }
+            if logistics_total > total_amount {
+                panic!("logistics schedule exceeds escrow");
+            }
+            env.storage().persistent().set(
+                &DataKeyExt5::FixedLogisticsAmounts(shipment_id.clone()),
+                &logistics_amounts,
+            );
+        }
+
         // #160: Validate milestone_splits when provided; otherwise fall back to payment_percent.
         if milestone_splits.len() > 0 {
             if milestone_splits.len() != milestones.len() {
@@ -10636,6 +10676,58 @@ impl ChainSettleContract {
     // CONFIRM MILESTONE (multi-sig)
     // ----------------------------------------------------------
 
+    /// #755: Stage a flat logistics schedule for the next shipment created by
+    /// this caller. Empty schedule (the default) leaves `logistics_fee_bps` in use.
+    pub fn set_fixed_logistics_amounts(env: Env, amounts: soroban_sdk::Vec<i128>) {
+        env.storage()
+            .instance()
+            .set(&DataKeyExt5::PendingFixedLogistics, &amounts);
+        env.events().publish(
+            (Symbol::new(&env, "fixed_logistics_scheduled"),),
+            amounts.len(),
+        );
+    }
+
+    /// #755: Transfer the configured flat logistics amount for `milestone_index`
+    /// and deduct it from the amount available to the supplier.
+    fn pay_fixed_logistics(
+        env: &Env,
+        shipment_id: &String,
+        milestone_index: u32,
+        token: &Address,
+        payment: &mut i128,
+    ) {
+        let amounts: soroban_sdk::Vec<i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt5::FixedLogisticsAmounts(shipment_id.clone()))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+        if milestone_index >= amounts.len() {
+            return;
+        }
+        let amount = amounts.get(milestone_index).unwrap();
+        if amount <= 0 || amount > *payment {
+            return;
+        }
+        let logistics = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Shipment>(&DataKey::Shipment(shipment_id.clone()))
+            .map(|sh| sh.logistics);
+        if let Some(logistics) = logistics {
+            token::Client::new(env, token).transfer(
+                &env.current_contract_address(),
+                &logistics,
+                &amount,
+            );
+            *payment -= amount;
+            env.events().publish(
+                (Symbol::new(env, "fixed_logistics_paid"), shipment_id.clone()),
+                (milestone_index, amount),
+            );
+        }
+    }
+
     pub fn confirm_milestone(env: Env, buyer: Address, shipment_id: String, milestone_index: u32) {
         env.storage()
             .instance()
@@ -10737,6 +10829,9 @@ impl ChainSettleContract {
 
         let gross_payment = Self::milestone_gross_payment(&env, &shipment, milestone_index);
         let mut payment = gross_payment;
+
+        // #755: Pay the flat logistics amount for this milestone at confirmation.
+        Self::pay_fixed_logistics(&env, &shipment_id, milestone_index, &shipment.token, &mut payment);
 
         // Apply late-delivery penalty based on deadline_ledger (0 = no deadline, no penalty).
         let mut penalty_deducted: i128 = 0;
@@ -25700,3 +25795,6 @@ pub const DISPUTE_HISTORY_MAX_ENTRIES: usize = 100;
 /// per `create_shipment` call (#652). Bounds the number of cross-contract
 /// calls so a single shipment cannot exhaust the instruction budget.
 pub const MAX_COMPLIANCE_PARTIES: u32 = 8;
+
+#[cfg(test)]
+mod test_issue_755;
