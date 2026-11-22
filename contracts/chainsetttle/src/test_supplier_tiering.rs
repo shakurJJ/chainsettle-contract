@@ -15,6 +15,7 @@ fn single_milestone(env: &Env) -> soroban_sdk::Vec<Milestone> {
         env,
         Milestone {
             name: String::from_str(env, "Delivery"),
+            token: None,
             payment_percent: 100,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,

@@ -35,6 +35,7 @@ fn test_min_shipment_value_default_zero_allows_any_amount() {
             &t.env,
             Milestone {
                 name: sid(&t.env, "M"),
+                token: None,
                 payment_percent: 100,
                 proof_hash: sid(&t.env, ""),
                 status: MilestoneStatus::Pending,
@@ -70,6 +71,7 @@ fn test_min_shipment_value_below_floor_panics() {
             &t.env,
             Milestone {
                 name: sid(&t.env, "M"),
+                token: None,
                 payment_percent: 100,
                 proof_hash: sid(&t.env, ""),
                 status: MilestoneStatus::Pending,

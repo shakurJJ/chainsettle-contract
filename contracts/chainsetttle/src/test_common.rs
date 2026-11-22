@@ -67,6 +67,7 @@ pub fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
         env,
         Milestone {
             name: String::from_str(env, "Goods Dispatched"),
+            token: None,
             payment_percent: 25,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
@@ -79,6 +80,7 @@ pub fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
         },
         Milestone {
             name: String::from_str(env, "In Transit"),
+            token: None,
             payment_percent: 50,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
@@ -91,6 +93,7 @@ pub fn build_milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
         },
         Milestone {
             name: String::from_str(env, "Delivered"),
+            token: None,
             payment_percent: 25,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,

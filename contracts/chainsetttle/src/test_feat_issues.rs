@@ -46,6 +46,7 @@ fn confirm_all_milestones(t: &TestSetup, client: &ChainSettleContractClient, id:
 fn milestone_with_deadline(env: &Env, pct: u32, deadline_ledger: u32) -> Milestone {
     Milestone {
         name: String::from_str(env, "M"),
+        token: None,
         payment_percent: pct,
         proof_hash: String::from_str(env, ""),
         status: MilestoneStatus::Pending,

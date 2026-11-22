@@ -154,6 +154,8 @@ pub struct Milestone {
     pub deadline_ledger: u32,
     /// Basis points penalty per overdue ledger past deadline_ledger (0 = use shipment-level or disabled).
     pub penalty_bps_per_ledger: u32,
+    /// #749: Optional escrow token for this milestone; None = shipment token.
+    pub token: Option<Address>,
 }
 
 #[contracttype]
@@ -1835,6 +1837,13 @@ pub enum DataKeyExt5 {
     PendingWithholdingRule(Symbol),
     /// Configured rule: (bps, tax authority).
     WithholdingRule(Symbol),
+    // ── #749 Per-milestone escrow tokens ────────────────────────────────────
+    /// Tokens staged for the next shipment's milestones (None = shipment token).
+    PendingMilestoneTokens,
+    /// Balance held in escrow for a shipment, per token.
+    MilestoneEscrow(String, Address),
+    /// All tokens used by a shipment (for complete refunds).
+    ShipmentTokens(String),
 }
 
 /// #621 – Pending proposal to append a milestone to an active shipment.
@@ -8009,6 +8018,19 @@ impl ChainSettleContract {
 
         let min_pct = ctx.min_pct;
 
+        // #749: apply staged per-milestone tokens (None = shipment token).
+        let milestone_tokens: soroban_sdk::Vec<Option<Address>> = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt5::PendingMilestoneTokens)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        env.storage()
+            .instance()
+            .remove(&DataKeyExt5::PendingMilestoneTokens);
+        if milestone_tokens.len() != 0 && milestone_tokens.len() != milestones.len() {
+            panic!("milestone_tokens length must match milestones");
+        }
+
         // #754: staged duties are funded in addition to the goods escrow and
         // excluded from all fee / percentage calculations.
         let duties_config: Option<(Address, i128)> = env
@@ -8127,13 +8149,78 @@ impl ChainSettleContract {
         Self::check_and_record_shipment_creation(&env, &supplier);
 
         let token_client = token::Client::new(&env, &token);
+        // #749: split funding across milestone tokens; goods escrow is reduced by
+        // the amount moved into alternative-token sub-accounts.
+        let mut alt_amounts: Vec<(Address, i128)> = Vec::new(&env);
+        let mut alt_total: i128 = 0;
+        if milestone_tokens.len() > 0 {
+            let mut used_tokens: Vec<Address> = Vec::new(&env);
+            used_tokens.push_back(token.clone());
+            for i in 0..milestones.len() {
+                if let Some(milestone_token) = milestone_tokens.get(i).unwrap() {
+                    if milestone_token == token {
+                        continue;
+                    }
+                    let percent = milestones.get(i).unwrap().payment_percent as i128;
+                    let amount = (total_amount * percent) / 100;
+                    if amount <= 0 {
+                        continue;
+                    }
+                    alt_total += amount;
+                    let mut found = false;
+                    for j in 0..used_tokens.len() {
+                        if used_tokens.get(j).unwrap() == milestone_token {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        used_tokens.push_back(milestone_token.clone());
+                    }
+                    let mut merged = false;
+                    for j in 0..alt_amounts.len() {
+                        if alt_amounts.get(j).unwrap().0 == milestone_token {
+                            let (t, old) = alt_amounts.get(j).unwrap();
+                            alt_amounts.set(j, (t, old + amount));
+                            merged = true;
+                            break;
+                        }
+                    }
+                    if !merged {
+                        alt_amounts.push_back((milestone_token, amount));
+                    }
+                }
+            }
+            if alt_total >= total_amount {
+                panic!("milestone token amounts exceed escrow");
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKeyExt5::ShipmentTokens(shipment_id.clone()), &used_tokens);
+            env.storage().persistent().set(
+                &DataKeyExt5::MilestoneEscrow(shipment_id.clone(), token.clone()),
+                &(total_amount - alt_total),
+            );
+            for j in 0..alt_amounts.len() {
+                let (alt_token, alt_amount) = alt_amounts.get(j).unwrap();
+                env.storage().persistent().set(
+                    &DataKeyExt5::MilestoneEscrow(shipment_id.clone(), alt_token.clone()),
+                    &alt_amount,
+                );
+                token::Client::new(&env, &alt_token).transfer(
+                    &primary_buyer,
+                    &env.current_contract_address(),
+                    &alt_amount,
+                );
+            }
+        }
         let fund_from_vault = options.fund_from_vault;
         let bond_total = if dispute_bond_amount > 0 {
             dispute_bond_amount * milestones.len() as i128
         } else {
             0
         };
-        let buyer_funding = total_amount
+        let buyer_funding = total_amount - alt_total
             + bond_total
             + if early_bonus_pool > 0 {
                 early_bonus_pool
@@ -8172,7 +8259,7 @@ impl ChainSettleContract {
             token_client.transfer(
                 &primary_buyer,
                 &env.current_contract_address(),
-                &total_amount,
+                &(total_amount - alt_total),
             );
             if bond_total > 0 {
                 token_client.transfer(
@@ -8234,6 +8321,9 @@ impl ChainSettleContract {
         for i in 0..milestones.len() {
             let mut m = milestones.get(i).unwrap();
             m.status = MilestoneStatus::Pending;
+            if milestone_tokens.len() > 0 {
+                m.token = milestone_tokens.get(i).unwrap();
+            }
             m.proof_hash = String::from_str(&env, "");
             m.release_after_ledger = 0;
             m.proof_submitted_ledger = None;
@@ -8827,6 +8917,7 @@ impl ChainSettleContract {
         }
         milestones.push_back(Milestone {
             name: proposal.name.clone(),
+            token: None,
             payment_percent: percents.get(new_index).unwrap(),
             proof_hash: String::from_str(&env, ""),
             status: MilestoneStatus::Pending,
@@ -10727,6 +10818,74 @@ impl ChainSettleContract {
     // CONFIRM MILESTONE (multi-sig)
     // ----------------------------------------------------------
 
+    /// #749: Stage per-milestone tokens for the next shipment. Empty or absent
+    /// means every milestone uses the shipment token (backwards compatible).
+    pub fn set_milestone_tokens(env: Env, tokens: soroban_sdk::Vec<Option<Address>>) {
+        env.storage()
+            .instance()
+            .set(&DataKeyExt5::PendingMilestoneTokens, &tokens);
+    }
+
+    /// #749: Read the token a milestone settles in.
+    pub fn get_milestone_token(
+        env: Env,
+        shipment_id: String,
+        milestone_index: u32,
+    ) -> Option<Address> {
+        let shipment: Shipment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Shipment(shipment_id))
+            .unwrap_or_else(|| panic!("shipment not found"));
+        shipment
+            .milestones
+            .get(milestone_index)
+            .and_then(|m| m.token.clone())
+            .or(Some(shipment.token))
+    }
+
+    pub fn get_milestone_escrow(env: Env, shipment_id: String, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::MilestoneEscrow(shipment_id, token))
+            .unwrap_or(0)
+    }
+
+    /// #749: Reduce the per-token escrow balance as a milestone pays out.
+    fn consume_milestone_escrow(env: &Env, shipment_id: &String, token: &Address, amount: i128) {
+        let key = DataKeyExt5::MilestoneEscrow(shipment_id.clone(), token.clone());
+        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&key, &((balance - amount).max(0)));
+    }
+
+    /// #749: Refund every per-token escrow balance on cancellation.
+    fn refund_milestone_escrow(
+        env: &Env,
+        shipment_id: &String,
+        recipient: &Address,
+    ) {
+        let tokens: soroban_sdk::Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt5::ShipmentTokens(shipment_id.clone()))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+        for i in 0..tokens.len() {
+            let token = tokens.get(i).unwrap();
+            let key = DataKeyExt5::MilestoneEscrow(shipment_id.clone(), token.clone());
+            let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            if balance > 0 {
+                token::Client::new(env, &token).transfer(
+                    &env.current_contract_address(),
+                    recipient,
+                    &balance,
+                );
+                env.storage().persistent().set(&key, &0i128);
+            }
+        }
+    }
+
     /// #753: Propose a per-jurisdiction withholding rule. Admin-only and
     /// subject to the governance timelock configured via set_timelock_duration.
     pub fn set_withholding_rule(
@@ -10986,6 +11145,11 @@ impl ChainSettleContract {
         }
 
         let mut milestone = shipment.milestones.get(milestone_index).unwrap();
+        // #749: capture payout token before the milestone is stored back.
+        let payout_token = milestone
+            .token
+            .clone()
+            .unwrap_or_else(|| shipment.token.clone());
         if milestone.status != MilestoneStatus::ProofSubmitted {
             panic!("milestone proof not yet submitted");
         }
@@ -11221,7 +11385,14 @@ impl ChainSettleContract {
 
             // Transfer the net payment minus any advance already sent.
             let mut actual_transfer = net_payment - advance_deducted;
-            let token_client = token::Client::new(&env, &shipment.token);
+            // #749: each milestone pays from its own token sub-account.
+            let token_client = token::Client::new(&env, &payout_token);
+            Self::consume_milestone_escrow(
+                &env,
+                &shipment_id,
+                &payout_token,
+                payment - advance_deducted,
+            );
 
             // Deduct logistics fee and pay logistics provider.
             if shipment.logistics_fee_bps > 0 {
@@ -14027,8 +14198,31 @@ impl ChainSettleContract {
             }
         }
 
-        let unreleased =
-            shipment.total_amount - shipment.released_amount - shipment.total_advanced_amount;
+        // #749: exclude alternative-token sub-accounts from the base-token refund;
+        // they are returned separately in their own tokens below.
+        let mut alt_refund_total: i128 = 0;
+        if let Some(tokens) = env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt5, soroban_sdk::Vec<Address>>(&DataKeyExt5::ShipmentTokens(
+                shipment_id.clone(),
+            ))
+        {
+            for i in 0..tokens.len() {
+                let token = tokens.get(i).unwrap();
+                if token != shipment.token {
+                    alt_refund_total += Self::get_milestone_escrow(
+                        env.clone(),
+                        shipment_id.clone(),
+                        token,
+                    );
+                }
+            }
+        }
+        let unreleased = shipment.total_amount
+            - shipment.released_amount
+            - shipment.total_advanced_amount
+            - alt_refund_total;
         let cancel_fee = (unreleased * shipment.buyer_cancel_fee_bps as i128) / 10_000;
         let refund = unreleased - cancel_fee;
         let token_client = token::Client::new(&env, &shipment.token);
@@ -14043,6 +14237,7 @@ impl ChainSettleContract {
         if refund > 0 {
             Self::refund_to_buyer(&env, &shipment_id, &shipment, refund);
         }
+        Self::refund_milestone_escrow(env, shipment_id, &shipment.buyers.get(0).unwrap());
 
         // Forfeit supplier collateral to buyer on buyer-initiated cancellation.
         let collateral: i128 = env
@@ -26042,3 +26237,6 @@ mod test_issue_754;
 
 #[cfg(test)]
 mod test_issue_753;
+
+#[cfg(test)]
+mod test_issue_749;

@@ -24,6 +24,7 @@ fn build_valid_milestone(env: &Env) -> soroban_sdk::Vec<Milestone> {
         env,
         Milestone {
             name: String::from_str(env, "Milestone 1"),
+            token: None,
             payment_percent: 100,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
@@ -42,6 +43,7 @@ fn build_zero_percent_milestone(env: &Env) -> soroban_sdk::Vec<Milestone> {
         env,
         Milestone {
             name: String::from_str(env, "Zero Percent Milestone"),
+            token: None,
             payment_percent: 0,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
@@ -60,6 +62,7 @@ fn build_low_percent_milestone(env: &Env) -> soroban_sdk::Vec<Milestone> {
         env,
         Milestone {
             name: String::from_str(env, "Low Percent Milestone"),
+            token: None,
             payment_percent: 1,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
@@ -78,6 +81,7 @@ fn build_multi_milestone_with_zero(env: &Env) -> soroban_sdk::Vec<Milestone> {
         env,
         Milestone {
             name: String::from_str(env, "Milestone 1"),
+            token: None,
             payment_percent: 50,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
@@ -90,6 +94,7 @@ fn build_multi_milestone_with_zero(env: &Env) -> soroban_sdk::Vec<Milestone> {
         },
         Milestone {
             name: String::from_str(env, "Milestone 2 (Zero Percent)"),
+            token: None,
             payment_percent: 0,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
@@ -102,6 +107,7 @@ fn build_multi_milestone_with_zero(env: &Env) -> soroban_sdk::Vec<Milestone> {
         },
         Milestone {
             name: String::from_str(env, "Milestone 3"),
+            token: None,
             payment_percent: 50,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,

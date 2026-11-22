@@ -10,6 +10,7 @@ fn two_milestones(env: &Env) -> Vec<Milestone> {
         env,
         Milestone {
             name: String::from_str(env, "goods"),
+            token: None,
             payment_percent: 50,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
@@ -22,6 +23,7 @@ fn two_milestones(env: &Env) -> Vec<Milestone> {
         },
         Milestone {
             name: String::from_str(env, "delivery"),
+            token: None,
             payment_percent: 50,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,

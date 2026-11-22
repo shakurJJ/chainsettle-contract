@@ -76,6 +76,7 @@ fn two_milestone_chaos(env: &Env) -> soroban_sdk::Vec<Milestone> {
         env,
         Milestone {
             name: String::from_str(env, "A"),
+            token: None,
             payment_percent: 60,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
@@ -88,6 +89,7 @@ fn two_milestone_chaos(env: &Env) -> soroban_sdk::Vec<Milestone> {
         },
         Milestone {
             name: String::from_str(env, "B"),
+            token: None,
             payment_percent: 40,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,

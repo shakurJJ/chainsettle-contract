@@ -63,6 +63,7 @@ fn milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
         env,
         Milestone {
             name: String::from_str(env, "M0"),
+            token: None,
             payment_percent: 50,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
@@ -76,6 +77,7 @@ fn milestones(env: &Env) -> soroban_sdk::Vec<Milestone> {
         },
         Milestone {
             name: String::from_str(env, "M1"),
+            token: None,
             payment_percent: 50,
             proof_hash: String::from_str(env, ""),
             status: MilestoneStatus::Pending,
@@ -509,6 +511,7 @@ fn test_err_invalid_percentages_sum_not_100() {
         &t.env,
         Milestone {
             name: String::from_str(&t.env, "A"),
+            token: None,
             payment_percent: 40,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
@@ -522,6 +525,7 @@ fn test_err_invalid_percentages_sum_not_100() {
         },
         Milestone {
             name: String::from_str(&t.env, "B"),
+            token: None,
             payment_percent: 40,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
@@ -563,6 +567,7 @@ fn test_err_invalid_percentages_sum_over_100() {
         &t.env,
         Milestone {
             name: String::from_str(&t.env, "A"),
+            token: None,
             payment_percent: 60,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
@@ -576,6 +581,7 @@ fn test_err_invalid_percentages_sum_over_100() {
         },
         Milestone {
             name: String::from_str(&t.env, "B"),
+            token: None,
             payment_percent: 60,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
@@ -614,6 +620,7 @@ fn test_err_invalid_percentages_below_min_threshold() {
         &t.env,
         Milestone {
             name: String::from_str(&t.env, "Tiny"),
+            token: None,
             payment_percent: 4,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
@@ -627,6 +634,7 @@ fn test_err_invalid_percentages_below_min_threshold() {
         },
         Milestone {
             name: String::from_str(&t.env, "Big"),
+            token: None,
             payment_percent: 96,
             proof_hash: String::from_str(&t.env, ""),
             status: MilestoneStatus::Pending,
