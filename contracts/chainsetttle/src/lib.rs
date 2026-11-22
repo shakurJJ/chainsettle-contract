@@ -1828,6 +1828,13 @@ pub enum DataKeyExt5 {
     PendingDuties,
     /// (customs broker, remaining duties) held separately from the goods escrow.
     DutiesEscrow(String),
+    // ── #753 Jurisdiction tax withholding ───────────────────────────────────
+    /// Jurisdiction tag recorded for a shipment at creation.
+    ShipmentJurisdiction(String),
+    /// Pending timelocked withholding rule: (effective ledger, bps, recipient).
+    PendingWithholdingRule(Symbol),
+    /// Configured rule: (bps, tax authority).
+    WithholdingRule(Symbol),
 }
 
 /// #621 – Pending proposal to append a milestone to an active shipment.
@@ -7656,6 +7663,12 @@ impl ChainSettleContract {
         let confirmation_cooldown_ledgers = options.confirmation_cooldown_ledgers;
         let arbiter_panel = options.arbiter_panel.clone();
         let jurisdiction = options.jurisdiction.clone();
+        if let Some(ref jurisdiction_tag) = jurisdiction {
+            env.storage().persistent().set(
+                &DataKeyExt5::ShipmentJurisdiction(shipment_id.clone()),
+                jurisdiction_tag,
+            );
+        }
         // #518–#521 settlement options.
         let quality_grades = options.quality_grades.clone();
         let milestone_quantities = options.milestone_quantities.clone();
@@ -10387,6 +10400,13 @@ impl ChainSettleContract {
             }
         }
 
+        // #753: mirror the withholding deducted at release.
+        let (withholding_bps, withholding_authority) =
+            Self::withholding_for_shipment(&env, &shipment_id);
+        if withholding_authority.is_some() {
+            actual_transfer -= (actual_transfer * withholding_bps as i128) / 10_000;
+        }
+
         PayoutPreview {
             gross_amount,
             advance_deducted,
@@ -10706,6 +10726,83 @@ impl ChainSettleContract {
     // ----------------------------------------------------------
     // CONFIRM MILESTONE (multi-sig)
     // ----------------------------------------------------------
+
+    /// #753: Propose a per-jurisdiction withholding rule. Admin-only and
+    /// subject to the governance timelock configured via set_timelock_duration.
+    pub fn set_withholding_rule(
+        env: Env,
+        admin: Address,
+        jurisdiction: Symbol,
+        bps: u32,
+        recipient: Address,
+    ) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        if bps > 10_000 {
+            panic!("withholding bps cannot exceed 10000");
+        }
+        let timelock: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt::TimelockDuration)
+            .unwrap_or(0);
+        let effective_ledger = env.ledger().sequence() + timelock;
+        env.storage().instance().set(
+            &DataKeyExt5::PendingWithholdingRule(jurisdiction.clone()),
+            &(effective_ledger, bps, recipient.clone()),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "withholding_rule_proposed"), jurisdiction),
+            (bps, recipient, effective_ledger),
+        );
+    }
+
+    /// #753: Execute a withholding rule once its timelock has expired.
+    pub fn execute_withholding_rule(env: Env, admin: Address, jurisdiction: Symbol) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        let (effective_ledger, bps, recipient): (u32, u32, Address) = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt5::PendingWithholdingRule(jurisdiction.clone()))
+            .unwrap_or_else(|| panic!("NoPendingWithholdingRule"));
+        if env.ledger().sequence() < effective_ledger {
+            panic!("TimelockNotExpired");
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKeyExt5::PendingWithholdingRule(jurisdiction.clone()));
+        env.storage().persistent().set(
+            &DataKeyExt5::WithholdingRule(jurisdiction.clone()),
+            &(bps, recipient.clone()),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "withholding_rule_set"), jurisdiction),
+            (bps, recipient),
+        );
+    }
+
+    pub fn get_withholding_rule(env: Env, jurisdiction: Symbol) -> Option<(u32, Address)> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::WithholdingRule(jurisdiction))
+    }
+
+    /// Resolve the active withholding rule for a shipment (if any).
+    fn withholding_for_shipment(env: &Env, shipment_id: &String) -> (u32, Option<Address>) {
+        let jurisdiction: Option<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt5::ShipmentJurisdiction(shipment_id.clone()));
+        match jurisdiction.and_then(|j| {
+            env.storage()
+                .persistent()
+                .get::<DataKeyExt5, (u32, Address)>(&DataKeyExt5::WithholdingRule(j))
+        }) {
+            Some((bps, authority)) => (bps, Some(authority)),
+            None => (0, None),
+        }
+    }
 
     /// #754: Stage a separate duties component for the next shipment.
     /// Disabled (no effect) unless called before create_shipment.
@@ -11135,6 +11232,25 @@ impl ChainSettleContract {
                         &env.current_contract_address(),
                         &shipment.logistics,
                         &logistics_fee,
+                    );
+                }
+            }
+
+            // #753: withhold jurisdiction tax from the supplier payout and pay the authority.
+            let (withholding_bps, withholding_authority) =
+                Self::withholding_for_shipment(&env, &shipment_id);
+            if let Some(authority) = withholding_authority {
+                let withheld = (actual_transfer * withholding_bps as i128) / 10_000;
+                if withheld > 0 {
+                    actual_transfer -= withheld;
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &authority,
+                        &withheld,
+                    );
+                    env.events().publish(
+                        (Symbol::new(&env, "tax_withheld"), shipment_id.clone()),
+                        (milestone_index, authority, withheld),
                     );
                 }
             }
@@ -25923,3 +26039,6 @@ mod test_issue_755;
 
 #[cfg(test)]
 mod test_issue_754;
+
+#[cfg(test)]
+mod test_issue_753;
