@@ -502,6 +502,7 @@ pub struct ShipmentOptions {
     // ── Encrypted evidence for arbiters ──────────────────────────────────
     /// When true, encrypted evidence key envelopes are required for disputes.
     pub require_encrypted_evidence: bool,
+
 }
 
 /// Who pays the protocol fee when it is collected in the admin-designated fee
@@ -533,6 +534,10 @@ pub struct ShipmentOptionsExt {
     pub refund_to_vault: bool,
     /// #750: Who pays the fee when a fee token applies to this shipment.
     pub fee_bearer: FeeBearer,
+    // -- #732 Commodity price adjustment clause --
+    /// Optional price escalator applied when a milestone is confirmed.
+    /// None keeps fixed escrow amounts (backwards compatible).
+    pub price_adjustment: Option<PriceAdjustmentClause>,
 }
 
 impl Default for ShipmentOptionsExt {
@@ -542,6 +547,7 @@ impl Default for ShipmentOptionsExt {
             po_reference: None,
             refund_to_vault: false,
             fee_bearer: FeeBearer::Supplier,
+            price_adjustment: None,
         }
     }
 }
@@ -571,6 +577,20 @@ pub struct ReturnRequest {
     pub status: ReturnStatus,
     pub created_ledger: u32,
     pub proof_hash: Option<BytesN<32>>,
+}
+
+/// #732 – Optional commodity price escalator for unpaid milestones.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct PriceAdjustmentClause {
+    /// Oracle contract exposing `get_price(asset) -> i128`.
+    pub oracle: Address,
+    /// Price at shipment creation; current/base sets the adjustment factor.
+    pub base_price: i128,
+    /// Maximum upward adjustment in basis points.
+    pub max_up_bps: u32,
+    /// Maximum downward adjustment in basis points.
+    pub max_down_bps: u32,
 }
 
 /// #736 – A retried `create_shipment_auto_id` maps back to its original ID.
@@ -2002,6 +2022,12 @@ pub enum DataKeyExt6 {
     IdempotencyKey(Address, String),
     /// Ledger window before an idempotency key expires.
     IdempotencyTtlLedgers,
+
+    // -- #732 Commodity price adjustment --
+    /// Price clause locked in at shipment creation.
+    PriceAdjustment(String),
+    /// Unused buyer top-up for (shipment_id, milestone_index).
+    PriceTopUp(String, u32),
 }
 
 /// #743 – Review state of a self-submitted arbiter application.
@@ -2313,6 +2339,12 @@ pub enum ChainSettleError {
     ReturnProofMissing = 25,
     /// Same idempotency key reused with different creation parameters.
     IdempotencyParamsMismatch = 26,
+    /// A price clause had a non-positive base price or an invalid down band.
+    InvalidPriceAdjustmentClause = 27,
+    /// An upward adjustment exceeded the agreed band.
+    PriceAdjustmentOutOfBand = 28,
+    /// Upward adjustment is blocked until the buyer tops up the escrow.
+    PriceAdjustmentUnderfunded = 29,
 }
 
 // ============================================================
@@ -8337,6 +8369,16 @@ impl ChainSettleContract {
     }
 
     fn apply_shipment_options_ext(env: &Env, shipment_id: &String, ext: &ShipmentOptionsExt) {
+        if let Some(ref clause) = ext.price_adjustment {
+            if clause.base_price <= 0 || clause.max_down_bps >= 10_000 {
+                soroban_sdk::panic_with_error!(env, ChainSettleError::InvalidPriceAdjustmentClause);
+            }
+            Self::set_persistent6(
+                env,
+                &DataKeyExt6::PriceAdjustment(shipment_id.clone()),
+                clause,
+            );
+        }
         if *ext == ShipmentOptionsExt::default() {
             return;
         }
@@ -8367,6 +8409,7 @@ impl ChainSettleContract {
                 ext.po_reference.clone(),
                 ext.refund_to_vault,
                 ext.fee_bearer,
+                ext.price_adjustment.clone(),
             ),
         );
     }
@@ -12028,6 +12071,9 @@ impl ChainSettleContract {
 
         let gross_payment = Self::milestone_gross_payment(&env, &shipment, milestone_index);
         let mut payment = gross_payment;
+
+        // #732: rescale unpaid milestone payouts from the registered oracle.
+        Self::apply_price_adjustment(&env, &shipment_id, milestone_index, &mut payment, &buyer);
 
         // #754: clearing a customs milestone releases duties to the broker exactly once.
         let milestone_name = milestone.name.clone();
@@ -18772,7 +18818,7 @@ impl ChainSettleContract {
         )
             .into_val(env);
         let xdr = soroban_sdk::xdr::ToXdr::to_xdr(&params, env);
-        env.crypto().sha256(&xdr)
+        env.crypto().sha256(&xdr).into()
     }
 
     /// Admin configures the ledger window for which idempotency keys live.
@@ -18787,6 +18833,101 @@ impl ChainSettleContract {
             .set(&DataKeyExt6::IdempotencyTtlLedgers, &ledgers);
         env.events()
             .publish((Symbol::new(&env, "idempotency_ttl_set"),), ledgers);
+    }
+
+    // ----------------------------------------------------------
+    // #732 COMMODITY PRICE ADJUSTMENT CLAUSE
+    // ----------------------------------------------------------
+
+    /// Buyer pre-funds a possible upward price adjustment for a milestone.
+    pub fn top_up_price_adjustment(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        amount: i128,
+    ) {
+        buyer.require_auth();
+        if amount <= 0 {
+            panic!("top-up amount must be positive");
+        }
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if milestone_index >= shipment.milestones.len() {
+            panic!("invalid milestone index");
+        }
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        let token = milestone.token.clone().unwrap_or_else(|| shipment.token.clone());
+        token::Client::new(&env, &token).transfer(&buyer, &env.current_contract_address(), &amount, &[]);
+        Self::increase_total_escrowed(&env, &token, amount);
+        let key = DataKeyExt6::PriceTopUp(shipment_id.clone(), milestone_index);
+        let prior: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(prior + amount));
+        env.events().publish(
+            (Symbol::new(&env, "price_top_up"), shipment_id),
+            (milestone_index, amount),
+        );
+    }
+
+    /// Applies the capped oracle adjustment to `payment`. Upward moves consume
+    /// a prior top-up (blocking release if insufficient); downward moves are
+    /// refunded to the buyer immediately.
+    fn apply_price_adjustment(
+        env: &Env,
+        shipment_id: &String,
+        milestone_index: u32,
+        payment: &mut i128,
+        buyer: &Address,
+    ) {
+        let clause: Option<PriceAdjustmentClause> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt6::PriceAdjustment(shipment_id.clone()));
+        let Some(clause) = clause else { return; };
+        let shipment = Self::get_shipment_internal(env, shipment_id);
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        let token = milestone.token.clone().unwrap_or_else(|| shipment.token.clone());
+        let price = PriceOracleClient::new(env, &clause.oracle).get_price(&token);
+        if price <= 0 {
+            soroban_sdk::panic_with_error!(env, ChainSettleError::PriceAdjustmentOutOfBand);
+        }
+        let raw_bps = price.saturating_mul(10_000) / clause.base_price;
+        let lower = 10_000i128.saturating_sub(clause.max_down_bps as i128).max(1);
+        let upper = 10_000i128.saturating_add(clause.max_up_bps as i128);
+        if raw_bps < lower || raw_bps > upper {
+            soroban_sdk::panic_with_error!(env, ChainSettleError::PriceAdjustmentOutOfBand);
+        }
+        let old = *payment;
+        let new_amount = old.saturating_mul(raw_bps) / 10_000;
+        if new_amount > old {
+            let delta = new_amount - old;
+            let key = DataKeyExt6::PriceTopUp(shipment_id.clone(), milestone_index);
+            let topped: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            if topped < delta {
+                soroban_sdk::panic_with_error!(env, ChainSettleError::PriceAdjustmentUnderfunded);
+            }
+            if topped == delta {
+                env.storage().persistent().remove(&key);
+            } else {
+                env.storage().persistent().set(&key, &(topped - delta));
+            }
+        } else if new_amount < old {
+            let delta = old - new_amount;
+            token::Client::new(env, &token).transfer(
+                &env.current_contract_address(),
+                buyer,
+                &delta,
+                &[],
+            );
+            Self::decrease_total_escrowed(env, &token, delta);
+        }
+        *payment = new_amount;
+        env.events().publish(
+            (Symbol::new(env, "price_adj"), shipment_id.clone()),
+            (milestone_index, old, new_amount),
+        );
     }
 
     // ----------------------------------------------------------
@@ -27389,6 +27530,16 @@ impl ChainSettleContract {
     }
 
     fn apply_shipment_options_ext(env: &Env, shipment_id: &String, ext: &ShipmentOptionsExt) {
+        if let Some(ref clause) = ext.price_adjustment {
+            if clause.base_price <= 0 || clause.max_down_bps >= 10_000 {
+                soroban_sdk::panic_with_error!(env, ChainSettleError::InvalidPriceAdjustmentClause);
+            }
+            Self::set_persistent6(
+                env,
+                &DataKeyExt6::PriceAdjustment(shipment_id.clone()),
+                clause,
+            );
+        }
         if *ext == ShipmentOptionsExt::default() {
             return;
         }
@@ -27860,3 +28011,6 @@ mod test_issue_735;
 
 #[cfg(test)]
 mod test_issue_736;
+
+#[cfg(test)]
+mod test_issue_732;
