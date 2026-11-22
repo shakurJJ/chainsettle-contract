@@ -1931,6 +1931,20 @@ pub enum DataKeyExt5 {
     ShipmentFeeToken(String),
     /// Fee bearer for the shipment (absent = `FeeBearer::Supplier`).
     ShipmentFeeBearer(String),
+
+    // ── #758 Negotiable bill-of-lading endorsement ────────────────────────
+    /// Current BOL holder for a shipment.
+    BolHolder(String),
+    /// Append-only endorsement history for a shipment.
+    BolEndorsements(String),}
+
+/// #758 – A single negotiable BOL endorsement record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BolEndorsement {
+    pub from: Address,
+    pub to: Address,
+    pub ledger: u32,
 }
 
 /// #621 – Pending proposal to append a milestone to an active shipment.
@@ -6808,6 +6822,16 @@ impl ChainSettleContract {
             constants::TTL_INITIAL_LEDGERS,
             constants::TTL_MAX_LEDGERS,
         );
+        // #758: first BOL attachment establishes the initial holder.
+        let holder_key = DataKeyExt5::BolHolder(shipment_id.clone());
+        if !env.storage().persistent().has(&holder_key) {
+            env.storage().persistent().set(&holder_key, &caller);
+            env.storage().persistent().extend_ttl(
+                &holder_key,
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+        }
         Self::append_audit_entry(
             &env,
             &mut shipment,
@@ -6846,6 +6870,67 @@ impl ChainSettleContract {
         env.storage()
             .persistent()
             .get(&DataKeyExt4::DocHashOwner(doc_hash))
+    }
+
+    // ----------------------------------------------------------
+    // #758 – NEGOTIABLE BILL-OF-LADING ENDORSEMENT
+    // ----------------------------------------------------------
+
+    /// Endorses the shipment's negotiable BOL to `to`. Only the current
+    /// BOL holder may endorse. Each endorsement is appended to on-chain history.
+    pub fn endorse_bol(env: Env, caller: Address, shipment_id: String, to: Address) {
+        caller.require_auth();
+        Self::assert_not_paused(&env);
+        let _shipment = Self::get_shipment_internal(&env, &shipment_id);
+
+        let holder_key = DataKeyExt5::BolHolder(shipment_id.clone());
+        let current_holder: Address = env
+            .storage()
+            .persistent()
+            .get(&holder_key)
+            .expect("no BOL holder");
+        if caller != current_holder {
+            panic!("only current BOL holder can endorse");
+        }
+
+        let entry = BolEndorsement {
+            from: current_holder.clone(),
+            to: to.clone(),
+            ledger: env.ledger().sequence(),
+        };
+        let hist_key = DataKeyExt5::BolEndorsements(shipment_id.clone());
+        let mut history: Vec<BolEndorsement> = env
+            .storage()
+            .persistent()
+            .get(&hist_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        history.push_back(entry.clone());
+        env.storage().persistent().set(&hist_key, &history);
+        env.storage().persistent().extend_ttl(
+            &hist_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        env.storage().persistent().set(&holder_key, &to);
+        env.storage().persistent().extend_ttl(
+            &holder_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "bol_endorsed"), shipment_id),
+            (current_holder, to, entry.ledger),
+        );
+    }
+
+    /// Returns the append-only BOL endorsement history for a shipment.
+    pub fn get_bol_endorsements(env: Env, shipment_id: String) -> Vec<BolEndorsement> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::BolEndorsements(shipment_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     // ----------------------------------------------------------
@@ -11781,6 +11866,8 @@ impl ChainSettleContract {
                 }
             }
 
+            // #757: re-check compliance before releasing funds.
+            Self::check_payout_compliance(&env, &mut shipment, &shipment_id, milestone_index);
             // Check circuit breaker before transferring payment
             Self::check_circuit_breaker(&env, payment);
             Self::check_address_outflow(&env, &shipment.supplier, payment);
@@ -12080,6 +12167,7 @@ impl ChainSettleContract {
         if shipment.status != ShipmentStatus::Active {
             panic!("shipment is not active");
         }
+        Self::assert_shipment_not_on_hold(&env, &shipment_id);
 
         let mut milestone = shipment.milestones.get(milestone_index).unwrap();
 
@@ -12102,6 +12190,7 @@ impl ChainSettleContract {
             None => gross,
         };
         let grade_refund = gross - payment;
+
 
         // Deduct any approved advance for this milestone.
         let advance_deducted =
@@ -19327,6 +19416,7 @@ impl ChainSettleContract {
             .persistent()
             .has(&DataKeyExt2::ComplianceHold(shipment_id))
     }
+
 
     fn assert_shipment_not_on_hold(env: &Env, shipment_id: &String) {
         if env
@@ -26942,3 +27032,6 @@ mod test_issue_753;
 
 #[cfg(test)]
 mod test_issue_749;
+
+#[cfg(test)]
+mod test_bol_endorsement;
