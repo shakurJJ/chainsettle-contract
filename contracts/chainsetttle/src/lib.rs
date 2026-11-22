@@ -546,6 +546,33 @@ impl Default for ShipmentOptionsExt {
     }
 }
 
+/// #735 – Lifecycle of a buyer-initiated goods return (RMA).
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub enum ReturnStatus {
+    /// Buyer requested a return; awaiting supplier decision.
+    Requested,
+    /// Supplier accepted the return; awaiting logistics return proof.
+    Accepted,
+    /// Logistics uploaded return proof; awaiting supplier receipt confirmation.
+    ProofSubmitted,
+    /// Supplier escalated the rejection to the normal dispute flow.
+    Escalated,
+    /// Refund issued after supplier confirmed receipt.
+    Completed,
+}
+
+/// #735 – Return (RMA) request stored per (shipment, milestone).
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct ReturnRequest {
+    pub buyer: Address,
+    pub reason_hash: BytesN<32>,
+    pub status: ReturnStatus,
+    pub created_ledger: u32,
+    pub proof_hash: Option<BytesN<32>>,
+}
+
 /// #744: Admin-configured windows for perishable shipments. A window only
 /// shortens the standard one: it applies when the shipment's own window is
 /// disabled or longer.
@@ -1953,6 +1980,16 @@ pub enum DataKeyExt5 {
     ShipmentFeeBearer(String),
 }
 
+/// `DataKeyExt5` is at the 50-variant XDR ceiling, so keys added from here on
+/// live in this enum.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub enum DataKeyExt6 {
+    // ── #735 Goods return (RMA) flow ───────────────────────────────────────
+    /// Return request for (shipment_id, milestone_index).
+    ReturnRequest(String, u32),
+}
+
 /// #743 – Review state of a self-submitted arbiter application.
 #[contracttype]
 #[derive(Clone, PartialEq, Debug)]
@@ -2249,6 +2286,17 @@ pub enum ChainSettleError {
     TokenDepegged = 19,
     /// TVL cap for escrow token exceeded (#559).
     TvlCapExceeded = 20,
+    // -- #735 Goods return (RMA) --
+    /// The proof review window has already closed.
+    ReturnWindowClosed = 21,
+    /// A return request already exists for this milestone.
+    ReturnAlreadyRequested = 22,
+    /// No return request exists for this milestone.
+    ReturnNotFound = 23,
+    /// The supplier has not accepted the return request.
+    ReturnNotAccepted = 24,
+    /// Return proof has not been submitted yet.
+    ReturnProofMissing = 25,
 }
 
 // ============================================================
@@ -12821,6 +12869,18 @@ impl ChainSettleContract {
     }
 
     pub fn raise_dispute(env: Env, buyer: Address, shipment_id: String, milestone_index: u32) {
+        Self::raise_dispute_inner(env, buyer, shipment_id, milestone_index, false);
+    }
+
+    /// `skip_auth` lets the #735 return-escalation path escalate on the
+    /// supplier's authority alone, reusing the existing dispute machinery.
+    fn raise_dispute_inner(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        skip_auth: bool,
+    ) {
         Self::assert_operation_not_paused(&env, Symbol::new(&env, "dispute"));
 
         let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
@@ -12836,12 +12896,14 @@ impl ChainSettleContract {
         let grade_key = DataKeyExt3::PendingGrade(shipment_id.clone(), milestone_index);
         let pending_grade: Option<(u32, u32)> = env.storage().persistent().get(&grade_key);
         let supplier_grade_dispute = pending_grade.is_some() && buyer == shipment.supplier;
-        if supplier_grade_dispute {
-            buyer.require_auth();
-        } else {
-            Self::require_buyer_auth_with_org_override(&env, &shipment, &buyer);
-            if pending_grade.is_some() {
-                panic!("graded milestone can only be disputed by the supplier");
+        if !skip_auth {
+            if supplier_grade_dispute {
+                buyer.require_auth();
+            } else {
+                Self::require_buyer_auth_with_org_override(&env, &shipment, &buyer);
+                if pending_grade.is_some() {
+                    panic!("graded milestone can only be disputed by the supplier");
+                }
             }
         }
 
@@ -18621,6 +18683,176 @@ impl ChainSettleContract {
             options,
         );
         auto_id
+    }
+
+    // ----------------------------------------------------------
+    // #735 GOODS RETURN (RMA) FLOW
+    // ----------------------------------------------------------
+
+    /// Buyer rejects delivered goods inside the proof review window.
+    pub fn request_return(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        reason_hash: BytesN<32>,
+    ) {
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "confirm"));
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        Self::require_buyer_auth_with_org_override(&env, &shipment, &buyer);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if milestone_index >= shipment.milestones.len() {
+            panic!("invalid milestone index");
+        }
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        if milestone.status != MilestoneStatus::ProofSubmitted {
+            panic!("milestone proof not yet submitted");
+        }
+        let window = Self::get_effective_auto_confirm_window(&env, &shipment);
+        let proof_ledger = milestone.proof_submitted_ledger.unwrap_or(0);
+        if window == 0 || env.ledger().sequence() >= proof_ledger + window {
+            soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnWindowClosed);
+        }
+        let key = DataKeyExt6::ReturnRequest(shipment_id.clone(), milestone_index);
+        if env.storage().persistent().has(&key) {
+            soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnAlreadyRequested);
+        }
+        Self::set_persistent6(
+            &env,
+            &key,
+            &ReturnRequest {
+                buyer: buyer.clone(),
+                reason_hash: reason_hash.clone(),
+                status: ReturnStatus::Requested,
+                created_ledger: env.ledger().sequence(),
+                proof_hash: None,
+            },
+        );
+        env.events().publish(
+            (Symbol::new(&env, "return_requested"), shipment_id),
+            (milestone_index, buyer, reason_hash),
+        );
+    }
+
+    /// Supplier accepts a routine return instead of going to arbitration.
+    pub fn accept_return(env: Env, supplier: Address, shipment_id: String, milestone_index: u32) {
+        supplier.require_auth();
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if supplier != shipment.supplier {
+            panic!("unauthorized");
+        }
+        let key = DataKeyExt6::ReturnRequest(shipment_id.clone(), milestone_index);
+        let mut request: ReturnRequest = env.storage().persistent().get(&key)
+            .unwrap_or_else(|| soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnNotFound));
+        if request.status != ReturnStatus::Requested {
+            soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnNotAccepted);
+        }
+        request.status = ReturnStatus::Accepted;
+        Self::set_persistent6(&env, &key, &request);
+        env.events().publish(
+            (Symbol::new(&env, "return_accepted"), shipment_id),
+            milestone_index,
+        );
+    }
+
+    /// Supplier escalates the rejection to the existing dispute flow.
+    pub fn escalate_return(env: Env, supplier: Address, shipment_id: String, milestone_index: u32) {
+        supplier.require_auth();
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if supplier != shipment.supplier {
+            panic!("unauthorized");
+        }
+        let key = DataKeyExt6::ReturnRequest(shipment_id.clone(), milestone_index);
+        let mut request: ReturnRequest = env.storage().persistent().get(&key)
+            .unwrap_or_else(|| soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnNotFound));
+        if request.status != ReturnStatus::Requested && request.status != ReturnStatus::Accepted {
+            soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnNotAccepted);
+        }
+        request.status = ReturnStatus::Escalated;
+        Self::set_persistent6(&env, &key, &request);
+        let buyer = request.buyer.clone();
+        Self::raise_dispute_inner(env.clone(), buyer, shipment_id.clone(), milestone_index, true);
+        env.events().publish(
+            (Symbol::new(&env, "return_escalated"), shipment_id),
+            milestone_index,
+        );
+    }
+
+    /// Logistics uploads proof that the rejected goods were returned.
+    pub fn submit_return_proof(
+        env: Env,
+        logistics: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        proof_hash: BytesN<32>,
+    ) {
+        logistics.require_auth();
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if logistics != shipment.logistics {
+            panic!("unauthorized");
+        }
+        let key = DataKeyExt6::ReturnRequest(shipment_id.clone(), milestone_index);
+        let mut request: ReturnRequest = env.storage().persistent().get(&key)
+            .unwrap_or_else(|| soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnNotFound));
+        if request.status != ReturnStatus::Accepted {
+            soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnNotAccepted);
+        }
+        request.status = ReturnStatus::ProofSubmitted;
+        request.proof_hash = Some(proof_hash.clone());
+        Self::set_persistent6(&env, &key, &request);
+        env.events().publish(
+            (Symbol::new(&env, "return_proof_submitted"), shipment_id),
+            (milestone_index, proof_hash),
+        );
+    }
+
+    /// Supplier confirms receipt of the returned goods: only now is the
+    /// milestone amount refunded to the buyer.
+    pub fn confirm_return_receipt(
+        env: Env,
+        supplier: Address,
+        shipment_id: String,
+        milestone_index: u32,
+    ) {
+        supplier.require_auth();
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if supplier != shipment.supplier {
+            panic!("unauthorized");
+        }
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if milestone_index >= shipment.milestones.len() {
+            panic!("invalid milestone index");
+        }
+        let key = DataKeyExt6::ReturnRequest(shipment_id.clone(), milestone_index);
+        let mut request: ReturnRequest = env.storage().persistent().get(&key)
+            .unwrap_or_else(|| soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnNotFound));
+        if request.status != ReturnStatus::ProofSubmitted {
+            soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnProofMissing);
+        }
+        let amount = Self::milestone_gross_payment(&env, &shipment, milestone_index);
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        let payout_token = milestone.token.clone().unwrap_or_else(|| shipment.token.clone());
+        token::Client::new(&env, &payout_token).transfer(
+            &env.current_contract_address(),
+            &request.buyer,
+            &amount,
+            &[],
+        );
+        Self::decrease_total_escrowed(&env, &payout_token, amount);
+        let mut milestone = milestone;
+        milestone.status = MilestoneStatus::Resolved;
+        shipment.milestones.set(milestone_index, milestone);
+        env.storage().persistent().set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+        request.status = ReturnStatus::Completed;
+        Self::set_persistent6(&env, &key, &request);
+        env.events().publish(
+            (Symbol::new(&env, "return_refunded"), shipment_id),
+            (milestone_index, amount),
+        );
     }
 
     fn format_auto_id(env: &Env, num: u64) -> String {
@@ -25524,6 +25756,15 @@ impl ChainSettleContract {
         );
     }
 
+    fn set_persistent6<V: IntoVal<Env, Val>>(env: &Env, key: &DataKeyExt6, value: &V) {
+        env.storage().persistent().set(key, value);
+        env.storage().persistent().extend_ttl(
+            key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
     fn decrease_total_escrowed(env: &Env, token: &Address, amount: i128) {
         let key = DataKey::TotalEscrowed(token.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -27509,3 +27750,6 @@ mod test_issue_753;
 
 #[cfg(test)]
 mod test_issue_749;
+
+#[cfg(test)]
+mod test_issue_735;
