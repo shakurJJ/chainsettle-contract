@@ -289,6 +289,8 @@ mod contract_prop_tests {
                 deadline_ledger: 0,
                 penalty_bps_per_ledger: 0,
                 not_before_ledger: 0,
+            
+                logistics: None,
             },
             Milestone {
                 name: String::from_str(env, "M1"),
@@ -302,6 +304,8 @@ mod contract_prop_tests {
                 deadline_ledger: 0,
                 penalty_bps_per_ledger: 0,
                 not_before_ledger: 0,
+            
+                logistics: None,
             },
         ];
         client.create_shipment(
@@ -692,6 +696,8 @@ mod milestone_percent_fuzz {
                 penalty_bps_per_ledger: 0,
                 not_before_ledger: 0,
             }
+        
+                logistics: None,
         }
 
         proptest! {

@@ -28,6 +28,8 @@ fn milestone(env: &Env, name: &str, deadline_ledger: u32) -> Milestone {
         deadline_ledger,
         penalty_bps_per_ledger: 0,
     }
+
+        logistics: None,
 }
 
 /// Two 50% milestones; milestone 0 has a deadline so it can become overdue.

@@ -82,6 +82,8 @@ fn single_milestone(
             deadline_ledger,
             penalty_bps_per_ledger,
             not_before_ledger: 0,
+        
+            logistics: None,
         },
     ]
 }
