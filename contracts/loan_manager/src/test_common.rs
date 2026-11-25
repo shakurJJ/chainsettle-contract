@@ -203,3 +203,138 @@ pub fn open_position(s: &Setup, user: &Address, coll: i128, debt: i128) {
         s.client().borrow(user, &debt);
     }
 }
+
+// ============================================================
+// TESTS
+// ============================================================
+
+#[test]
+fn test_mock_oracle_price_setting() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_700_000_000);
+
+    let oracle_id = env.register(MockOracle, ());
+    let oracle = MockOracleClient::new(&env, &oracle_id);
+    let asset = Address::generate(&env);
+
+    // Set price and verify retrieval
+    oracle.set_price(&asset, &PRICE_ONE);
+    let (price, ts) = oracle.latest_price(&asset);
+    
+    assert_eq!(price, PRICE_ONE);
+    assert_eq!(ts, 1_700_000_000);
+
+    // Update price and timestamp
+    env.ledger().with_mut(|l| l.timestamp = 1_700_001_000);
+    oracle.set_price(&asset, &(PRICE_ONE * 2));
+    let (price2, ts2) = oracle.latest_price(&asset);
+    
+    assert_eq!(price2, PRICE_ONE * 2);
+    assert_eq!(ts2, 1_700_001_000);
+}
+
+#[test]
+#[should_panic(expected = "price not set")]
+fn test_mock_oracle_missing_price_panics() {
+    let env = Env::default();
+    let oracle_id = env.register(MockOracle, ());
+    let oracle = MockOracleClient::new(&env, &oracle_id);
+    let asset = Address::generate(&env);
+
+    // Should panic when querying price that was never set
+    oracle.latest_price(&asset);
+}
+
+#[test]
+fn test_mock_oracle_staleness_control() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_700_000_000);
+
+    let oracle_id = env.register(MockOracle, ());
+    let oracle = MockOracleClient::new(&env, &oracle_id);
+    let asset = Address::generate(&env);
+
+    // Set initial price
+    oracle.set_price(&asset, &PRICE_ONE);
+    let (_, ts_fresh) = oracle.latest_price(&asset);
+    assert_eq!(ts_fresh, 1_700_000_000);
+
+    // Make the price stale by 1 hour
+    oracle.set_stale(&asset, &3600);
+    let (price_stale, ts_stale) = oracle.latest_price(&asset);
+    
+    assert_eq!(price_stale, PRICE_ONE); // Price unchanged
+    assert_eq!(ts_stale, 1_700_000_000 - 3600); // Timestamp backdated
+
+    // Set raw data with arbitrary timestamp
+    oracle.set_raw(&asset, &(PRICE_ONE * 3), &1_600_000_000);
+    let (price_raw, ts_raw) = oracle.latest_price(&asset);
+    
+    assert_eq!(price_raw, PRICE_ONE * 3);
+    assert_eq!(ts_raw, 1_600_000_000);
+}
+
+#[test]
+fn test_setup_initialization() {
+    let s = setup();
+    let client = s.client();
+
+    // Verify oracles are configured
+    let (primary, secondary) = client.get_oracles();
+    assert_eq!(primary, Some(s.primary.clone()));
+    assert_eq!(secondary, Some(s.secondary.clone()));
+
+    // Verify market is configured
+    let threshold = client.get_liquidation_threshold(&s.coll_id, &s.debt_id);
+    assert_eq!(threshold, DEFAULT_THRESHOLD_BPS);
+
+    // Verify initial prices are set
+    let po = s.primary_oracle();
+    let (coll_price, _) = po.latest_price(&s.coll_id);
+    let (debt_price, _) = po.latest_price(&s.debt_id);
+    assert_eq!(coll_price, PRICE_ONE);
+    assert_eq!(debt_price, PRICE_ONE);
+
+    // Verify users have initial balances
+    let coll_token = token::StellarAssetClient::new(&s.env, &s.coll_id);
+    let debt_token = token::StellarAssetClient::new(&s.env, &s.debt_id);
+    
+    assert_eq!(coll_token.balance(&s.alice), 100_000_000_000);
+    assert_eq!(debt_token.balance(&s.alice), 100_000_000_000);
+    assert_eq!(coll_token.balance(&s.bob), 100_000_000_000);
+    assert_eq!(debt_token.balance(&s.bob), 100_000_000_000);
+}
+
+#[test]
+fn test_time_advancement_and_helpers() {
+    let s = setup();
+    
+    // Initial timestamp
+    let t0 = s.env.ledger().timestamp();
+    assert_eq!(t0, 1_700_000_000);
+
+    // Advance by 1 hour
+    advance_time(&s.env, 3600);
+    assert_eq!(s.env.ledger().timestamp(), 1_700_000_000 + 3600);
+
+    // Seed liquidity using helper
+    seed_liquidity(&s, &[&s.d1, &s.d2], &[1_000_000, 2_000_000]);
+    
+    let debt_token = token::StellarAssetClient::new(&s.env, &s.debt_id);
+    assert_eq!(debt_token.balance(&s.d1), 1_000_000);
+    assert_eq!(debt_token.balance(&s.d2), 2_000_000);
+
+    // Open position using helper
+    open_position(&s, &s.alice, 10_000_000, 5_000_000);
+    
+    let collateral = s.client().get_collateral(&s.alice);
+    let debt = s.client().get_debt(&s.alice);
+    assert_eq!(collateral, 10_000_000);
+    assert_eq!(debt, 5_000_000);
+
+    // Advance more time and verify
+    advance_time(&s.env, 86400); // 1 day
+    assert_eq!(s.env.ledger().timestamp(), 1_700_000_000 + 3600 + 86400);
+}
