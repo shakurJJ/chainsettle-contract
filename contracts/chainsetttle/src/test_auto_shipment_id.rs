@@ -22,6 +22,7 @@ fn test_auto_generated_shipment_ids() {
         &10_000_000,
         &build_milestones(env),
         &options,
+        &None,
     );
     assert_eq!(id1, String::from_str(env, "SHIP-1"));
 
@@ -40,6 +41,7 @@ fn test_auto_generated_shipment_ids() {
         &5_000_000,
         &build_milestones(env),
         &options,
+        &None,
     );
     assert_eq!(id2, String::from_str(env, "SHIP-2"));
 

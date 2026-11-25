@@ -504,6 +504,7 @@ pub struct ShipmentOptions {
     // ── Encrypted evidence for arbiters ──────────────────────────────────
     /// When true, encrypted evidence key envelopes are required for disputes.
     pub require_encrypted_evidence: bool,
+
 }
 
 /// Who pays the protocol fee when it is collected in the admin-designated fee
@@ -535,6 +536,15 @@ pub struct ShipmentOptionsExt {
     pub refund_to_vault: bool,
     /// #750: Who pays the fee when a fee token applies to this shipment.
     pub fee_bearer: FeeBearer,
+    // -- #732 Commodity price adjustment clause --
+    /// Optional price escalator applied when a milestone is confirmed.
+    /// None keeps fixed escrow amounts (backwards compatible).
+    pub price_adjustment: Option<PriceAdjustmentClause>,
+
+    // -- #733 Required trade-document sets --
+    /// Per-milestone checklist that must be satisfied before confirmation.
+    /// None keeps the existing hash-only behaviour.
+    pub required_documents: Option<Vec<DocumentRequirement>>,
 }
 
 impl Default for ShipmentOptionsExt {
@@ -544,8 +554,77 @@ impl Default for ShipmentOptionsExt {
             po_reference: None,
             refund_to_vault: false,
             fee_bearer: FeeBearer::Supplier,
+            price_adjustment: None,
+            required_documents: None,
         }
     }
+}
+
+/// #735 – Lifecycle of a buyer-initiated goods return (RMA).
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub enum ReturnStatus {
+    /// Buyer requested a return; awaiting supplier decision.
+    Requested,
+    /// Supplier accepted the return; awaiting logistics return proof.
+    Accepted,
+    /// Logistics uploaded return proof; awaiting supplier receipt confirmation.
+    ProofSubmitted,
+    /// Supplier escalated the rejection to the normal dispute flow.
+    Escalated,
+    /// Refund issued after supplier confirmed receipt.
+    Completed,
+}
+
+/// #735 – Return (RMA) request stored per (shipment, milestone).
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct ReturnRequest {
+    pub buyer: Address,
+    pub reason_hash: BytesN<32>,
+    pub status: ReturnStatus,
+    pub created_ledger: u32,
+    pub proof_hash: Option<BytesN<32>>,
+}
+
+/// #733 – Typed trade documents that can gate milestone confirmation.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DocumentType {
+    Invoice,
+    BillOfLading,
+    PackingList,
+    CertificateOfOrigin,
+}
+
+/// #733 – Documents required for one milestone of a shipment.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct DocumentRequirement {
+    pub milestone_index: u32,
+    pub doc_types: Vec<DocumentType>,
+}
+
+/// #732 – Optional commodity price escalator for unpaid milestones.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct PriceAdjustmentClause {
+    /// Oracle contract exposing `get_price(asset) -> i128`.
+    pub oracle: Address,
+    /// Price at shipment creation; current/base sets the adjustment factor.
+    pub base_price: i128,
+    /// Maximum upward adjustment in basis points.
+    pub max_up_bps: u32,
+    /// Maximum downward adjustment in basis points.
+    pub max_down_bps: u32,
+}
+
+/// #736 – A retried `create_shipment_auto_id` maps back to its original ID.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct IdempotencyRecord {
+    pub shipment_id: String,
+    pub params_hash: BytesN<32>,
 }
 
 /// #744: Admin-configured windows for perishable shipments. A window only
@@ -1986,6 +2065,34 @@ pub struct BolEndorsement {
     pub ledger: u32,
 }
 
+/// `DataKeyExt5` is at the 50-variant XDR ceiling, so keys added from here on
+/// live in this enum.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub enum DataKeyExt6 {
+    // ── #735 Goods return (RMA) flow ───────────────────────────────────────
+    /// Return request for (shipment_id, milestone_index).
+    ReturnRequest(String, u32),
+
+    // -- #736 Idempotent auto-ID shipment creation --
+    /// (buyer, idempotency key) -> original record.
+    IdempotencyKey(Address, String),
+    /// Ledger window before an idempotency key expires.
+    IdempotencyTtlLedgers,
+
+    // -- #732 Commodity price adjustment --
+    /// Price clause locked in at shipment creation.
+    PriceAdjustment(String),
+    /// Unused buyer top-up for (shipment_id, milestone_index).
+    PriceTopUp(String, u32),
+
+    // -- #733 Required trade-document sets --
+    /// Required document types for (shipment_id, milestone_index).
+    RequiredDocuments(String, u32),
+    /// Attached document hash for (shipment_id, milestone_index, doc_type).
+    AttachedDocument(String, u32, DocumentType),
+}
+
 /// #743 – Review state of a self-submitted arbiter application.
 #[contracttype]
 #[derive(Clone, PartialEq, Debug)]
@@ -2282,6 +2389,27 @@ pub enum ChainSettleError {
     TokenDepegged = 19,
     /// TVL cap for escrow token exceeded (#559).
     TvlCapExceeded = 20,
+    // -- #735 Goods return (RMA) --
+    /// The proof review window has already closed.
+    ReturnWindowClosed = 21,
+    /// A return request already exists for this milestone.
+    ReturnAlreadyRequested = 22,
+    /// No return request exists for this milestone.
+    ReturnNotFound = 23,
+    /// The supplier has not accepted the return request.
+    ReturnNotAccepted = 24,
+    /// Return proof has not been submitted yet.
+    ReturnProofMissing = 25,
+    /// Same idempotency key reused with different creation parameters.
+    IdempotencyParamsMismatch = 26,
+    /// A price clause had a non-positive base price or an invalid down band.
+    InvalidPriceAdjustmentClause = 27,
+    /// An upward adjustment exceeded the agreed band.
+    PriceAdjustmentOutOfBand = 28,
+    /// Upward adjustment is blocked until the buyer tops up the escrow.
+    PriceAdjustmentUnderfunded = 29,
+    /// A required trade document has not been attached yet.
+    RequiredDocumentsMissing = 30,
 }
 
 // ============================================================
@@ -8377,6 +8505,28 @@ impl ChainSettleContract {
     }
 
     fn apply_shipment_options_ext(env: &Env, shipment_id: &String, ext: &ShipmentOptionsExt) {
+        if let Some(ref requirements) = ext.required_documents {
+            for requirement in requirements.iter() {
+                Self::set_persistent6(
+                    env,
+                    &DataKeyExt6::RequiredDocuments(
+                        shipment_id.clone(),
+                        requirement.milestone_index,
+                    ),
+                    &requirement.doc_types,
+                );
+            }
+        }
+        if let Some(ref clause) = ext.price_adjustment {
+            if clause.base_price <= 0 || clause.max_down_bps >= 10_000 {
+                soroban_sdk::panic_with_error!(env, ChainSettleError::InvalidPriceAdjustmentClause);
+            }
+            Self::set_persistent6(
+                env,
+                &DataKeyExt6::PriceAdjustment(shipment_id.clone()),
+                clause,
+            );
+        }
         if *ext == ShipmentOptionsExt::default() {
             return;
         }
@@ -8407,6 +8557,8 @@ impl ChainSettleContract {
                 ext.po_reference.clone(),
                 ext.refund_to_vault,
                 ext.fee_bearer,
+                ext.price_adjustment.clone(),
+                ext.required_documents.clone(),
             ),
         );
     }
@@ -12036,6 +12188,9 @@ impl ChainSettleContract {
             panic!("milestone proof not yet submitted");
         }
 
+        // #733: Letter-of-credit style document checklist gating confirmation.
+        Self::assert_required_documents(&env, &shipment_id, milestone_index);
+
         // #543: Inspected milestones require inspector sign-off before confirmation.
         Self::assert_inspection_complete(&env, &shipment_id, milestone_index);
 
@@ -12083,6 +12238,9 @@ impl ChainSettleContract {
 
         let gross_payment = Self::milestone_gross_payment(&env, &shipment, milestone_index);
         let mut payment = gross_payment;
+
+        // #732: rescale unpaid milestone payouts from the registered oracle.
+        Self::apply_price_adjustment(&env, &shipment_id, milestone_index, &mut payment, &buyer);
 
         // #754: clearing a customs milestone releases duties to the broker exactly once.
         let milestone_name = milestone.name.clone();
@@ -12946,6 +13104,18 @@ impl ChainSettleContract {
     }
 
     pub fn raise_dispute(env: Env, buyer: Address, shipment_id: String, milestone_index: u32) {
+        Self::raise_dispute_inner(env, buyer, shipment_id, milestone_index, false);
+    }
+
+    /// `skip_auth` lets the #735 return-escalation path escalate on the
+    /// supplier's authority alone, reusing the existing dispute machinery.
+    fn raise_dispute_inner(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        skip_auth: bool,
+    ) {
         Self::assert_operation_not_paused(&env, Symbol::new(&env, "dispute"));
 
         let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
@@ -12961,12 +13131,14 @@ impl ChainSettleContract {
         let grade_key = DataKeyExt3::PendingGrade(shipment_id.clone(), milestone_index);
         let pending_grade: Option<(u32, u32)> = env.storage().persistent().get(&grade_key);
         let supplier_grade_dispute = pending_grade.is_some() && buyer == shipment.supplier;
-        if supplier_grade_dispute {
-            buyer.require_auth();
-        } else {
-            Self::require_buyer_auth_with_org_override(&env, &shipment, &buyer);
-            if pending_grade.is_some() {
-                panic!("graded milestone can only be disputed by the supplier");
+        if !skip_auth {
+            if supplier_grade_dispute {
+                buyer.require_auth();
+            } else {
+                Self::require_buyer_auth_with_org_override(&env, &shipment, &buyer);
+                if pending_grade.is_some() {
+                    panic!("graded milestone can only be disputed by the supplier");
+                }
             }
         }
 
@@ -18724,7 +18896,33 @@ impl ChainSettleContract {
         total_amount: i128,
         milestones: Vec<Milestone>,
         options: ShipmentOptions,
+        idempotency_key: Option<String>,
     ) -> String {
+        // A retried call with the same key and identical parameters returns the
+        // original shipment instead of funding a duplicate.
+        let idem = if let Some(ref key) = idempotency_key {
+            let buyer = buyers.get(0).unwrap_or_else(|| panic!("no buyer supplied"));
+            let fingerprint = Self::idempotency_fingerprint(
+                &env, &buyers, &supplier, &logistics, &arbiter, &token,
+                total_amount, &milestones, &options,
+            );
+            let ikey = DataKeyExt6::IdempotencyKey(buyer, key.clone());
+            if let Some(record) =
+                env.storage().persistent().get::<DataKeyExt6, IdempotencyRecord>(&ikey)
+            {
+                if record.params_hash != fingerprint {
+                    soroban_sdk::panic_with_error!(
+                        &env,
+                        ChainSettleError::IdempotencyParamsMismatch
+                    );
+                }
+                return record.shipment_id;
+            }
+            Some((ikey, fingerprint, key.clone()))
+        } else {
+            None
+        };
+
         let count: u64 = env
             .storage()
             .instance()
@@ -18737,7 +18935,7 @@ impl ChainSettleContract {
 
         let auto_id = Self::format_auto_id(&env, next_count);
         Self::create_shipment(
-            env,
+            env.clone(),
             auto_id.clone(),
             buyers,
             supplier,
@@ -18748,7 +18946,384 @@ impl ChainSettleContract {
             milestones,
             options,
         );
+
+        if let Some((ikey, fingerprint, key)) = idem {
+            let ttl: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKeyExt6::IdempotencyTtlLedgers)
+                .unwrap_or(constants::TTL_INITIAL_LEDGERS);
+            env.storage().persistent().set(
+                &ikey,
+                &IdempotencyRecord {
+                    shipment_id: auto_id.clone(),
+                    params_hash: fingerprint,
+                },
+            );
+            env.storage().persistent().extend_ttl(&ikey, ttl, ttl);
+            env.events().publish(
+                (Symbol::new(&env, "shipment_idempotency_recorded"), auto_id.clone()),
+                key,
+            );
+        }
         auto_id
+    }
+
+    /// Stable hash of all creation parameters, used to detect key reuse with
+    /// different parameters.
+    fn idempotency_fingerprint(
+        env: &Env,
+        buyers: &Vec<Address>,
+        supplier: &Address,
+        logistics: &Address,
+        arbiter: &Address,
+        token: &Address,
+        total_amount: i128,
+        milestones: &Vec<Milestone>,
+        options: &ShipmentOptions,
+    ) -> BytesN<32> {
+        let params: Val = (
+            buyers.clone(),
+            supplier.clone(),
+            logistics.clone(),
+            arbiter.clone(),
+            token.clone(),
+            total_amount,
+            milestones.clone(),
+            options.clone(),
+        )
+            .into_val(env);
+        let xdr = soroban_sdk::xdr::ToXdr::to_xdr(&params, env);
+        env.crypto().sha256(&xdr).into()
+    }
+
+    /// Admin configures the ledger window for which idempotency keys live.
+    pub fn set_idempotency_ttl(env: Env, admin: Address, ledgers: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        if ledgers == 0 {
+            panic!("idempotency ttl must be positive");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKeyExt6::IdempotencyTtlLedgers, &ledgers);
+        env.events()
+            .publish((Symbol::new(&env, "idempotency_ttl_set"),), ledgers);
+    }
+
+    // ----------------------------------------------------------
+    // #733 REQUIRED TRADE-DOCUMENT SETS
+    // ----------------------------------------------------------
+
+    /// Attach one typed trade document hash to a milestone. The existing
+    /// `attach_invoice_hash` / `attach_bol_hash` helpers remain unchanged.
+    pub fn attach_document(
+        env: Env,
+        caller: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        doc_type: DocumentType,
+        hash: BytesN<32>,
+    ) {
+        caller.require_auth();
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if milestone_index >= shipment.milestones.len() {
+            panic!("invalid milestone index");
+        }
+        let key = DataKeyExt6::AttachedDocument(
+            shipment_id.clone(),
+            milestone_index,
+            doc_type.clone(),
+        );
+        Self::set_persistent6(&env, &key, &hash);
+        env.events().publish(
+            (Symbol::new(&env, "document_attached"), shipment_id),
+            (milestone_index, doc_type, hash),
+        );
+    }
+
+    /// Panics with a typed error while any required document is missing.
+    fn assert_required_documents(env: &Env, shipment_id: &String, milestone_index: u32) {
+        let required: Option<Vec<DocumentType>> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt6::RequiredDocuments(shipment_id.clone(), milestone_index));
+        let Some(required) = required else { return; };
+        for doc_type in required.iter() {
+            let key = DataKeyExt6::AttachedDocument(
+                shipment_id.clone(),
+                milestone_index,
+                doc_type,
+            );
+            if !env.storage().persistent().has(&key) {
+                soroban_sdk::panic_with_error!(env, ChainSettleError::RequiredDocumentsMissing);
+            }
+        }
+    }
+
+    // ----------------------------------------------------------
+    // #732 COMMODITY PRICE ADJUSTMENT CLAUSE
+    // ----------------------------------------------------------
+
+    /// Buyer pre-funds a possible upward price adjustment for a milestone.
+    pub fn top_up_price_adjustment(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        amount: i128,
+    ) {
+        buyer.require_auth();
+        if amount <= 0 {
+            panic!("top-up amount must be positive");
+        }
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if milestone_index >= shipment.milestones.len() {
+            panic!("invalid milestone index");
+        }
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        let token = milestone.token.clone().unwrap_or_else(|| shipment.token.clone());
+        token::Client::new(&env, &token).transfer(&buyer, &env.current_contract_address(), &amount, &[]);
+        Self::increase_total_escrowed(&env, &token, amount);
+        let key = DataKeyExt6::PriceTopUp(shipment_id.clone(), milestone_index);
+        let prior: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(prior + amount));
+        env.events().publish(
+            (Symbol::new(&env, "price_top_up"), shipment_id),
+            (milestone_index, amount),
+        );
+    }
+
+    /// Applies the capped oracle adjustment to `payment`. Upward moves consume
+    /// a prior top-up (blocking release if insufficient); downward moves are
+    /// refunded to the buyer immediately.
+    fn apply_price_adjustment(
+        env: &Env,
+        shipment_id: &String,
+        milestone_index: u32,
+        payment: &mut i128,
+        buyer: &Address,
+    ) {
+        let clause: Option<PriceAdjustmentClause> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt6::PriceAdjustment(shipment_id.clone()));
+        let Some(clause) = clause else { return; };
+        let shipment = Self::get_shipment_internal(env, shipment_id);
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        let token = milestone.token.clone().unwrap_or_else(|| shipment.token.clone());
+        let price = PriceOracleClient::new(env, &clause.oracle).get_price(&token);
+        if price <= 0 {
+            soroban_sdk::panic_with_error!(env, ChainSettleError::PriceAdjustmentOutOfBand);
+        }
+        let raw_bps = price.saturating_mul(10_000) / clause.base_price;
+        let lower = 10_000i128.saturating_sub(clause.max_down_bps as i128).max(1);
+        let upper = 10_000i128.saturating_add(clause.max_up_bps as i128);
+        if raw_bps < lower || raw_bps > upper {
+            soroban_sdk::panic_with_error!(env, ChainSettleError::PriceAdjustmentOutOfBand);
+        }
+        let old = *payment;
+        let new_amount = old.saturating_mul(raw_bps) / 10_000;
+        if new_amount > old {
+            let delta = new_amount - old;
+            let key = DataKeyExt6::PriceTopUp(shipment_id.clone(), milestone_index);
+            let topped: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            if topped < delta {
+                soroban_sdk::panic_with_error!(env, ChainSettleError::PriceAdjustmentUnderfunded);
+            }
+            if topped == delta {
+                env.storage().persistent().remove(&key);
+            } else {
+                env.storage().persistent().set(&key, &(topped - delta));
+            }
+        } else if new_amount < old {
+            let delta = old - new_amount;
+            token::Client::new(env, &token).transfer(
+                &env.current_contract_address(),
+                buyer,
+                &delta,
+                &[],
+            );
+            Self::decrease_total_escrowed(env, &token, delta);
+        }
+        *payment = new_amount;
+        env.events().publish(
+            (Symbol::new(env, "price_adj"), shipment_id.clone()),
+            (milestone_index, old, new_amount),
+        );
+    }
+
+    // ----------------------------------------------------------
+    // #735 GOODS RETURN (RMA) FLOW
+    // ----------------------------------------------------------
+
+    /// Buyer rejects delivered goods inside the proof review window.
+    pub fn request_return(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        reason_hash: BytesN<32>,
+    ) {
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "confirm"));
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        Self::require_buyer_auth_with_org_override(&env, &shipment, &buyer);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if milestone_index >= shipment.milestones.len() {
+            panic!("invalid milestone index");
+        }
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        if milestone.status != MilestoneStatus::ProofSubmitted {
+            panic!("milestone proof not yet submitted");
+        }
+        let window = Self::get_effective_auto_confirm_window(&env, &shipment);
+        let proof_ledger = milestone.proof_submitted_ledger.unwrap_or(0);
+        if window == 0 || env.ledger().sequence() >= proof_ledger + window {
+            soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnWindowClosed);
+        }
+        let key = DataKeyExt6::ReturnRequest(shipment_id.clone(), milestone_index);
+        if env.storage().persistent().has(&key) {
+            soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnAlreadyRequested);
+        }
+        Self::set_persistent6(
+            &env,
+            &key,
+            &ReturnRequest {
+                buyer: buyer.clone(),
+                reason_hash: reason_hash.clone(),
+                status: ReturnStatus::Requested,
+                created_ledger: env.ledger().sequence(),
+                proof_hash: None,
+            },
+        );
+        env.events().publish(
+            (Symbol::new(&env, "return_requested"), shipment_id),
+            (milestone_index, buyer, reason_hash),
+        );
+    }
+
+    /// Supplier accepts a routine return instead of going to arbitration.
+    pub fn accept_return(env: Env, supplier: Address, shipment_id: String, milestone_index: u32) {
+        supplier.require_auth();
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if supplier != shipment.supplier {
+            panic!("unauthorized");
+        }
+        let key = DataKeyExt6::ReturnRequest(shipment_id.clone(), milestone_index);
+        let mut request: ReturnRequest = env.storage().persistent().get(&key)
+            .unwrap_or_else(|| soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnNotFound));
+        if request.status != ReturnStatus::Requested {
+            soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnNotAccepted);
+        }
+        request.status = ReturnStatus::Accepted;
+        Self::set_persistent6(&env, &key, &request);
+        env.events().publish(
+            (Symbol::new(&env, "return_accepted"), shipment_id),
+            milestone_index,
+        );
+    }
+
+    /// Supplier escalates the rejection to the existing dispute flow.
+    pub fn escalate_return(env: Env, supplier: Address, shipment_id: String, milestone_index: u32) {
+        supplier.require_auth();
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if supplier != shipment.supplier {
+            panic!("unauthorized");
+        }
+        let key = DataKeyExt6::ReturnRequest(shipment_id.clone(), milestone_index);
+        let mut request: ReturnRequest = env.storage().persistent().get(&key)
+            .unwrap_or_else(|| soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnNotFound));
+        if request.status != ReturnStatus::Requested && request.status != ReturnStatus::Accepted {
+            soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnNotAccepted);
+        }
+        request.status = ReturnStatus::Escalated;
+        Self::set_persistent6(&env, &key, &request);
+        let buyer = request.buyer.clone();
+        Self::raise_dispute_inner(env.clone(), buyer, shipment_id.clone(), milestone_index, true);
+        env.events().publish(
+            (Symbol::new(&env, "return_escalated"), shipment_id),
+            milestone_index,
+        );
+    }
+
+    /// Logistics uploads proof that the rejected goods were returned.
+    pub fn submit_return_proof(
+        env: Env,
+        logistics: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        proof_hash: BytesN<32>,
+    ) {
+        logistics.require_auth();
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if logistics != shipment.logistics {
+            panic!("unauthorized");
+        }
+        let key = DataKeyExt6::ReturnRequest(shipment_id.clone(), milestone_index);
+        let mut request: ReturnRequest = env.storage().persistent().get(&key)
+            .unwrap_or_else(|| soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnNotFound));
+        if request.status != ReturnStatus::Accepted {
+            soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnNotAccepted);
+        }
+        request.status = ReturnStatus::ProofSubmitted;
+        request.proof_hash = Some(proof_hash.clone());
+        Self::set_persistent6(&env, &key, &request);
+        env.events().publish(
+            (Symbol::new(&env, "return_proof_submitted"), shipment_id),
+            (milestone_index, proof_hash),
+        );
+    }
+
+    /// Supplier confirms receipt of the returned goods: only now is the
+    /// milestone amount refunded to the buyer.
+    pub fn confirm_return_receipt(
+        env: Env,
+        supplier: Address,
+        shipment_id: String,
+        milestone_index: u32,
+    ) {
+        supplier.require_auth();
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if supplier != shipment.supplier {
+            panic!("unauthorized");
+        }
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if milestone_index >= shipment.milestones.len() {
+            panic!("invalid milestone index");
+        }
+        let key = DataKeyExt6::ReturnRequest(shipment_id.clone(), milestone_index);
+        let mut request: ReturnRequest = env.storage().persistent().get(&key)
+            .unwrap_or_else(|| soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnNotFound));
+        if request.status != ReturnStatus::ProofSubmitted {
+            soroban_sdk::panic_with_error!(&env, ChainSettleError::ReturnProofMissing);
+        }
+        let amount = Self::milestone_gross_payment(&env, &shipment, milestone_index);
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        let payout_token = milestone.token.clone().unwrap_or_else(|| shipment.token.clone());
+        token::Client::new(&env, &payout_token).transfer(
+            &env.current_contract_address(),
+            &request.buyer,
+            &amount,
+            &[],
+        );
+        Self::decrease_total_escrowed(&env, &payout_token, amount);
+        let mut milestone = milestone;
+        milestone.status = MilestoneStatus::Resolved;
+        shipment.milestones.set(milestone_index, milestone);
+        env.storage().persistent().set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+        request.status = ReturnStatus::Completed;
+        Self::set_persistent6(&env, &key, &request);
+        env.events().publish(
+            (Symbol::new(&env, "return_refunded"), shipment_id),
+            (milestone_index, amount),
+        );
     }
 
     fn format_auto_id(env: &Env, num: u64) -> String {
@@ -25746,6 +26321,15 @@ impl ChainSettleContract {
         );
     }
 
+    fn set_persistent6<V: IntoVal<Env, Val>>(env: &Env, key: &DataKeyExt6, value: &V) {
+        env.storage().persistent().set(key, value);
+        env.storage().persistent().extend_ttl(
+            key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
     fn decrease_total_escrowed(env: &Env, token: &Address, amount: i128) {
         let key = DataKey::TotalEscrowed(token.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -27266,6 +27850,28 @@ impl ChainSettleContract {
     }
 
     fn apply_shipment_options_ext(env: &Env, shipment_id: &String, ext: &ShipmentOptionsExt) {
+        if let Some(ref requirements) = ext.required_documents {
+            for requirement in requirements.iter() {
+                Self::set_persistent6(
+                    env,
+                    &DataKeyExt6::RequiredDocuments(
+                        shipment_id.clone(),
+                        requirement.milestone_index,
+                    ),
+                    &requirement.doc_types,
+                );
+            }
+        }
+        if let Some(ref clause) = ext.price_adjustment {
+            if clause.base_price <= 0 || clause.max_down_bps >= 10_000 {
+                soroban_sdk::panic_with_error!(env, ChainSettleError::InvalidPriceAdjustmentClause);
+            }
+            Self::set_persistent6(
+                env,
+                &DataKeyExt6::PriceAdjustment(shipment_id.clone()),
+                clause,
+            );
+        }
         if *ext == ShipmentOptionsExt::default() {
             return;
         }
@@ -27731,6 +28337,18 @@ mod test_issue_753;
 
 #[cfg(test)]
 mod test_issue_749;
+
+#[cfg(test)]
+mod test_issue_735;
+
+#[cfg(test)]
+mod test_issue_736;
+
+#[cfg(test)]
+mod test_issue_732;
+
+#[cfg(test)]
+mod test_issue_733;
 
 #[cfg(test)]
 mod test_bol_endorsement;
