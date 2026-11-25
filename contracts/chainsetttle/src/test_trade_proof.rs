@@ -38,6 +38,8 @@ fn single_milestone(env: &soroban_sdk::Env) -> Vec<Milestone> {
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
             not_before_ledger: 0,
+        
+            logistics: None,
         },
     ]
 }
@@ -57,6 +59,8 @@ fn two_milestones(env: &soroban_sdk::Env) -> Vec<Milestone> {
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
             not_before_ledger: 0,
+        
+            logistics: None,
         },
         Milestone {
             name: String::from_str(env, "B"),
@@ -70,6 +74,8 @@ fn two_milestones(env: &soroban_sdk::Env) -> Vec<Milestone> {
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
             not_before_ledger: 0,
+        
+            logistics: None,
         },
     ]
 }

@@ -157,6 +157,8 @@ pub struct Milestone {
     pub penalty_bps_per_ledger: u32,
     /// #749: Optional escrow token for this milestone; None = shipment token.
     pub token: Option<Address>,
+    /// #756: Optional logistics provider for this milestone; None = shipment logistics.
+    pub logistics: Option<Address>,
 }
 
 #[contracttype]
@@ -684,6 +686,16 @@ pub struct InspectionRecord {
     pub report_hash: BytesN<32>,
     pub signed_ledger: u32,
 }
+
+// ── #757 Payout-time compliance registry ─────────────────────────────────────
+mod compliance_registry {
+    use soroban_sdk::{contractclient, Address, Env};
+    #[contractclient(name = "ComplianceRegistryClient")]
+    pub trait ComplianceRegistry {
+        fn is_flagged(env: Env, party: Address) -> bool;
+    }
+}
+pub use compliance_registry::ComplianceRegistryClient;
 
 // ── #558 Price Oracle Client & Depeg Guard Config ────────────────────────────
 mod price_oracle {
@@ -2030,6 +2042,27 @@ pub enum DataKeyExt5 {
     ShipmentFeeToken(String),
     /// Fee bearer for the shipment (absent = `FeeBearer::Supplier`).
     ShipmentFeeBearer(String),
+
+    // ── #758 Negotiable bill-of-lading endorsement ────────────────────────
+    /// Current BOL holder for a shipment.
+    BolHolder(String),
+    /// Append-only endorsement history for a shipment.
+    BolEndorsements(String),
+
+    // ── #757 Payout-time compliance re-check ──────────────────────────────
+    /// Admin toggle for payout-time compliance checks.
+    PayoutComplianceEnabled,
+    /// External compliance registry contract address.
+    PayoutComplianceRegistry,
+}
+
+/// #758 – A single negotiable BOL endorsement record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BolEndorsement {
+    pub from: Address,
+    pub to: Address,
+    pub ledger: u32,
 }
 
 /// `DataKeyExt5` is at the 50-variant XDR ceiling, so keys added from here on
@@ -6975,6 +7008,16 @@ impl ChainSettleContract {
             constants::TTL_INITIAL_LEDGERS,
             constants::TTL_MAX_LEDGERS,
         );
+        // #758: first BOL attachment establishes the initial holder.
+        let holder_key = DataKeyExt5::BolHolder(shipment_id.clone());
+        if !env.storage().persistent().has(&holder_key) {
+            env.storage().persistent().set(&holder_key, &caller);
+            env.storage().persistent().extend_ttl(
+                &holder_key,
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+        }
         Self::append_audit_entry(
             &env,
             &mut shipment,
@@ -7013,6 +7056,67 @@ impl ChainSettleContract {
         env.storage()
             .persistent()
             .get(&DataKeyExt4::DocHashOwner(doc_hash))
+    }
+
+    // ----------------------------------------------------------
+    // #758 – NEGOTIABLE BILL-OF-LADING ENDORSEMENT
+    // ----------------------------------------------------------
+
+    /// Endorses the shipment's negotiable BOL to `to`. Only the current
+    /// BOL holder may endorse. Each endorsement is appended to on-chain history.
+    pub fn endorse_bol(env: Env, caller: Address, shipment_id: String, to: Address) {
+        caller.require_auth();
+        Self::assert_not_paused(&env);
+        let _shipment = Self::get_shipment_internal(&env, &shipment_id);
+
+        let holder_key = DataKeyExt5::BolHolder(shipment_id.clone());
+        let current_holder: Address = env
+            .storage()
+            .persistent()
+            .get(&holder_key)
+            .expect("no BOL holder");
+        if caller != current_holder {
+            panic!("only current BOL holder can endorse");
+        }
+
+        let entry = BolEndorsement {
+            from: current_holder.clone(),
+            to: to.clone(),
+            ledger: env.ledger().sequence(),
+        };
+        let hist_key = DataKeyExt5::BolEndorsements(shipment_id.clone());
+        let mut history: Vec<BolEndorsement> = env
+            .storage()
+            .persistent()
+            .get(&hist_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        history.push_back(entry.clone());
+        env.storage().persistent().set(&hist_key, &history);
+        env.storage().persistent().extend_ttl(
+            &hist_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        env.storage().persistent().set(&holder_key, &to);
+        env.storage().persistent().extend_ttl(
+            &holder_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "bol_endorsed"), shipment_id),
+            (current_holder, to, entry.ledger),
+        );
+    }
+
+    /// Returns the append-only BOL endorsement history for a shipment.
+    pub fn get_bol_endorsements(env: Env, shipment_id: String) -> Vec<BolEndorsement> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::BolEndorsements(shipment_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     // ----------------------------------------------------------
@@ -9542,6 +9646,18 @@ impl ChainSettleContract {
             DataKeyExt4::LogisticsShipments(logistics.clone()),
             &shipment_id,
         );
+        // #756: index per-milestone logistics carriers.
+        for i in 0..milestones.len() {
+            if let Some(ml) = milestones.get(i).unwrap().logistics.clone() {
+                if ml != logistics {
+                    Self::add_to_party_index(
+                        &env,
+                        DataKeyExt4::LogisticsShipments(ml),
+                        &shipment_id,
+                    );
+                }
+            }
+        }
 
         // Add to AllShipments list for pagination.
         let mut all_shipments: Vec<String> = env
@@ -9836,6 +9952,8 @@ impl ChainSettleContract {
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
             not_before_ledger: 0,
+        
+            logistics: None,
         });
         shipment.milestones = milestones;
         shipment.total_amount += amount;
@@ -11080,7 +11198,8 @@ impl ChainSettleContract {
         // pending proof; the milestone stays Pending until the other party attests.
         let dual_required = Self::requires_dual_attestation(&env, &shipment_id);
         if dual_required {
-            if caller != shipment.supplier && caller != shipment.logistics {
+            let milestone_logistics = Self::milestone_logistics(&shipment, milestone_index);
+            if caller != shipment.supplier && caller != milestone_logistics {
                 panic!("dual attestation requires supplier or logistics");
             }
             let pending_key = DataKeyExt3::PendingDualProof(shipment_id.clone(), milestone_index);
@@ -12259,6 +12378,8 @@ impl ChainSettleContract {
                 }
             }
 
+            // #757: re-check compliance before releasing funds.
+            Self::check_payout_compliance(&env, &mut shipment, &shipment_id, milestone_index);
             // Check circuit breaker before transferring payment
             Self::check_circuit_breaker(&env, payment);
             Self::check_address_outflow(&env, &shipment.supplier, payment);
@@ -12322,7 +12443,7 @@ impl ChainSettleContract {
                     actual_transfer -= logistics_fee;
                     token_client.transfer(
                         &env.current_contract_address(),
-                        &shipment.logistics,
+                        &Self::milestone_logistics(&shipment, milestone_index),
                         &logistics_fee,
                     );
                 }
@@ -12558,6 +12679,7 @@ impl ChainSettleContract {
         if shipment.status != ShipmentStatus::Active {
             panic!("shipment is not active");
         }
+        Self::assert_shipment_not_on_hold(&env, &shipment_id);
 
         let mut milestone = shipment.milestones.get(milestone_index).unwrap();
 
@@ -12580,6 +12702,9 @@ impl ChainSettleContract {
             None => gross,
         };
         let grade_refund = gross - payment;
+
+        // #757: re-check compliance before releasing funds.
+        Self::check_payout_compliance(&env, &mut shipment, &shipment_id, milestone_index);
 
         // Deduct any approved advance for this milestone.
         let advance_deducted =
@@ -12612,7 +12737,7 @@ impl ChainSettleContract {
                 actual_transfer -= logistics_fee;
                 token_client.transfer(
                     &env.current_contract_address(),
-                    &shipment.logistics,
+                    &Self::milestone_logistics(&shipment, milestone_index),
                     &logistics_fee,
                 );
             }
@@ -16073,6 +16198,8 @@ impl ChainSettleContract {
         let mut fee_amount: i128 = 0;
         let net_payment = Self::deduct_fee(&env, payment, &shipment.token, &shipment_id, &mut fee_amount);
 
+        // #757: re-check compliance before releasing funds.
+        Self::check_payout_compliance(&env, &mut shipment, &shipment_id, milestone_index);
         // Check circuit breaker before transferring payment
         Self::check_circuit_breaker(&env, payment);
         Self::check_address_outflow(&env, &shipment.supplier, payment);
@@ -16109,7 +16236,7 @@ impl ChainSettleContract {
                 actual_transfer -= logistics_fee;
                 token_client.transfer(
                     &env.current_contract_address(),
-                    &shipment.logistics,
+                    &Self::milestone_logistics(&shipment, milestone_index),
                     &logistics_fee,
                 );
             }
@@ -17421,7 +17548,8 @@ impl ChainSettleContract {
         if !Self::requires_dual_attestation(&env, &shipment_id) {
             panic!("dual attestation not required for this shipment");
         }
-        if caller != shipment.supplier && caller != shipment.logistics {
+        let milestone_logistics = Self::milestone_logistics(&shipment, milestone_index);
+        if caller != shipment.supplier && caller != milestone_logistics {
             panic!("unauthorized");
         }
 
@@ -20373,6 +20501,24 @@ impl ChainSettleContract {
             .has(&DataKeyExt2::ComplianceHold(shipment_id))
     }
 
+    /// #757: Enable or disable payout-time compliance re-checks.
+    pub fn set_payout_compliance_enabled(env: Env, admin: Address, enabled: bool) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKeyExt5::PayoutComplianceEnabled, &enabled);
+    }
+
+    /// #757: Set the external compliance registry used for payout-time checks.
+    pub fn set_payout_compliance_registry(env: Env, admin: Address, registry: Address) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKeyExt5::PayoutComplianceRegistry, &registry);
+    }
+
     fn assert_shipment_not_on_hold(env: &Env, shipment_id: &String) {
         if env
             .storage()
@@ -20380,6 +20526,70 @@ impl ChainSettleContract {
             .has(&DataKeyExt2::ComplianceHold(shipment_id.clone()))
         {
             panic!("shipment is on compliance hold pending review");
+        }
+    }
+
+    fn check_payout_compliance(
+        env: &Env,
+        shipment: &mut Shipment,
+        shipment_id: &String,
+        milestone_index: u32,
+    ) {
+        let enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt5::PayoutComplianceEnabled)
+            .unwrap_or(false);
+        if !enabled {
+            return;
+        }
+        let registry: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt5::PayoutComplianceRegistry);
+        let Some(registry) = registry else {
+            return;
+        };
+        let client = ComplianceRegistryClient::new(env, &registry);
+        let mut parties: Vec<Address> = Vec::new(env);
+        parties.push_back(shipment.supplier.clone());
+        parties.push_back(shipment.logistics.clone());
+        for b in shipment.buyers.iter() {
+            parties.push_back(b);
+        }
+        for party in parties.iter() {
+            if client.is_flagged(&party) {
+                // Apply compliance hold and move milestone to held state.
+                let hold_key = DataKeyExt2::ComplianceHold(shipment_id.clone());
+                let reason = BytesN::from_array(env, &[0u8; 32]);
+                env.storage().persistent().set(&hold_key, &reason);
+                env.storage().persistent().extend_ttl(
+                    &hold_key,
+                    constants::TTL_INITIAL_LEDGERS,
+                    constants::TTL_MAX_LEDGERS,
+                );
+
+                let mut milestone = shipment.milestones.get(milestone_index).unwrap();
+                milestone.status = MilestoneStatus::ConfirmedHeld;
+                if milestone.release_after_ledger < env.ledger().sequence() {
+                    milestone.release_after_ledger = env.ledger().sequence();
+                }
+                shipment.milestones.set(milestone_index, milestone);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Shipment(shipment_id.clone()), shipment);
+                env.storage().persistent().extend_ttl(
+                    &DataKey::Shipment(shipment_id.clone()),
+                    constants::TTL_INITIAL_LEDGERS,
+                    constants::TTL_MAX_LEDGERS,
+                );
+
+                env.events().publish(
+                    (Symbol::new(env, "payout_blocked"), shipment_id.clone()),
+                    (milestone_index, party),
+                );
+                panic!("payout blocked: compliance check failed");
+            }
         }
     }
 
@@ -25468,7 +25678,7 @@ impl ChainSettleContract {
                     actual_transfer -= logistics_fee;
                     token_client.transfer(
                         &env.current_contract_address(),
-                        &shipment.logistics,
+                        &Self::milestone_logistics(&shipment, milestone_index),
                         &logistics_fee,
                     );
                 }
@@ -25919,6 +26129,15 @@ impl ChainSettleContract {
 
     /// Designated-submitter check of `require_proof_submitter_auth`, without
     /// requiring auth (for callers that already authorized `caller`).
+    fn milestone_logistics(shipment: &Shipment, milestone_index: u32) -> Address {
+        if let Some(m) = shipment.milestones.get(milestone_index) {
+            if let Some(l) = m.logistics.clone() {
+                return l;
+            }
+        }
+        shipment.logistics.clone()
+    }
+
     fn assert_proof_submitter(
         env: &Env,
         shipment: &Shipment,
@@ -25939,8 +26158,11 @@ impl ChainSettleContract {
             .get::<_, Vec<Address>>(&DataKeyExt3::ProofSubmitters(shipment_id.clone()))
             .map(|s| !s.is_empty())
             .unwrap_or(false);
-        if !has_explicit_submitters && *caller == shipment.logistics {
-            return;
+        if !has_explicit_submitters {
+            let milestone_logistics = Self::milestone_logistics(shipment, milestone_index);
+            if *caller == milestone_logistics {
+                return;
+            }
         }
         panic!("unauthorized");
     }
@@ -28127,3 +28349,12 @@ mod test_issue_732;
 
 #[cfg(test)]
 mod test_issue_733;
+
+#[cfg(test)]
+mod test_bol_endorsement;
+
+#[cfg(test)]
+mod test_payout_compliance;
+
+#[cfg(test)]
+mod test_milestone_logistics;

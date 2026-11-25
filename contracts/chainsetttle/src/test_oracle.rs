@@ -75,6 +75,8 @@ fn build_single_milestone(env: &Env) -> Vec<Milestone> {
         deadline_ledger: 0,
         penalty_bps_per_ledger: 0,
         not_before_ledger: 0,
+    
+        logistics: None,
     });
     v
 }
@@ -93,6 +95,8 @@ fn build_three_milestones(env: &Env) -> Vec<Milestone> {
         deadline_ledger: 0,
         penalty_bps_per_ledger: 0,
         not_before_ledger: 0,
+    
+        logistics: None,
     });
     v.push_back(Milestone {
         name: String::from_str(&env, "Transit"),
@@ -106,6 +110,8 @@ fn build_three_milestones(env: &Env) -> Vec<Milestone> {
         deadline_ledger: 0,
         penalty_bps_per_ledger: 0,
         not_before_ledger: 0,
+    
+        logistics: None,
     });
     v.push_back(Milestone {
         name: String::from_str(&env, "Delivery"),
@@ -119,6 +125,8 @@ fn build_three_milestones(env: &Env) -> Vec<Milestone> {
         deadline_ledger: 0,
         penalty_bps_per_ledger: 0,
         not_before_ledger: 0,
+    
+        logistics: None,
     });
     v
 }

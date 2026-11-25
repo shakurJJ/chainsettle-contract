@@ -92,6 +92,8 @@ fn build_milestones_n(env: &Env, count: u32) -> soroban_sdk::Vec<Milestone> {
             deadline_ledger: 0,
             penalty_bps_per_ledger: 0,
             not_before_ledger: 0,
+        
+            logistics: None,
         });
     }
 
