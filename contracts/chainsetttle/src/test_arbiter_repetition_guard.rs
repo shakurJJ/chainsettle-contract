@@ -268,3 +268,160 @@ fn test_panel_requires_open_dispute() {
     );
     client.assign_dispute_panel(&t.buyer, &shipment_id, &0u32, &3u32);
 }
+
+// ============================================================
+// Additional repetition guard tests
+// ============================================================
+
+#[test]
+fn test_history_size_zero_disables_guard_completely() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    client.set_arbiter_history_size(&t.buyer, &0u32);
+    let pool = add_pool(&t, &client, 2);
+
+    // Even with explicit zero, guard should remain disabled
+    let s1 = open_dispute(&t, &client, "z1", &t.supplier, &t.contract_id);
+    let s2 = open_dispute(&t, &client, "z2", &t.supplier, &t.contract_id);
+    
+    // Should cycle back to first arbiter without skipping
+    assert_eq!(client.get_shipment(&s1).arbiter, pool[0]);
+    assert_eq!(client.get_shipment(&s2).arbiter, pool[1]);
+    
+    let s3 = open_dispute(&t, &client, "z3", &t.supplier, &t.contract_id);
+    assert_eq!(client.get_shipment(&s3).arbiter, pool[0]);
+}
+
+#[test]
+fn test_multiple_suppliers_maintain_independent_histories() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    client.set_arbiter_history_size(&t.buyer, &2u32);
+    let pool = add_pool(&t, &client, 4);
+    
+    let supplier2 = Address::generate(&t.env);
+    let supplier3 = Address::generate(&t.env);
+
+    // Each supplier gets different arbiters
+    open_dispute(&t, &client, "m1", &t.supplier, &t.contract_id);
+    open_dispute(&t, &client, "m2", &supplier2, &t.contract_id);
+    open_dispute(&t, &client, "m3", &t.supplier, &t.contract_id);
+    open_dispute(&t, &client, "m4", &supplier3, &t.contract_id);
+
+    let hist1 = client.get_supplier_recent_arbiters(&t.supplier);
+    let hist2 = client.get_supplier_recent_arbiters(&supplier2);
+    let hist3 = client.get_supplier_recent_arbiters(&supplier3);
+
+    // All histories should be independent
+    assert_eq!(hist1.len(), 2);
+    assert_eq!(hist2.len(), 1);
+    assert_eq!(hist3.len(), 1);
+    
+    // Verify they're tracking different arbiters
+    assert_eq!(hist1.get(0).unwrap(), pool[0]);
+    assert_eq!(hist1.get(1).unwrap(), pool[2]);
+    assert_eq!(hist2.get(0).unwrap(), pool[1]);
+    assert_eq!(hist3.get(0).unwrap(), pool[3]);
+}
+
+#[test]
+fn test_history_size_can_be_reduced_and_truncates_existing() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    client.set_arbiter_history_size(&t.buyer, &5u32);
+    let pool = add_pool(&t, &client, 5);
+
+    // Create 5 disputes to fill history
+    for i in 0..5 {
+        open_dispute(&t, &client, &format!("h{}", i), &t.supplier, &t.contract_id);
+    }
+    
+    assert_eq!(client.get_supplier_recent_arbiters(&t.supplier).len(), 5);
+    
+    // Reduce history size to 2
+    client.set_arbiter_history_size(&t.buyer, &2u32);
+    
+    // Create one more dispute to trigger trimming
+    open_dispute(&t, &client, "h5", &t.supplier, &t.contract_id);
+    
+    // History should now only keep the most recent 2
+    let recent = client.get_supplier_recent_arbiters(&t.supplier);
+    assert_eq!(recent.len(), 2);
+    // Should have the last two arbiters from the sequence
+    assert_eq!(recent.get(0).unwrap(), pool[4]);
+    assert_eq!(recent.get(1).unwrap(), pool[0]);
+}
+
+#[test]
+fn test_panel_with_max_history_cycles_through_all_pool_members() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let pool_size = 9u32;
+    let panel_size = 3u32;
+    
+    client.set_arbiter_history_size(&t.buyer, &6u32);
+    let pool = add_pool(&t, &client, pool_size);
+
+    // First panel
+    let s1 = open_dispute(&t, &client, "c1", &t.supplier, &t.arbiter);
+    let panel1 = client.assign_dispute_panel(&t.buyer, &s1, &0u32, &panel_size);
+    
+    // Second panel should avoid all three from panel1
+    let s2 = open_dispute(&t, &client, "c2", &t.supplier, &t.arbiter);
+    let panel2 = client.assign_dispute_panel(&t.buyer, &s2, &0u32, &panel_size);
+    
+    // Third panel should avoid all six recent arbiters
+    let s3 = open_dispute(&t, &client, "c3", &t.supplier, &t.arbiter);
+    let panel3 = client.assign_dispute_panel(&t.buyer, &s3, &0u32, &panel_size);
+    
+    // Verify no overlap between consecutive panels
+    for a in panel2.iter() {
+        assert!(!panel1.contains(a));
+    }
+    for a in panel3.iter() {
+        assert!(!panel1.contains(a));
+        assert!(!panel2.contains(a));
+    }
+    
+    // All three panels together should cover all pool members
+    let mut all_used = std::collections::HashSet::new();
+    for a in panel1.iter() {
+        all_used.insert(a.clone());
+    }
+    for a in panel2.iter() {
+        all_used.insert(a.clone());
+    }
+    for a in panel3.iter() {
+        all_used.insert(a.clone());
+    }
+    assert_eq!(all_used.len(), pool_size as usize);
+}
+
+#[test]
+fn test_appeal_with_full_history_still_draws_from_pool() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    client.set_arbiter_history_size(&t.buyer, &3u32);
+    client.set_appeal_window_ledgers(&t.buyer, &50u32);
+    let pool = add_pool(&t, &client, 4);
+
+    // Fill up the supplier's history with 3 arbiters
+    for i in 0..3 {
+        let s = open_dispute(&t, &client, &format!("af{}", i), &t.supplier, &t.contract_id);
+        // Resolve immediately so we can keep opening disputes
+        client.resolve_dispute(&client.get_shipment(&s).arbiter, &s, &0u32, &true, &None);
+    }
+    
+    // Now create a dispute with a non-pool arbiter and appeal it
+    let s_appeal = open_dispute(&t, &client, "af_appeal", &t.supplier, &t.arbiter);
+    client.resolve_dispute(&t.arbiter, &s_appeal, &0u32, &true, &None);
+    client.appeal_dispute(&t.buyer, &s_appeal, &0u32);
+    
+    // The appeal should draw from the pool, skipping the 3 recent arbiters
+    let appeal_arbiter = client.get_shipment(&s_appeal).arbiter;
+    assert!(pool.contains(&appeal_arbiter));
+    
+    // Should be the one pool member not in recent history
+    let recent = client.get_supplier_recent_arbiters(&t.supplier);
+    assert!(!recent.contains(&appeal_arbiter));
+}
