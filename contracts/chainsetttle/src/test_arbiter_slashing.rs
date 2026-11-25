@@ -243,3 +243,178 @@ fn test_add_arbiter_to_pool_rejects_slashed_arbiter_without_reinstatement() {
 
     client.add_arbiter_to_pool(&t.buyer, &t.arbiter);
 }
+
+#[test]
+fn test_multiple_arbiters_slashed_independently() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let arbiter2 = Address::generate(&t.env);
+    let arbiter3 = Address::generate(&t.env);
+    
+    client.add_arbiter_to_pool(&t.buyer, &t.arbiter);
+    client.add_arbiter_to_pool(&t.buyer, &arbiter2);
+    client.add_arbiter_to_pool(&t.buyer, &arbiter3);
+    client.set_appeal_window_ledgers(&t.buyer, &50u32);
+    client.set_max_overturned_before_slash(&t.buyer, &2u32);
+
+    // First arbiter gets overturned twice
+    let ship_id_1 = sid(&t.env, "s1");
+    create_standard(&t, &client, &ship_id_1, &t.arbiter);
+    open_resolve_appeal_overturn(&t, &client, &ship_id_1, &t.arbiter);
+    
+    let ship_id_2 = sid(&t.env, "s2");
+    create_standard(&t, &client, &ship_id_2, &t.arbiter);
+    open_resolve_appeal_overturn(&t, &client, &ship_id_2, &t.arbiter);
+    
+    assert!(client.is_arbiter_slashed(&t.arbiter));
+    assert_eq!(client.get_arbiter_stats(&t.arbiter).overturned_count, 2);
+
+    // Second arbiter gets overturned twice
+    let ship_id_3 = sid(&t.env, "s3");
+    create_standard(&t, &client, &ship_id_3, &arbiter2);
+    open_resolve_appeal_overturn(&t, &client, &ship_id_3, &arbiter2);
+    
+    let ship_id_4 = sid(&t.env, "s4");
+    create_standard(&t, &client, &ship_id_4, &arbiter2);
+    open_resolve_appeal_overturn(&t, &client, &ship_id_4, &arbiter2);
+    
+    assert!(client.is_arbiter_slashed(&arbiter2));
+    assert_eq!(client.get_arbiter_stats(&arbiter2).overturned_count, 2);
+
+    // Third arbiter should still be in good standing
+    assert!(!client.is_arbiter_slashed(&arbiter3));
+    assert_eq!(client.get_arbiter_stats(&arbiter3).overturned_count, 0);
+
+    let pool = client.get_arbiter_pool();
+    assert!(!pool.contains(&t.arbiter));
+    assert!(!pool.contains(&arbiter2));
+    assert!(pool.contains(&arbiter3));
+}
+
+#[test]
+fn test_reinstate_arbiter_resets_overturned_count() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let arbiter2 = Address::generate(&t.env);
+    client.add_arbiter_to_pool(&t.buyer, &t.arbiter);
+    client.add_arbiter_to_pool(&t.buyer, &arbiter2);
+    client.set_appeal_window_ledgers(&t.buyer, &50u32);
+    client.set_max_overturned_before_slash(&t.buyer, &2u32);
+
+    // Get one overturn
+    let ship_id_1 = sid(&t.env, "s1");
+    create_standard(&t, &client, &ship_id_1, &t.arbiter);
+    open_resolve_appeal_overturn(&t, &client, &ship_id_1, &t.arbiter);
+    
+    let stats_before = client.get_arbiter_stats(&t.arbiter);
+    assert_eq!(stats_before.overturned_count, 1);
+    assert!(!client.is_arbiter_slashed(&t.arbiter));
+
+    // Get second overturn to trigger slash
+    let ship_id_2 = sid(&t.env, "s2");
+    create_standard(&t, &client, &ship_id_2, &t.arbiter);
+    open_resolve_appeal_overturn(&t, &client, &ship_id_2, &t.arbiter);
+    
+    assert!(client.is_arbiter_slashed(&t.arbiter));
+    assert_eq!(client.get_arbiter_stats(&t.arbiter).overturned_count, 2);
+
+    // Reinstate and verify count is reset
+    client.reinstate_arbiter(&t.buyer, &t.arbiter);
+    
+    let stats_after = client.get_arbiter_stats(&t.arbiter);
+    assert_eq!(stats_after.overturned_count, 0);
+    assert!(!client.is_arbiter_slashed(&t.arbiter));
+}
+
+#[test]
+fn test_changing_threshold_does_not_retroactively_slash() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let arbiter2 = Address::generate(&t.env);
+    client.add_arbiter_to_pool(&t.buyer, &t.arbiter);
+    client.add_arbiter_to_pool(&t.buyer, &arbiter2);
+    client.set_appeal_window_ledgers(&t.buyer, &50u32);
+    client.set_max_overturned_before_slash(&t.buyer, &5u32);
+
+    // Accumulate 2 overturns under threshold of 5
+    let ship_id_1 = sid(&t.env, "s1");
+    create_standard(&t, &client, &ship_id_1, &t.arbiter);
+    open_resolve_appeal_overturn(&t, &client, &ship_id_1, &t.arbiter);
+    
+    let ship_id_2 = sid(&t.env, "s2");
+    create_standard(&t, &client, &ship_id_2, &t.arbiter);
+    open_resolve_appeal_overturn(&t, &client, &ship_id_2, &t.arbiter);
+    
+    assert_eq!(client.get_arbiter_stats(&t.arbiter).overturned_count, 2);
+    assert!(!client.is_arbiter_slashed(&t.arbiter));
+
+    // Lower threshold to 1 - should not retroactively slash
+    client.set_max_overturned_before_slash(&t.buyer, &1u32);
+    assert!(!client.is_arbiter_slashed(&t.arbiter));
+    
+    // But the next overturn should trigger slash at the new threshold
+    let ship_id_3 = sid(&t.env, "s3");
+    create_standard(&t, &client, &ship_id_3, &t.arbiter);
+    open_resolve_appeal_overturn(&t, &client, &ship_id_3, &t.arbiter);
+    
+    // With 3 overturns and threshold of 1, should now be slashed
+    assert!(client.is_arbiter_slashed(&t.arbiter));
+    assert_eq!(client.get_arbiter_stats(&t.arbiter).overturned_count, 3);
+}
+
+#[test]
+fn test_arbiter_stats_persist_across_multiple_disputes() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let arbiter2 = Address::generate(&t.env);
+    client.add_arbiter_to_pool(&t.buyer, &t.arbiter);
+    client.add_arbiter_to_pool(&t.buyer, &arbiter2);
+    client.set_appeal_window_ledgers(&t.buyer, &50u32);
+    client.set_max_overturned_before_slash(&t.buyer, &10u32);
+
+    // Track incrementing overturns
+    for i in 1..=5 {
+        let ship_id = sid(&t.env, &std::format!("ship_{}", i));
+        create_standard(&t, &client, &ship_id, &t.arbiter);
+        open_resolve_appeal_overturn(&t, &client, &ship_id, &t.arbiter);
+        
+        let stats = client.get_arbiter_stats(&t.arbiter);
+        assert_eq!(stats.overturned_count, i);
+        assert!(!client.is_arbiter_slashed(&t.arbiter), "Should not be slashed at count {}", i);
+    }
+
+    // Verify final count
+    let final_stats = client.get_arbiter_stats(&t.arbiter);
+    assert_eq!(final_stats.overturned_count, 5);
+    assert!(!client.is_arbiter_slashed(&t.arbiter));
+}
+
+#[test]
+#[should_panic(expected = "arbiter already slashed")]
+fn test_cannot_reinstate_arbiter_twice_consecutively() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let arbiter2 = Address::generate(&t.env);
+    client.add_arbiter_to_pool(&t.buyer, &t.arbiter);
+    client.add_arbiter_to_pool(&t.buyer, &arbiter2);
+    client.set_appeal_window_ledgers(&t.buyer, &50u32);
+    client.set_max_overturned_before_slash(&t.buyer, &1u32);
+
+    let ship_id = sid(&t.env, "s1");
+    create_standard(&t, &client, &ship_id, &t.arbiter);
+    open_resolve_appeal_overturn(&t, &client, &ship_id, &t.arbiter);
+    
+    assert!(client.is_arbiter_slashed(&t.arbiter));
+
+    // First reinstatement should succeed
+    client.reinstate_arbiter(&t.buyer, &t.arbiter);
+    assert!(!client.is_arbiter_slashed(&t.arbiter));
+
+    // Second reinstatement should panic - arbiter is not slashed
+    client.reinstate_arbiter(&t.buyer, &t.arbiter);
+}
