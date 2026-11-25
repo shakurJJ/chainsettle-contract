@@ -111,3 +111,6 @@ pub const MAX_METADATA_INDEX_ENTRIES: u32 = 100;
 
 /// #745: Maximum byte length of a buyer purchase-order reference.
 pub const MAX_PO_REFERENCE_LEN: u32 = 64;
+
+/// Fixed-point scale for time-decayed reputation counters (#790).
+pub const REPUTATION_DECAY_SCALE: u64 = 1_000_000;
