@@ -1975,6 +1975,82 @@ pub enum DataKeyExt5 {
     PayoutComplianceEnabled,
     /// External compliance registry contract address.
     PayoutComplianceRegistry,
+
+    // ── #786 Framework agreements with call-off shipments ─────────────────
+    /// Framework agreement record keyed by framework id.
+    Framework(u64),
+    /// Next framework id to allocate.
+    NextFrameworkId,
+    /// Shipment ids created as call-offs against a framework.
+    FrameworkCallOffs(u64),
+
+    // ── #789 Third-party surety collateral ────────────────────────────────
+    /// Admin-approved surety addresses.
+    ApprovedSurety(Address),
+    /// Surety deposit backing a shipment's supplier collateral.
+    SuretyDeposit(String),
+
+    // ── #790 Time-decayed supplier reputation ─────────────────────────────
+    /// Reputation half-life in ledgers (absent / 0 = decay disabled).
+    ReputationHalfLife,
+    /// Fixed-point, lazily decayed reputation counters for a supplier.
+    DecayedReputation(Address),
+}
+
+/// #786 – Terms inherited by every call-off shipment under a framework.
+#[contracttype]
+#[derive(Clone)]
+pub struct FrameworkTerms {
+    pub token: Address,
+    pub logistics: Address,
+    pub arbiter: Address,
+    pub milestones: Vec<Milestone>,
+    pub options: ShipmentOptions,
+}
+
+/// #786 – Framework agreement signed by a buyer and supplier.
+#[contracttype]
+#[derive(Clone)]
+pub struct FrameworkAgreement {
+    pub framework_id: u64,
+    pub buyer: Address,
+    pub supplier: Address,
+    /// Cumulative cap on call-off value.
+    pub cap: i128,
+    /// Cumulative value already called off.
+    pub used: i128,
+    pub terms: FrameworkTerms,
+    /// Ledger at/after which no new call-offs may be created.
+    pub expires_at: u32,
+    pub created_ledger: u32,
+}
+
+/// #786 – Per-call-off parameters; everything else is inherited from the framework.
+#[contracttype]
+#[derive(Clone)]
+pub struct CallOffParams {
+    pub shipment_id: String,
+    pub amount: i128,
+}
+
+/// #789 – Collateral posted by a third-party surety on a supplier's behalf.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SuretyDeposit {
+    pub surety: Address,
+    /// Portion of the shipment's locked collateral owned by the surety.
+    pub amount: i128,
+}
+
+/// #790 – Fixed-point (`REPUTATION_DECAY_SCALE`) decayed reputation counters,
+/// last decayed at `last_ledger`.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecayedReputation {
+    pub completed: u64,
+    pub disputed: u64,
+    pub cancelled: u64,
+    pub last_ledger: u32,
 }
 
 /// #758 – A single negotiable BOL endorsement record.
@@ -3438,11 +3514,35 @@ impl ChainSettleContract {
             .unwrap_or(constants::DEFAULT_MAX_DISPUTE_BOND_BPS)
     }
 
+    /// Supplier reputation. When a reputation half-life is configured (#790),
+    /// counters are time-decayed so recent outcomes weigh more than old ones.
     pub fn get_reputation(env: Env, supplier: Address) -> ReputationScore {
+        Self::get_reputation_internal(&env, &supplier)
+    }
+
+    /// #790: Raw lifetime reputation counters, never decayed.
+    pub fn get_lifetime_reputation(env: Env, supplier: Address) -> ReputationScore {
+        Self::get_lifetime_reputation_internal(&env, &supplier)
+    }
+
+    /// #790: Admin sets the reputation half-life in ledgers. `0` disables
+    /// decay (lifetime counters are used, the pre-existing behaviour).
+    /// Decay is applied lazily on read and on each reputation update.
+    pub fn set_reputation_half_life(env: Env, admin: Address, ledgers: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
         env.storage()
-            .persistent()
-            .get(&DataKey::SupplierRep(supplier.clone()))
-            .unwrap_or_default()
+            .instance()
+            .set(&DataKeyExt5::ReputationHalfLife, &ledgers);
+        env.events().publish(
+            (Symbol::new(&env, "reputation_half_life_set"),),
+            ledgers,
+        );
+    }
+
+    /// #790: Configured reputation half-life in ledgers (`0` = disabled).
+    pub fn get_reputation_half_life(env: Env) -> u32 {
+        Self::reputation_half_life(&env)
     }
 
     /// #631 – Returns the supplier's on-time vs late confirmed-milestone
@@ -4292,6 +4392,186 @@ impl ChainSettleContract {
             .unwrap_or_else(|| panic!("standing order not found"))
     }
 
+    // ----------------------------------------------------------
+    // #786 – FRAMEWORK AGREEMENTS WITH CALL-OFF SHIPMENTS
+    // ----------------------------------------------------------
+
+    /// Buyer and supplier sign a framework agreement with shared terms and a
+    /// cumulative value `cap`. Call-offs created before `expires_at` (a ledger
+    /// sequence) inherit the terms. Returns the new framework id.
+    pub fn create_framework(
+        env: Env,
+        buyer: Address,
+        supplier: Address,
+        cap: i128,
+        terms: FrameworkTerms,
+        expires_at: u32,
+    ) -> u64 {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        buyer.require_auth();
+        supplier.require_auth();
+
+        if buyer == supplier {
+            panic!("buyer and supplier must differ");
+        }
+        if cap < constants::MIN_SHIPMENT_AMOUNT {
+            panic!("cap must be greater than zero");
+        }
+        if expires_at <= env.ledger().sequence() {
+            panic!("expires_at must be in the future");
+        }
+        if terms.milestones.is_empty() {
+            panic!("at least one milestone is required");
+        }
+        let mut total_percent: u32 = 0;
+        for i in 0..terms.milestones.len() {
+            total_percent += terms.milestones.get(i).unwrap().payment_percent;
+        }
+        if total_percent != 100 {
+            panic!("milestone percentages must sum to 100");
+        }
+
+        let framework_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt5::NextFrameworkId)
+            .unwrap_or(1u64);
+        env.storage()
+            .instance()
+            .set(&DataKeyExt5::NextFrameworkId, &(framework_id + 1));
+
+        let framework = FrameworkAgreement {
+            framework_id,
+            buyer: buyer.clone(),
+            supplier: supplier.clone(),
+            cap,
+            used: 0,
+            terms,
+            expires_at,
+            created_ledger: env.ledger().sequence(),
+        };
+        let key = DataKeyExt5::Framework(framework_id);
+        env.storage().persistent().set(&key, &framework);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "framework_created"), framework_id),
+            (buyer, supplier, cap, expires_at),
+        );
+        framework_id
+    }
+
+    /// Buyer creates a call-off shipment under a framework. The shipment inherits
+    /// the framework's token, logistics, arbiter, milestones and options; only the
+    /// shipment id and amount are supplied. Rejected once the framework has
+    /// expired or when the amount would exceed the remaining cap.
+    pub fn create_call_off(env: Env, framework_id: u64, params: CallOffParams) -> String {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_operation_not_paused(&env, Symbol::new(&env, "create"));
+
+        let key = DataKeyExt5::Framework(framework_id);
+        let mut framework = Self::get_framework_internal(&env, framework_id);
+        framework.buyer.require_auth();
+
+        if env.ledger().sequence() >= framework.expires_at {
+            panic!("framework expired");
+        }
+        if params.amount < constants::MIN_SHIPMENT_AMOUNT {
+            panic!("amount must be greater than zero");
+        }
+        let remaining = framework.cap - framework.used;
+        if params.amount > remaining {
+            panic!("call-off exceeds framework cap");
+        }
+
+        framework.used += params.amount;
+        env.storage().persistent().set(&key, &framework);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        let mut buyers = Vec::new(&env);
+        buyers.push_back(framework.buyer.clone());
+
+        // Buyer auth was taken above; the supplier signed the framework terms.
+        env.storage()
+            .instance()
+            .set(&DataKeyExt4::SkipBuyerAuth, &true);
+
+        let created = Self::create_shipment(
+            env.clone(),
+            params.shipment_id,
+            buyers,
+            framework.supplier.clone(),
+            framework.terms.logistics.clone(),
+            framework.terms.arbiter.clone(),
+            framework.terms.token.clone(),
+            params.amount,
+            framework.terms.milestones.clone(),
+            framework.terms.options.clone(),
+        );
+
+        let calls_key = DataKeyExt5::FrameworkCallOffs(framework_id);
+        let mut calls: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&calls_key)
+            .unwrap_or(Vec::new(&env));
+        calls.push_back(created.clone());
+        env.storage().persistent().set(&calls_key, &calls);
+        env.storage().persistent().extend_ttl(
+            &calls_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "call_off_created"), framework_id),
+            (created.clone(), params.amount, framework.cap - framework.used),
+        );
+        created
+    }
+
+    /// Framework agreement by id.
+    pub fn get_framework(env: Env, framework_id: u64) -> FrameworkAgreement {
+        Self::get_framework_internal(&env, framework_id)
+    }
+
+    /// Cap still available for call-offs (0 once the framework has expired).
+    pub fn get_framework_remaining_cap(env: Env, framework_id: u64) -> i128 {
+        let framework = Self::get_framework_internal(&env, framework_id);
+        if env.ledger().sequence() >= framework.expires_at {
+            return 0;
+        }
+        (framework.cap - framework.used).max(0)
+    }
+
+    /// Shipment ids created as call-offs against a framework.
+    pub fn get_framework_call_offs(env: Env, framework_id: u64) -> Vec<String> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::FrameworkCallOffs(framework_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    fn get_framework_internal(env: &Env, framework_id: u64) -> FrameworkAgreement {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::Framework(framework_id))
+            .unwrap_or_else(|| panic!("framework not found"))
+    }
+
     fn standing_shipment_id(env: &Env, order_id: u64, occurrence: u32) -> String {
         let mut buf = [0u8; 64];
         let mut len = 0usize;
@@ -4648,6 +4928,198 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
+    // #789 THIRD-PARTY SURETY COLLATERAL
+    // ----------------------------------------------------------
+
+    /// Admin approves (or revokes) an address as a surety allowed to post
+    /// supplier collateral.
+    pub fn set_approved_surety(env: Env, admin: Address, surety: Address, approved: bool) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        let key = DataKeyExt5::ApprovedSurety(surety.clone());
+        if approved {
+            env.storage().persistent().set(&key, &true);
+            env.storage().persistent().extend_ttl(
+                &key,
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+        env.events().publish(
+            (Symbol::new(&env, "surety_approval_set"), surety),
+            approved,
+        );
+    }
+
+    /// Whether `surety` is approved to post supplier collateral.
+    pub fn is_approved_surety(env: Env, surety: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::ApprovedSurety(surety))
+            .unwrap_or(false)
+    }
+
+    /// Surety deposit backing a shipment's supplier collateral, if any.
+    pub fn get_surety_deposit(env: Env, shipment_id: String) -> Option<SuretyDeposit> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt5::SuretyDeposit(shipment_id))
+    }
+
+    /// An approved surety posts `amount` of collateral on the supplier's behalf.
+    ///
+    /// The deposit joins the shipment's locked supplier collateral. Any collateral
+    /// the supplier locked themselves is substituted (returned to the supplier) up
+    /// to `amount`, so the surety bond replaces the supplier's own capital.
+    /// Slashes and forfeits draw on the surety deposit first, and collateral
+    /// returned on completion or incremental release goes to the surety first.
+    pub fn post_surety_collateral(env: Env, surety: Address, shipment_id: String, amount: i128) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        surety.require_auth();
+
+        if amount <= 0 {
+            panic!("amount must be greater than zero");
+        }
+        if !Self::is_approved_surety(env.clone(), surety.clone()) {
+            panic!("unauthorized: surety is not approved");
+        }
+
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("surety collateral only allowed on active shipments");
+        }
+        if surety == shipment.supplier {
+            panic!("supplier cannot act as its own surety");
+        }
+
+        let deposit_key = DataKeyExt5::SuretyDeposit(shipment_id.clone());
+        let mut deposit: SuretyDeposit = env
+            .storage()
+            .persistent()
+            .get(&deposit_key)
+            .unwrap_or(SuretyDeposit {
+                surety: surety.clone(),
+                amount: 0,
+            });
+        if deposit.surety != surety && deposit.amount > 0 {
+            panic!("shipment is already backed by another surety");
+        }
+        deposit.surety = surety.clone();
+
+        let token_client = token::Client::new(&env, &shipment.token);
+        token_client.transfer(&surety, &env.current_contract_address(), &amount);
+
+        let collateral_key = DataKey::SupplierCollateral(shipment_id.clone());
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&collateral_key)
+            .unwrap_or(0);
+        let supplier_own = (current - deposit.amount).max(0);
+        let substituted = supplier_own.min(amount);
+        if substituted > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &shipment.supplier,
+                &substituted,
+            );
+        }
+
+        let new_balance = current - substituted + amount;
+        deposit.amount += amount;
+        env.storage()
+            .persistent()
+            .set(&collateral_key, &new_balance);
+        env.storage().persistent().set(&deposit_key, &deposit);
+        env.storage().persistent().extend_ttl(
+            &collateral_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        env.storage().persistent().extend_ttl(
+            &deposit_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "surety_posted"), shipment_id),
+            (surety, amount, substituted, deposit.amount, new_balance),
+        );
+    }
+
+    /// #789: Debits `amount` of collateral that is leaving the pool to the buyer
+    /// or treasury (slash / forfeit) from the surety deposit first, emitting a
+    /// `surety_draw` event for the portion drawn from the surety.
+    fn draw_surety_collateral(env: &Env, shipment_id: &String, amount: i128, kind: Symbol) {
+        if amount <= 0 {
+            return;
+        }
+        let key = DataKeyExt5::SuretyDeposit(shipment_id.clone());
+        let deposit: Option<SuretyDeposit> = env.storage().persistent().get(&key);
+        let Some(mut deposit) = deposit else {
+            return;
+        };
+        let drawn = deposit.amount.min(amount);
+        if drawn <= 0 {
+            return;
+        }
+        deposit.amount -= drawn;
+        env.storage().persistent().set(&key, &deposit);
+        env.events().publish(
+            (Symbol::new(env, "surety_draw"), shipment_id.clone()),
+            (deposit.surety, kind, drawn, deposit.amount),
+        );
+    }
+
+    /// #789: Returns `amount` of collateral owed back to the collateral provider.
+    /// The surety's share is refunded to the surety first; any remainder goes to
+    /// the supplier.
+    fn return_supplier_collateral(
+        env: &Env,
+        shipment_id: &String,
+        shipment: &Shipment,
+        token_client: &token::Client,
+        amount: i128,
+    ) {
+        if amount <= 0 {
+            return;
+        }
+        let key = DataKeyExt5::SuretyDeposit(shipment_id.clone());
+        let deposit: Option<SuretyDeposit> = env.storage().persistent().get(&key);
+        let mut to_supplier = amount;
+        if let Some(mut deposit) = deposit {
+            let to_surety = deposit.amount.min(amount);
+            if to_surety > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &deposit.surety,
+                    &to_surety,
+                );
+                deposit.amount -= to_surety;
+                to_supplier -= to_surety;
+                env.storage().persistent().set(&key, &deposit);
+                env.events().publish(
+                    (Symbol::new(env, "surety_refund"), shipment_id.clone()),
+                    (deposit.surety, to_surety, deposit.amount),
+                );
+            }
+        }
+        if to_supplier > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &shipment.supplier,
+                &to_supplier,
+            );
+        }
+    }
+
+    // ----------------------------------------------------------
     // #553 CONFIGURABLE REFUND RECIPIENT
     // ----------------------------------------------------------
 
@@ -4756,6 +5228,8 @@ impl ChainSettleContract {
             .unwrap_or(0);
         if collateral > 0 {
             Self::refund_to_buyer(&env, &shipment_id, &shipment, collateral);
+            // #789: forfeited collateral is drawn from the surety deposit first.
+            Self::draw_surety_collateral(&env, &shipment_id, collateral, Symbol::new(&env, "forfeit"));
         }
 
         Self::refund_holdbacks_on_cancel(&env, &shipment_id, &mut shipment, buyer.clone());
@@ -4854,10 +5328,13 @@ impl ChainSettleContract {
         if share <= 0 {
             return;
         }
-        token::Client::new(env, &shipment.token).transfer(
-            &env.current_contract_address(),
-            &shipment.supplier,
-            &share,
+        // #789: the surety's share is returned to the surety first.
+        Self::return_supplier_collateral(
+            env,
+            shipment_id,
+            shipment,
+            &token::Client::new(env, &shipment.token),
+            share,
         );
         env.storage()
             .persistent()
@@ -4991,6 +5468,8 @@ impl ChainSettleContract {
         }
 
         Self::refund_to_buyer(&env, &shipment_id, &shipment, slash);
+        // #789: slashes reduce the surety deposit first.
+        Self::draw_surety_collateral(&env, &shipment_id, slash, Symbol::new(&env, "slash"));
         env.storage()
             .persistent()
             .set(&collateral_key, &(remaining - slash));
@@ -12436,10 +12915,13 @@ impl ChainSettleContract {
                     .get(&DataKey::SupplierCollateral(shipment_id.clone()))
                     .unwrap_or(0);
                 if collateral > 0 {
-                    token_client.transfer(
-                        &env.current_contract_address(),
-                        &shipment.supplier,
-                        &collateral,
+                    // #789: surety-posted collateral is refunded to the surety.
+                    Self::return_supplier_collateral(
+                        &env,
+                        &shipment_id,
+                        &shipment,
+                        &token_client,
+                        collateral,
                     );
                 }
 
@@ -15254,6 +15736,8 @@ impl ChainSettleContract {
             .unwrap_or(0);
         if collateral > 0 {
             Self::refund_to_buyer(&env, &shipment_id, &shipment, collateral);
+            // #789: forfeited collateral is drawn from the surety deposit first.
+            Self::draw_surety_collateral(&env, &shipment_id, collateral, Symbol::new(&env, "forfeit"));
         }
 
         Self::refund_holdbacks_on_cancel(env, shipment_id, &mut shipment, buyer.clone());
@@ -17804,6 +18288,8 @@ impl ChainSettleContract {
             .unwrap_or(0);
         if collateral > 0 {
             Self::pay_refund(&env, &shipment_id, &shipment, &primary_buyer, collateral);
+            // #789: forfeited collateral is drawn from the surety deposit first.
+            Self::draw_surety_collateral(&env, &shipment_id, collateral, Symbol::new(&env, "forfeit"));
         }
 
         // Update total escrowed tracking.
@@ -18018,6 +18504,8 @@ impl ChainSettleContract {
             .unwrap_or(0);
         if collateral > 0 {
             token_client.transfer(&env.current_contract_address(), &fee_config.treasury, &collateral);
+            // #789: swept collateral is drawn from the surety deposit first.
+            Self::draw_surety_collateral(&env, &shipment_id, collateral, Symbol::new(&env, "sweep"));
         }
 
         let current_escrowed: i128 = env
@@ -21787,11 +22275,123 @@ impl ChainSettleContract {
             .set(&DataKey::CircuitBreakerWindowOutflow, &window_outflow);
     }
 
+    /// Effective reputation: lifetime counters, or their time-decayed view when
+    /// a reputation half-life is configured (#790).
     fn get_reputation_internal(env: &Env, supplier: &Address) -> ReputationScore {
+        let half_life = Self::reputation_half_life(env);
+        if half_life > 0 {
+            if let Some(rec) = Self::decayed_reputation_now(env, supplier, half_life) {
+                return ReputationScore {
+                    completed: Self::decayed_fp_to_count(rec.completed),
+                    disputed: Self::decayed_fp_to_count(rec.disputed),
+                    cancelled: Self::decayed_fp_to_count(rec.cancelled),
+                };
+            }
+        }
+        Self::get_lifetime_reputation_internal(env, supplier)
+    }
+
+    /// Raw, never-decayed lifetime reputation counters.
+    fn get_lifetime_reputation_internal(env: &Env, supplier: &Address) -> ReputationScore {
         env.storage()
             .persistent()
             .get(&DataKey::SupplierRep(supplier.clone()))
             .unwrap_or_default()
+    }
+
+    fn reputation_half_life(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt5::ReputationHalfLife)
+            .unwrap_or(0)
+    }
+
+    /// #790: Halves `value` once per elapsed half-life, interpolating linearly
+    /// within a partial half-life. Exact at half-life boundaries and monotonic.
+    fn decay_reputation_fp(value: u64, elapsed: u32, half_life: u32) -> u64 {
+        if half_life == 0 || value == 0 || elapsed == 0 {
+            return value;
+        }
+        let halvings = elapsed / half_life;
+        if halvings >= 64 {
+            return 0;
+        }
+        let shifted = (value >> halvings) as u128;
+        let rem = (elapsed % half_life) as u128;
+        let two_hl = 2 * half_life as u128;
+        (shifted * (two_hl - rem) / two_hl) as u64
+    }
+
+    fn decayed_fp_to_count(fp: u64) -> u32 {
+        let scale = constants::REPUTATION_DECAY_SCALE;
+        let rounded = fp.saturating_add(scale / 2) / scale;
+        rounded.min(u32::MAX as u64) as u32
+    }
+
+    /// Stored decayed counters brought forward to the current ledger (not persisted).
+    fn decayed_reputation_now(
+        env: &Env,
+        supplier: &Address,
+        half_life: u32,
+    ) -> Option<DecayedReputation> {
+        let rec: Option<DecayedReputation> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt5::DecayedReputation(supplier.clone()));
+        rec.map(|mut r| {
+            let now = env.ledger().sequence();
+            let elapsed = now.saturating_sub(r.last_ledger);
+            r.completed = Self::decay_reputation_fp(r.completed, elapsed, half_life);
+            r.disputed = Self::decay_reputation_fp(r.disputed, elapsed, half_life);
+            r.cancelled = Self::decay_reputation_fp(r.cancelled, elapsed, half_life);
+            r.last_ledger = now;
+            r
+        })
+    }
+
+    /// #790: Applies lazy decay and the new deltas to the supplier's decayed
+    /// counters. Seeds from lifetime counters on first use. When decay is
+    /// disabled the decayed record is dropped so re-enabling starts fresh.
+    fn update_decayed_reputation(
+        env: &Env,
+        supplier: &Address,
+        lifetime_before: &ReputationScore,
+        completed_delta: u32,
+        disputed_delta: u32,
+        cancelled_delta: u32,
+    ) {
+        let key = DataKeyExt5::DecayedReputation(supplier.clone());
+        let half_life = Self::reputation_half_life(env);
+        if half_life == 0 {
+            if env.storage().persistent().has(&key) {
+                env.storage().persistent().remove(&key);
+            }
+            return;
+        }
+        let scale = constants::REPUTATION_DECAY_SCALE;
+        let mut rec = Self::decayed_reputation_now(env, supplier, half_life).unwrap_or(
+            DecayedReputation {
+                completed: (lifetime_before.completed as u64).saturating_mul(scale),
+                disputed: (lifetime_before.disputed as u64).saturating_mul(scale),
+                cancelled: (lifetime_before.cancelled as u64).saturating_mul(scale),
+                last_ledger: env.ledger().sequence(),
+            },
+        );
+        rec.completed = rec
+            .completed
+            .saturating_add((completed_delta as u64).saturating_mul(scale));
+        rec.disputed = rec
+            .disputed
+            .saturating_add((disputed_delta as u64).saturating_mul(scale));
+        rec.cancelled = rec
+            .cancelled
+            .saturating_add((cancelled_delta as u64).saturating_mul(scale));
+        env.storage().persistent().set(&key, &rec);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
     }
 
     fn set_reputation_internal(env: &Env, supplier: &Address, score: &ReputationScore) {
@@ -21813,7 +22413,16 @@ impl ChainSettleContract {
         disputed_delta: u32,
         cancelled_delta: u32,
     ) {
-        let mut score = Self::get_reputation_internal(env, supplier);
+        let mut score = Self::get_lifetime_reputation_internal(env, supplier);
+        // #790: Keep the decayed view in step before the tier is re-evaluated.
+        Self::update_decayed_reputation(
+            env,
+            supplier,
+            &score,
+            completed_delta,
+            disputed_delta,
+            cancelled_delta,
+        );
         score.completed = score.completed.saturating_add(completed_delta);
         score.disputed = score.disputed.saturating_add(disputed_delta);
         score.cancelled = score.cancelled.saturating_add(cancelled_delta);
@@ -21821,7 +22430,8 @@ impl ChainSettleContract {
 
         // Feature D: Check auto-blacklist rule after any reputation increment.
         if disputed_delta > 0 || cancelled_delta > 0 {
-            Self::check_auto_blacklist_internal(env, supplier, &score);
+            let effective = Self::get_reputation_internal(env, supplier);
+            Self::check_auto_blacklist_internal(env, supplier, &effective);
         }
     }
 
@@ -27740,3 +28350,12 @@ mod test_payout_compliance;
 
 #[cfg(test)]
 mod test_milestone_logistics;
+
+#[cfg(test)]
+mod test_framework_agreements;
+
+#[cfg(test)]
+mod test_surety_collateral;
+
+#[cfg(test)]
+mod test_reputation_decay;
