@@ -291,3 +291,272 @@ fn test_pool_assigned_arbiter_resolves_dispute() {
     let milestone = client.get_milestone(&ship_id, &0u32);
     assert_eq!(milestone.status, MilestoneStatus::Resolved);
 }
+
+// ============================================================
+// New Tests: Extended arbiter pool functionality
+// ============================================================
+
+#[test]
+fn test_multiple_arbiters_round_robin_distribution() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    // Add three arbiters to the pool
+    let arb1 = t.arbiter.clone();
+    let arb2 = t.buyer2.clone();
+    let arb3 = t.logistics.clone();
+    
+    client.add_arbiter_to_pool(&t.buyer, &arb1);
+    client.add_arbiter_to_pool(&t.buyer, &arb2);
+    client.add_arbiter_to_pool(&t.buyer, &arb3);
+
+    // Create three shipments and verify round-robin assignment
+    let ship1 = sid(&t.env, "multi_ship1");
+    let ship2 = sid(&t.env, "multi_ship2");
+    let ship3 = sid(&t.env, "multi_ship3");
+
+    for (i, ship_id) in [&ship1, &ship2, &ship3].iter().enumerate() {
+        client.create_shipment(
+            ship_id,
+            &single_buyer_vec(&t.env, &t.buyer),
+            &t.supplier,
+            &t.supplier, // Using supplier as logistics to free up logistics as arbiter
+            &pool_sentinel(&t),
+            &t.token_id,
+            &1_000_000,
+            &build_milestones(&t.env),
+            &default_options(&t.env),
+        );
+        client.submit_proof(
+            &t.supplier,
+            ship_id,
+            &0u32,
+            &proof_hash(&t.env),
+            &proof_type(&t.env),
+        );
+        client.raise_dispute(&t.buyer, ship_id, &0u32);
+
+        let shipment = client.get_shipment(ship_id);
+        match i {
+            0 => assert_eq!(shipment.arbiter, arb1),
+            1 => assert_eq!(shipment.arbiter, arb2),
+            2 => assert_eq!(shipment.arbiter, arb3),
+            _ => panic!("Unexpected index"),
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_non_pool_arbiter_cannot_resolve_pool_dispute() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    // Add arbiter to pool
+    client.add_arbiter_to_pool(&t.buyer, &t.arbiter);
+
+    let ship_id = sid(&t.env, "unauthorized_arb");
+    client.create_shipment(
+        &ship_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &pool_sentinel(&t),
+        &t.token_id,
+        &1_000_000,
+        &build_milestones(&t.env),
+        &default_options(&t.env),
+    );
+
+    client.submit_proof(
+        &t.supplier,
+        &ship_id,
+        &0u32,
+        &proof_hash(&t.env),
+        &proof_type(&t.env),
+    );
+    client.raise_dispute(&t.buyer, &ship_id, &0u32);
+
+    // Assigned arbiter is t.arbiter from the pool
+    // Try to resolve with a different address (buyer2) — should panic
+    client.resolve_dispute(&t.buyer2, &ship_id, &0u32, &true, &None);
+}
+
+#[test]
+fn test_remove_arbiter_does_not_affect_existing_assignments() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    client.add_arbiter_to_pool(&t.buyer, &t.arbiter);
+
+    // Create shipment and raise dispute — arbiter gets assigned
+    let ship_id = sid(&t.env, "pre_removal");
+    client.create_shipment(
+        &ship_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &pool_sentinel(&t),
+        &t.token_id,
+        &1_000_000,
+        &build_milestones(&t.env),
+        &default_options(&t.env),
+    );
+    client.submit_proof(
+        &t.supplier,
+        &ship_id,
+        &0u32,
+        &proof_hash(&t.env),
+        &proof_type(&t.env),
+    );
+    client.raise_dispute(&t.buyer, &ship_id, &0u32);
+
+    // Verify arbiter was assigned
+    assert_eq!(client.get_shipment(&ship_id).arbiter, t.arbiter);
+
+    // Remove arbiter from pool
+    client.remove_arbiter_from_pool(&t.buyer, &t.arbiter);
+    assert_eq!(client.get_arbiter_pool().len(), 0);
+
+    // The already-assigned arbiter should still be able to resolve
+    client.resolve_dispute(&t.arbiter, &ship_id, &0u32, &false, &None);
+    
+    let milestone = client.get_milestone(&ship_id, &0u32);
+    assert_eq!(milestone.status, MilestoneStatus::Pending);
+}
+
+#[test]
+fn test_pool_index_advances_only_on_dispute_raised() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    // Two arbiters in pool
+    let arb1 = t.arbiter.clone();
+    let arb2 = t.buyer2.clone();
+    client.add_arbiter_to_pool(&t.buyer, &arb1);
+    client.add_arbiter_to_pool(&t.buyer, &arb2);
+
+    // Create shipment 1 — no dispute raised yet
+    let ship1 = sid(&t.env, "no_dispute1");
+    client.create_shipment(
+        &ship1,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &pool_sentinel(&t),
+        &t.token_id,
+        &1_000_000,
+        &build_milestones(&t.env),
+        &default_options(&t.env),
+    );
+    client.submit_proof(
+        &t.supplier,
+        &ship1,
+        &0u32,
+        &proof_hash(&t.env),
+        &proof_type(&t.env),
+    );
+    // No dispute raised — confirm milestone
+    client.confirm_milestone(&t.buyer, &ship1, &0u32);
+
+    // Create shipment 2 and raise dispute — should get arb1 (first in pool)
+    let ship2 = sid(&t.env, "dispute1");
+    client.create_shipment(
+        &ship2,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &pool_sentinel(&t),
+        &t.token_id,
+        &1_000_000,
+        &build_milestones(&t.env),
+        &default_options(&t.env),
+    );
+    client.submit_proof(
+        &t.supplier,
+        &ship2,
+        &0u32,
+        &proof_hash(&t.env),
+        &proof_type(&t.env),
+    );
+    client.raise_dispute(&t.buyer, &ship2, &0u32);
+    assert_eq!(client.get_shipment(&ship2).arbiter, arb1);
+
+    // Create shipment 3 and raise dispute — should get arb2 (second in pool)
+    let ship3 = sid(&t.env, "dispute2");
+    client.create_shipment(
+        &ship3,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &pool_sentinel(&t),
+        &t.token_id,
+        &1_000_000,
+        &build_milestones(&t.env),
+        &default_options(&t.env),
+    );
+    client.submit_proof(
+        &t.supplier,
+        &ship3,
+        &0u32,
+        &proof_hash(&t.env),
+        &proof_type(&t.env),
+    );
+    client.raise_dispute(&t.buyer, &ship3, &0u32);
+    assert_eq!(client.get_shipment(&ship3).arbiter, arb2);
+}
+
+#[test]
+fn test_add_multiple_arbiters_then_remove_all() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    // Add three arbiters
+    let arb1 = t.arbiter.clone();
+    let arb2 = t.buyer2.clone();
+    let arb3 = t.logistics.clone();
+    
+    client.add_arbiter_to_pool(&t.buyer, &arb1);
+    client.add_arbiter_to_pool(&t.buyer, &arb2);
+    client.add_arbiter_to_pool(&t.buyer, &arb3);
+    assert_eq!(client.get_arbiter_pool().len(), 3);
+
+    // Remove all arbiters one by one
+    client.remove_arbiter_from_pool(&t.buyer, &arb2);
+    assert_eq!(client.get_arbiter_pool().len(), 2);
+    
+    client.remove_arbiter_from_pool(&t.buyer, &arb1);
+    assert_eq!(client.get_arbiter_pool().len(), 1);
+    assert_eq!(client.get_arbiter_pool().get(0).unwrap(), arb3);
+    
+    client.remove_arbiter_from_pool(&t.buyer, &arb3);
+    assert_eq!(client.get_arbiter_pool().len(), 0);
+
+    // Verify that pool is empty and creating a shipment with pool sentinel
+    // then raising dispute should panic
+    let ship_id = sid(&t.env, "empty_pool_ship");
+    client.create_shipment(
+        &ship_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &pool_sentinel(&t),
+        &t.token_id,
+        &1_000_000,
+        &build_milestones(&t.env),
+        &default_options(&t.env),
+    );
+    client.submit_proof(
+        &t.supplier,
+        &ship_id,
+        &0u32,
+        &proof_hash(&t.env),
+        &proof_type(&t.env),
+    );
+    
+    // This should panic due to empty pool
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.raise_dispute(&t.buyer, &ship_id, &0u32);
+    }));
+    assert!(result.is_err());
+}
