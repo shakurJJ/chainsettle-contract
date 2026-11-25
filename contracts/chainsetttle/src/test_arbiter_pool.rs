@@ -299,7 +299,7 @@ fn test_pool_assigned_arbiter_resolves_dispute() {
 #[test]
 fn test_multiple_arbiters_round_robin_distribution() {
     let t = setup();
-    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let client = ChainSettleContractClient::new(&t.env, t.contract_id);
 
     // Add three arbiters to pool
     let arb1 = t.arbiter.clone();
