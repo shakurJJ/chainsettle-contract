@@ -291,3 +291,218 @@ fn test_pool_assigned_arbiter_resolves_dispute() {
     let milestone = client.get_milestone(&ship_id, &0u32);
     assert_eq!(milestone.status, MilestoneStatus::Resolved);
 }
+
+// ============================================================
+// New Tests: Extended Arbiter Pool Functionality
+// ============================================================
+
+#[test]
+fn test_multiple_arbiters_round_robin_distribution() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    // Add three arbiters to the pool
+    let arb1 = t.arbiter.clone();
+    let arb2 = t.buyer2.clone();
+    let arb3 = t.logistics.clone();
+    client.add_arbiter_to_pool(&t.buyer, &arb1);
+    client.add_arbiter_to_pool(&t.buyer, &arb2);
+    client.add_arbiter_to_pool(&t.buyer, &arb3);
+
+    // Create three shipments and verify round-robin distribution
+    let shipments = vec![
+        (sid(&t.env, "ship_rr1"), arb1.clone()),
+        (sid(&t.env, "ship_rr2"), arb2.clone()),
+        (sid(&t.env, "ship_rr3"), arb3.clone()),
+    ];
+
+    for (ship_id, expected_arbiter) in shipments.iter() {
+        client.create_shipment(
+            ship_id,
+            &single_buyer_vec(&t.env, &t.buyer),
+            &t.supplier,
+            &t.logistics,
+            &pool_sentinel(&t),
+            &t.token_id,
+            &1_000_000,
+            &build_milestones(&t.env),
+            &default_options(&t.env),
+        );
+        client.submit_proof(
+            &t.supplier,
+            ship_id,
+            &0u32,
+            &proof_hash(&t.env),
+            &proof_type(&t.env),
+        );
+        client.raise_dispute(&t.buyer, ship_id, &0u32);
+        
+        let shipment = client.get_shipment(ship_id);
+        assert_eq!(shipment.arbiter, *expected_arbiter);
+    }
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_non_pool_arbiter_cannot_resolve_pool_dispute() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    // Add arb1 to pool
+    client.add_arbiter_to_pool(&t.buyer, &t.arbiter);
+
+    let ship_id = sid(&t.env, "ship_wrong_arb");
+    client.create_shipment(
+        &ship_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &pool_sentinel(&t),
+        &t.token_id,
+        &1_000_000,
+        &build_milestones(&t.env),
+        &default_options(&t.env),
+    );
+
+    client.submit_proof(
+        &t.supplier,
+        &ship_id,
+        &0u32,
+        &proof_hash(&t.env),
+        &proof_type(&t.env),
+    );
+    client.raise_dispute(&t.buyer, &ship_id, &0u32);
+
+    // Try to resolve with a different arbiter (not in pool or not assigned)
+    // Should panic with Unauthorized
+    client.resolve_dispute(&t.buyer2, &ship_id, &0u32, &true, &None);
+}
+
+#[test]
+fn test_remove_arbiter_does_not_affect_existing_disputes() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    // Add arbiter to pool
+    client.add_arbiter_to_pool(&t.buyer, &t.arbiter);
+
+    let ship_id = sid(&t.env, "ship_remove_test");
+    client.create_shipment(
+        &ship_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &pool_sentinel(&t),
+        &t.token_id,
+        &1_000_000,
+        &build_milestones(&t.env),
+        &default_options(&t.env),
+    );
+
+    client.submit_proof(
+        &t.supplier,
+        &ship_id,
+        &0u32,
+        &proof_hash(&t.env),
+        &proof_type(&t.env),
+    );
+    client.raise_dispute(&t.buyer, &ship_id, &0u32);
+
+    // Now remove the arbiter from pool
+    client.remove_arbiter_from_pool(&t.buyer, &t.arbiter);
+    assert_eq!(client.get_arbiter_pool().len(), 0);
+
+    // The assigned arbiter should still be able to resolve the existing dispute
+    client.resolve_dispute(&t.arbiter, &ship_id, &0u32, &true, &None);
+
+    let milestone = client.get_milestone(&ship_id, &0u32);
+    assert_eq!(milestone.status, MilestoneStatus::Resolved);
+}
+
+#[test]
+fn test_pool_state_persists_across_multiple_operations() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    // Add multiple arbiters
+    client.add_arbiter_to_pool(&t.buyer, &t.arbiter);
+    client.add_arbiter_to_pool(&t.buyer, &t.buyer2);
+    client.add_arbiter_to_pool(&t.buyer, &t.logistics);
+    
+    assert_eq!(client.get_arbiter_pool().len(), 3);
+
+    // Remove one
+    client.remove_arbiter_from_pool(&t.buyer, &t.buyer2);
+    let pool = client.get_arbiter_pool();
+    assert_eq!(pool.len(), 2);
+    assert!(pool.contains(&t.arbiter));
+    assert!(pool.contains(&t.logistics));
+    assert!(!pool.contains(&t.buyer2));
+
+    // Add it back
+    client.add_arbiter_to_pool(&t.buyer, &t.buyer2);
+    let pool = client.get_arbiter_pool();
+    assert_eq!(pool.len(), 3);
+    assert!(pool.contains(&t.buyer2));
+
+    // Remove all
+    client.remove_arbiter_from_pool(&t.buyer, &t.arbiter);
+    client.remove_arbiter_from_pool(&t.buyer, &t.buyer2);
+    client.remove_arbiter_from_pool(&t.buyer, &t.logistics);
+    assert_eq!(client.get_arbiter_pool().len(), 0);
+}
+
+#[test]
+fn test_pool_assignment_with_multiple_milestones() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    // Add two arbiters to pool
+    let arb1 = t.arbiter.clone();
+    let arb2 = t.buyer2.clone();
+    client.add_arbiter_to_pool(&t.buyer, &arb1);
+    client.add_arbiter_to_pool(&t.buyer, &arb2);
+
+    let ship_id = sid(&t.env, "ship_multi_milestone");
+    client.create_shipment(
+        &ship_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &pool_sentinel(&t),
+        &t.token_id,
+        &3_000_000, // 3 milestones
+        &build_milestones(&t.env),
+        &default_options(&t.env),
+    );
+
+    // Raise disputes on two different milestones in the same shipment
+    client.submit_proof(
+        &t.supplier,
+        &ship_id,
+        &0u32,
+        &proof_hash(&t.env),
+        &proof_type(&t.env),
+    );
+    client.raise_dispute(&t.buyer, &ship_id, &0u32);
+    
+    let shipment = client.get_shipment(&ship_id);
+    let first_arbiter = shipment.arbiter.clone();
+    
+    // Resolve first dispute
+    client.resolve_dispute(&first_arbiter, &ship_id, &0u32, &true, &None);
+    
+    // Submit proof and raise dispute for second milestone
+    client.submit_proof(
+        &t.supplier,
+        &ship_id,
+        &1u32,
+        &proof_hash(&t.env),
+        &proof_type(&t.env),
+    );
+    client.raise_dispute(&t.buyer, &ship_id, &1u32);
+    
+    // Verify the shipment still has an arbiter assigned
+    let shipment_after = client.get_shipment(&ship_id);
+    assert!(shipment_after.arbiter == arb1 || shipment_after.arbiter == arb2);
+}
